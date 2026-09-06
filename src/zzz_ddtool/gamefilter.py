@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Sequence
 from difflib import SequenceMatcher
@@ -10,8 +11,6 @@ from zzz_ddtool.capture import grab_game_image
 from zzz_ddtool.layout import (
     DISMANTLE_FORBID,
     FILTER_BTN,
-    FILTER_RESET,
-    FILTER_SLOTS,
     scale_point,
     scale_rect,
 )
@@ -21,6 +20,10 @@ from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key, wheel_client
 
 # 筛选面板里「套装 → 点击选择」条的搜索区（面板右半屏）
 FILTER_SETS_BAR = (1300, 260, 1860, 380)
+# 「分区[N]」按钮搜索区。未滚动时在 y≈766-876，滚动后在 y≈429-574，两态都盖住
+FILTER_SLOT_AREA = (1300, 380, 1860, 950)
+# 面板底部「重置」按钮搜索区（避开右边的批量操作）
+FILTER_RESET_AREA = (1250, 990, 1650, 1080)
 # 弹层 / 词条按钮的全窗口搜索区。认不上的话宁可中断。
 FULL_WINDOW = (0, 0, 1920, 1080)
 # 滚动找词条时的尝试上限
@@ -142,6 +145,31 @@ def apply_sets_mainstats(
         log.info("mainstats picked: %s", list(mainstats))
 
 
+def _click_slot(hwnd: int, slot: int, width: int, height: int) -> None:
+    """OCR 找「分区[N]」按钮，点文字中心。面板滚动状态无关。认不上就中断。"""
+    image, _ = _grab()
+    for line in read_rect(image, FILTER_SLOT_AREA):
+        text = line.text.replace(" ", "")
+        if "分区" not in text:
+            continue
+        m = re.search(r"(\d+)", text)
+        if m and int(m.group(1)) == slot:
+            click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+            return
+    raise FilterClickError(f"筛选面板里没找到「分区[{slot}]」按钮，中断。")
+
+
+def _click_reset(hwnd: int, width: int, height: int) -> None:
+    """OCR 找面板底部的「重置」按钮点中心（避开批量操作）。"""
+    image, _ = _grab()
+    for line in read_rect(image, FILTER_RESET_AREA):
+        text = line.text.replace(" ", "")
+        if "重置" in text and "批量" not in text:
+            click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+            return
+    raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
+
+
 def apply_game_filter(
     hwnd: int,
     width: int,
@@ -154,20 +182,17 @@ def apply_game_filter(
     """Open 驱动盘筛选, 重置, apply slots/sets/mainstats, Esc to close.
 
     能按键就按键：关筛选用 Esc，不扫关闭按钮。
+    分区/重置按钮靠 OCR 点文字中心，不用硬坐标（旧表偏到错误按钮上）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
     click_client(hwnd, fx, fy)
     time.sleep(0.55)
-    rx, ry = scale_point(*FILTER_RESET, width, height)
-    click_client(hwnd, rx, ry)
+    _click_reset(hwnd, width, height)
     time.sleep(0.45)
     for slot in slots:
-        if slot not in FILTER_SLOTS:
-            continue
-        sx, sy = scale_point(*FILTER_SLOTS[slot], width, height)
-        click_client(hwnd, sx, sy)
+        _click_slot(hwnd, slot, width, height)
         time.sleep(0.12)
     if sets or mainstats:
         apply_sets_mainstats(hwnd, width, height, sets=sets, mainstats=mainstats)

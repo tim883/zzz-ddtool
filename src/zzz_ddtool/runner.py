@@ -22,7 +22,7 @@ from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
-from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key
+from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key, wheel_client
 
 
 class RunnerError(RuntimeError):
@@ -111,35 +111,82 @@ class Runner:
 
         sub_preset = self._sub_preset(job)
         accepted_ids = set(job.accepted) if job.accepted else None
+        w, h = image.width(), image.height()
+        gx, gy = scale_point(640, 540, w, h)
 
-        cells = _grid_cells(image.width(), image.height())
-        for idx, (cx, cy) in enumerate(cells):
+        prev_signature: tuple | None = None
+        for page_idx in range(self.preset.max_pages):
             if self._processed >= self.preset.max_discs:
                 self.log.info("job hit max_discs")
                 break
-            self.log.debug("cell %d/%d (%d,%d)", idx + 1, len(cells), cx, cy)
-            click_client(hwnd, cx, cy)
-            time.sleep(0.4)
-            detail_image, page, *_ = self._grab()
-            if page != "drive_disc":
-                self.log.warning("detail click left drive_disc (page=%s), stop job", page)
+            cells = self._visible_cells(w, h)
+            signature = tuple(sorted(cells))
+            if not cells or signature == prev_signature:
+                self.log.info("page %d empty or same as before, job done", page_idx)
                 break
-            disc = self._parse_disc(detail_image)
-            if disc is None:
-                self.log.info("cell %d no disc, skip", idx + 1)
-                press_key(hwnd, VK_ESCAPE)
-                time.sleep(0.25)
+            prev_signature = signature
+            self.log.info("page %d: %d cells to process", page_idx, len(cells))
+            for cx, cy in cells:
+                if self._processed >= self.preset.max_discs:
+                    break
+                click_client(hwnd, cx, cy)
+                time.sleep(0.4)
+                detail_image, page, *_ = self._grab()
+                if page != "drive_disc":
+                    self.log.warning("detail click left drive_disc (page=%s), stop job", page)
+                    return
+                disc = self._parse_disc(detail_image)
+                if disc is None:
+                    self.log.info("cell (%d,%d) no disc, skip", cx, cy)
+                    continue
+                decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
+                self._record(job, disc, decision)
+                self._act(hwnd, decision.action)
+                self._processed += 1
+                time.sleep(0.3)
+            wheel_client(hwnd, gx, gy, -5)  # 翻下一页
+            time.sleep(0.8)
+
+    def _visible_cells(self, width: int, height: int) -> list[tuple[int, int]]:
+        """OCR 当前页「等级」标签定位格子，返回未装备格子的图标中心点。
+
+        点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过。
+        """
+        image, _method, hwnd = grab_game_image()
+        ox, oy = scale_point(*GRID_ORIGIN, width, height)
+        sx, sy = scale_point(*GRID_STEP, width, height)
+        from zzz_ddtool.equipped import tile_has_portrait
+        from zzz_ddtool.layout import GRID_LABEL_DY
+        from zzz_ddtool.ocr import read_rect
+
+        cells: list[tuple[int, int]] = []
+        for line in read_rect(image, (60, 150, 1240, 1000)):
+            text = line.text.replace(" ", "")
+            if not text.startswith("等级"):
                 continue
-            decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
-            self._record(job, disc, decision)
-            self._act(hwnd, decision.action)
-            self._processed += 1
-            time.sleep(0.3)
+            lx = (line.left + line.right) // 2
+            ly = (line.top + line.bottom) // 2
+            col = round((lx - ox) / sx)
+            row = round((ly + GRID_LABEL_DY - oy) / sy)
+            if not (0 <= col < GRID_COLS and 0 <= row < GRID_ROWS):
+                continue
+            cx, cy = ox + col * sx, oy + row * sy
+            if tile_has_portrait(image, cx - 56, cy - 68, cx + 56, cy + 68):
+                self.log.info("cell r%dc%d equipped, skip", row, col)
+                continue
+            cells.append((cx, cy))
+        return cells
 
     def _grab(self):
         image, method, hwnd = grab_game_image()
         from zzz_ddtool.screen import classify_image
         page = classify_image(image)
+        if page == "unknown":
+            # 可能筛选面板开着盖住认页图标：Esc 一下再认
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.5)
+            image, method, hwnd = grab_game_image()
+            page = classify_image(image)
         return image, page, method, hwnd
 
     def _parse_disc(self, image: QImage) -> Disc | None:
@@ -151,26 +198,63 @@ class Runner:
                 time.sleep(0.1)
         return None
 
+    # 详情页主按钮（强化/查看）区域，OCR 实测标定
+    UPGRADE_BTN_AREA = (1550, 780, 1900, 880)
+    # 强化页确认按钮搜索区（底部右侧），认不到就不点
+    CONFIRM_AREA = (1300, 900, 1920, 1080)
+
     def _act(self, hwnd: int, action: Action) -> None:
         if action == Action.UPGRADE:
-            # 强化按钮在右侧详情面板底部；直接用 Esc 关闭后由用户/后续流程处理
-            press_key(hwnd, VK_ESCAPE)
-            self.log.info("action=UPGRADE")
+            self._do_upgrade(hwnd)
         elif action == Action.MARK_DISCARD:
-            # 弃置按钮坐标：ACTION_ROW 右半区
-            from zzz_ddtool.layout import ACTION_ROW, scale_rect
-            image, *_ = self._grab()
-            left, top, right, bottom = scale_rect(*ACTION_ROW, image.width(), image.height())
-            x = (left + right) // 2 + 20
-            y = (top + bottom) // 2
-            click_client(hwnd, x, y)
-            self.log.info("action=MARK_DISCARD")
+            # TODO: 弃置走 R 键 + 确认弹窗，UI 未实测前不启用，先关详情
+            press_key(hwnd, VK_ESCAPE)
+            self.log.info("action=MARK_DISCARD (暂只关详情，不点弃置)")
         elif action == Action.SKIP:
             press_key(hwnd, VK_ESCAPE)
             self.log.info("action=SKIP")
         elif action == Action.STOP:
             press_key(hwnd, VK_ESCAPE)
             self.log.info("action=STOP")
+
+    def _do_upgrade(self, hwnd: int) -> None:
+        """点详情页「强化」→ 强化页找确认按钮点下去 → Esc 回列表。
+
+        全程 OCR 认按钮，认不出就中断（手册 01）。
+        """
+        from zzz_ddtool.ocr import read_rect
+
+        image, *_ = self._grab()
+        hit = None
+        for line in read_rect(image, self.UPGRADE_BTN_AREA):
+            if "强化" in line.text:
+                hit = line
+                break
+        if hit is None:
+            self.log.warning("UPGRADE: 详情页没找到「强化」按钮，Esc 跳过")
+            press_key(hwnd, VK_ESCAPE)
+            return
+        click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
+        time.sleep(1.2)
+
+        image, page, *_ = self._grab()
+        confirm = None
+        for line in read_rect(image, self.CONFIRM_AREA):
+            text = line.text.replace(" ", "")
+            if "确认" in text or text == "强化":
+                confirm = line
+                break
+        if confirm is None:
+            self.log.warning("UPGRADE: 强化页没找到确认按钮(页面=%s)，Esc 放弃", page)
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.4)
+            press_key(hwnd, VK_ESCAPE)
+            return
+        click_client(hwnd, (confirm.left + confirm.right) // 2, (confirm.top + confirm.bottom) // 2)
+        time.sleep(1.5)
+        self.log.info("action=UPGRADE clicked confirm at (%d,%d)", confirm.left, confirm.top)
+        press_key(hwnd, VK_ESCAPE)  # 回详情/列表
+        time.sleep(0.4)
 
     def _record(self, job: TaskJob, disc: Disc, decision: Decision) -> None:
         self.results.append(
@@ -183,13 +267,3 @@ class Runner:
             )
         )
 
-
-def _grid_cells(width: int, height: int) -> list[tuple[int, int]]:
-    """返回当前页 9×4 网格中心点（设计坐标按实际分辨率缩放）。"""
-    ox, oy = scale_point(*GRID_ORIGIN, width, height)
-    sx, sy = scale_point(*GRID_STEP, width, height)
-    cells: list[tuple[int, int]] = []
-    for row in range(GRID_ROWS):
-        for col in range(GRID_COLS):
-            cells.append((ox + col * sx, oy + row * sy))
-    return cells

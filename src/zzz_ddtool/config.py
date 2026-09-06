@@ -31,6 +31,7 @@ class Preset:
     task_chain: tuple[TaskJob, ...] = ()
     ocr_retry: int = 3
     accepted: tuple[str, ...] | None = None
+    max_pages: int = 20
 
     def useful_names(self) -> frozenset[str]:
         return frozenset(name for name, weight in self.weights.items() if weight > 0)

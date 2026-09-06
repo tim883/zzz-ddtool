@@ -13,20 +13,13 @@ OVERWORLD_HINT = (20, 980, 280, 1060)
 # OneDragon storage_wengine.yml TAB-驱动盘 (1510,126)-(1588,210)
 DRIVE_DISC_TAB = (1549, 168)
 DRIVE_DISC_TAB_REGION = (1510, 126, 1588, 210)
-# 漏斗白圈中心。右边青蓝圆是拆解，点到会进拆解页。
-FILTER_BTN = (166, 906)
+# 漏斗白圈中心（filter-panel-bottom.png 实测圆心）。右边青蓝圆是拆解，点到会进拆解页。
+FILTER_BTN = (149, 930)
 # 拆解蓝标 +「拆解」字。任何点击落在这里都要拒绝。
 DISMANTLE_FORBID = (210, 890, 460, 990)
-# 1024×576 筛选图 ×1.875 → 1920×1080；关面板用 Esc，不点叉
-FILTER_RESET = (1301, 1033)
-FILTER_SLOTS = {
-    1: (1460, 780),
-    2: (1540, 780),
-    3: (1620, 780),
-    4: (1700, 780),
-    5: (1460, 850),
-    6: (1540, 850),
-}
+# 旧硬坐标已废弃：分区/重置改 OCR 找按钮文字点中心，滚动状态无关。
+# FILTER_RESET=(1301,1033) 偏到重置按钮左缘图标；FILTER_SLOTS 整表偏到错误按钮上。
+FILTER_RESET = (1432, 1029)
 
 # 右侧详情面板。坐标来自 scripts/ocr_probe.py 在手册/样张/驱动盘页.png 上的实测。
 DETAIL_PANEL = (1400, 225, 1870, 800)
@@ -41,11 +34,15 @@ SUB_STAT_FIRST = 26
 # 副属性行内：名字在左，数值在右，按这个 x 切分
 SUB_STAT_SPLIT_X = 1650
 
-# 左侧格子网格：9 列 x 4 行（实测列间距约 135，行高约 175）
+# 左侧格子网格：9 列 x 4 行。funnel-debug.png 实测：
+# 「等级」标签列中心 x=166 起步长 135，行中心 y=354 起步长 175。
+# 图标中心在标签正上方约 87px，点击点必须是图标中心，不是标签。
 GRID_COLS = 9
 GRID_ROWS = 4
-GRID_ORIGIN = (134, 340)
+GRID_ORIGIN = (166, 267)
 GRID_STEP = (135, 175)
+# 图标中心到「等级」标签中心的垂直偏移（OCR 标定用）
+GRID_LABEL_DY = 87
 
 
 def scale_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:
