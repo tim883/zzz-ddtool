@@ -8,6 +8,10 @@ from random import randint, uniform
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+from zzz_ddtool.logutil import get_logger
+
+_input_log = get_logger("zzz_ddtool.wininput")
+
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -150,6 +154,7 @@ def _key_event(vk: int, *, up: bool = False, scancode: bool = False) -> INPUT:
 
 def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
     """Foreground click, same idea as OneDragon: move cursor then mouse down/up."""
+    _input_log.info("click (%d,%d) alt=%s", x, y, alt)
     sx, sy = client_to_screen(hwnd, x + randint(-2, 2), y + randint(-2, 2))
     focus_window(hwnd)
     if alt:
@@ -168,6 +173,7 @@ def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
 
 def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
     """把光标移到窗口客户区 (x,y) 后滚动。delta 负数向下翻页。一格约 120。"""
+    _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
     sx, sy = client_to_screen(hwnd, x, y)
     focus_window(hwnd)
     user32.SetCursorPos(sx, sy)
@@ -180,6 +186,7 @@ def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
 def press_key_once(hwnd: int, vk: int) -> None:
     """只按一次键（down+up 一对）。R 弃置这类开关型键必须用这个：
     press_key 会发多对 down/up，R 按奇数次才有效，偶数次等于没按。"""
+    _input_log.info("key_once vk=0x%02X", vk)
     focus_window(hwnd)
     _send([_key_event(vk), _key_event(vk, scancode=True)])
     time.sleep(0.05)
@@ -189,6 +196,7 @@ def press_key_once(hwnd: int, vk: int) -> None:
 
 
 def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
+    _input_log.info("key vk=0x%02X", vk)
     scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or SCAN_ESCAPE
     focus_window(hwnd)
     user32.keybd_event(vk, scan, 0, 0)
