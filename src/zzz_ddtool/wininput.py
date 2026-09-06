@@ -12,6 +12,7 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_VIRTUALDESK = 0x4000
@@ -161,6 +162,17 @@ def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
     if alt:
         pause(0.04, 0.08)
         _send([_key_event(VK_MENU, up=True)])
+    pause()
+
+
+def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
+    """把光标移到窗口客户区 (x,y) 后滚动。delta 负数向下翻页。一格约 120。"""
+    sx, sy = client_to_screen(hwnd, x, y)
+    focus_window(hwnd)
+    user32.SetCursorPos(sx, sy)
+    pause(0.04, 0.08)
+    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
+    time.sleep(0.15)
     pause()
 
 
