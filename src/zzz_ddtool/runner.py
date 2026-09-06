@@ -181,7 +181,7 @@ class Runner:
                     continue
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 self._record(job, disc, decision)
-                self._act(hwnd, decision.action)
+                self._act(hwnd, decision.action, disc)
                 self._processed += 1
                 if decision.action == Action.STOP:
                     self.log.warning("decision STOP (%s), end job", decision.reason)
@@ -256,15 +256,23 @@ class Runner:
     STAGE_ADD_AREA = (1100, 860, 1500, 980)
     UPGRADE_CONFIRM_AREA = (1450, 860, 1700, 980)
 
-    def _act(self, hwnd: int, action: Action) -> None:
+    def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
         # 翻页前由 _run_job 统一 Esc。
+        # R 是开关：按之前必须看 disc.discarded，否则打标签会变成摘标签（反之亦然）。
         if action == Action.UPGRADE:
+            if disc.discarded:
+                press_key_once(hwnd, VK_R)  # 先摘掉旧弃置标签再强化，保证终态统一
+                time.sleep(0.5)
+                self.log.info("action=UPGRADE：摘除旧弃置标签 (R)")
             self._do_upgrade(hwnd)
         elif action == Action.MARK_DISCARD:
-            press_key_once(hwnd, VK_R)  # R 打弃置标签
-            time.sleep(0.5)
-            self.log.info("action=MARK_DISCARD (R)")
+            if disc.discarded:
+                self.log.info("action=MARK_DISCARD：已带弃置标签，跳过按键")
+            else:
+                press_key_once(hwnd, VK_R)  # R 打弃置标签
+                time.sleep(0.5)
+                self.log.info("action=MARK_DISCARD (R)")
         elif action == Action.SKIP:
             self.log.info("action=SKIP")
         elif action == Action.STOP:
