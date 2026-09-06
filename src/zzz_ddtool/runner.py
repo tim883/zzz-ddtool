@@ -22,7 +22,7 @@ from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
-from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key, wheel_client
+from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
 
 
 class RunnerError(RuntimeError):
@@ -198,18 +198,22 @@ class Runner:
                 time.sleep(0.1)
         return None
 
-    # 详情页主按钮（强化/查看）区域，OCR 实测标定
+    # 详情页右下大按钮（查看/强化，永远存在），OCR 实测标定
     UPGRADE_BTN_AREA = (1550, 780, 1900, 880)
-    # 强化页确认按钮搜索区（底部右侧），认不到就不点
-    CONFIRM_AREA = (1300, 900, 1920, 1080)
+    # 缩放页「等级00」文字区，>> 箭头在它右侧约 95px
+    ZOOM_LEVEL_AREA = (1100, 150, 1550, 300)
+    # 强化页「阶段添加」与「升级」按钮搜索区（老大截图实测位置）
+    STAGE_ADD_AREA = (1100, 860, 1500, 980)
+    UPGRADE_CONFIRM_AREA = (1450, 860, 1700, 980)
 
     def _act(self, hwnd: int, action: Action) -> None:
         if action == Action.UPGRADE:
             self._do_upgrade(hwnd)
         elif action == Action.MARK_DISCARD:
-            # TODO: 弃置走 R 键 + 确认弹窗，UI 未实测前不启用，先关详情
+            press_key_once(hwnd, VK_R)  # R 打弃置标签
+            time.sleep(0.5)
             press_key(hwnd, VK_ESCAPE)
-            self.log.info("action=MARK_DISCARD (暂只关详情，不点弃置)")
+            self.log.info("action=MARK_DISCARD (R)")
         elif action == Action.SKIP:
             press_key(hwnd, VK_ESCAPE)
             self.log.info("action=SKIP")
@@ -218,41 +222,84 @@ class Runner:
             self.log.info("action=STOP")
 
     def _do_upgrade(self, hwnd: int) -> None:
-        """点详情页「强化」→ 强化页找确认按钮点下去 → Esc 回列表。
+        """老大截图标定的完整链路：
 
-        全程 OCR 认按钮，认不出就中断（手册 01）。
+        详情页大按钮(查看) → 缩放页「>>」箭头 → 强化页「阶段添加」→「升级」→ Esc 回列表。
+        每一步 OCR 认按钮，认不出就中断回退（手册 01）。
         """
         from zzz_ddtool.ocr import read_rect
 
+        def _click_line(lines, needle: str, region_desc: str) -> bool:
+            for line in lines:
+                if needle in line.text.replace(" ", ""):
+                    click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+                    return True
+            self.log.warning("UPGRADE: 没找到%s，中断回退", region_desc)
+            return False
+
+        # 1) 详情页大按钮（0 级也显示「查看」）
         image, *_ = self._grab()
         hit = None
-        for line in read_rect(image, self.UPGRADE_BTN_AREA):
-            if "强化" in line.text:
-                hit = line
+        for text in ("查看", "强化"):
+            for line in read_rect(image, self.UPGRADE_BTN_AREA):
+                if text in line.text.replace(" ", ""):
+                    hit = line
+                    break
+            if hit:
                 break
         if hit is None:
-            self.log.warning("UPGRADE: 详情页没找到「强化」按钮，Esc 跳过")
+            self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮，Esc 跳过")
             press_key(hwnd, VK_ESCAPE)
             return
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
-        time.sleep(1.2)
+        time.sleep(0.9)
 
-        image, page, *_ = self._grab()
-        confirm = None
-        for line in read_rect(image, self.CONFIRM_AREA):
-            text = line.text.replace(" ", "")
-            if "确认" in text or text == "强化":
-                confirm = line
+        # 2) 缩放页「>>」金箭头：在「等级00」右侧约 95px
+        image, *_ = self._grab()
+        level_line = None
+        for line in read_rect(image, self.ZOOM_LEVEL_AREA):
+            if "等级" in line.text.replace(" ", ""):
+                level_line = line
                 break
-        if confirm is None:
-            self.log.warning("UPGRADE: 强化页没找到确认按钮(页面=%s)，Esc 放弃", page)
+        if level_line is None:
+            self.log.warning("UPGRADE: 缩放页没找到「等级」，中断回退")
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.4)
             press_key(hwnd, VK_ESCAPE)
             return
-        click_client(hwnd, (confirm.left + confirm.right) // 2, (confirm.top + confirm.bottom) // 2)
+        ax = level_line.right + 95
+        ay = (level_line.top + level_line.bottom) // 2
+        click_client(hwnd, ax, ay)
+        time.sleep(1.0)
+
+        # 3) 强化页「阶段添加」加素材
+        image, *_ = self._grab()
+        if not _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」"):
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.4)
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.4)
+            press_key(hwnd, VK_ESCAPE)
+            return
+        time.sleep(0.8)
+
+        # 4) 「升级」确认
+        image, *_ = self._grab()
+        if not _click_line(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」"):
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.4)
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.4)
+            press_key(hwnd, VK_ESCAPE)
+            return
         time.sleep(1.5)
-        self.log.info("action=UPGRADE clicked confirm at (%d,%d)", confirm.left, confirm.top)
+        self.log.info("action=UPGRADE 完成（阶段添加→升级）")
+        # 5) 强化页 → 缩放页 → 网格
+        press_key(hwnd, VK_ESCAPE)
+        time.sleep(0.4)
+        press_key(hwnd, VK_ESCAPE)
+        time.sleep(0.4)
+        press_key(hwnd, VK_ESCAPE)
         press_key(hwnd, VK_ESCAPE)  # 回详情/列表
         time.sleep(0.4)
 

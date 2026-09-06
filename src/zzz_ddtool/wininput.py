@@ -20,6 +20,7 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 VK_ESCAPE = 0x1B
 VK_MENU = 0x12
+VK_R = 0x52
 SCAN_ESCAPE = 0x01
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
@@ -174,6 +175,17 @@ def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
     user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
     time.sleep(0.15)
     pause()
+
+
+def press_key_once(hwnd: int, vk: int) -> None:
+    """只按一次键（down+up 一对）。R 弃置这类开关型键必须用这个：
+    press_key 会发多对 down/up，R 按奇数次才有效，偶数次等于没按。"""
+    focus_window(hwnd)
+    _send([_key_event(vk), _key_event(vk, scancode=True)])
+    time.sleep(0.05)
+    _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
+    time.sleep(0.03)
+    pause(0.35, 0.55)
 
 
 def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
