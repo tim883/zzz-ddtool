@@ -103,6 +103,8 @@ class WNDCLASSW(ctypes.Structure):
 CLASS_NAME = "ZZZDDToolOverlay"
 _proc_ref = None  # 防 WNDPROC 被 GC
 _hwnd = None
+_ready = threading.Event()
+_msg_counts: dict[int, int] = {}
 _lines: list[str] = []
 _lock = threading.Lock()
 _screen_w = user32.GetSystemMetrics(0)
@@ -136,14 +138,14 @@ def _paint(hdc: wintypes.HDC) -> None:
     if _font is None:
         _font = _make_font()
     old_font = gdi32.SelectObject(mem_dc, _font)
-    user32.SetTextColor(mem_dc, TEXT_COLOR)
-    user32.SetBkMode(mem_dc, 1)  # TRANSPARENT
+    gdi32.SetTextColor(mem_dc, TEXT_COLOR)
+    gdi32.SetBkMode(mem_dc, 1)  # TRANSPARENT
     with _lock:
         lines = list(_lines)
     ox, oy = _game_origin
     for i, line in enumerate(lines):
         buf = ctypes.c_wchar_p(line)
-        user32.TextOutW(mem_dc, ox + 12, oy + 8 + i * LINE_H, buf, len(line))
+        gdi32.TextOutW(mem_dc, ox + 12, oy + 8 + i * LINE_H, buf, len(line))
     gdi32.SelectObject(mem_dc, old_font)
     gdi32.BitBlt(hdc, 0, 0, _screen_w, _screen_h, mem_dc, 0, 0, 0x00CC0020)  # SRCCOPY
     gdi32.SelectObject(mem_dc, old_bmp)
@@ -152,6 +154,7 @@ def _paint(hdc: wintypes.HDC) -> None:
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
+    _msg_counts[msg] = _msg_counts.get(msg, 0) + 1
     if msg == WM_PAINT:
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
@@ -175,12 +178,17 @@ def _ensure_window() -> bool:
     global _hwnd, _proc_ref
     if _hwnd:
         return True
+    _ready.clear()
     _proc_ref = WNDPROC(_wnd_proc)
     wc = WNDCLASSW()
     wc.lpfnWndProc = _proc_ref
     wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
     wc.lpszClassName = CLASS_NAME
-    user32.RegisterClassW(ctypes.byref(wc))
+    if not user32.RegisterClassW(ctypes.byref(wc)):
+        from zzz_ddtool.logutil import get_logger
+
+        get_logger("zzz_ddtool.overlay").warning("RegisterClassW 失败")
+        return False
     hwnd = user32.CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         CLASS_NAME,
@@ -190,10 +198,13 @@ def _ensure_window() -> bool:
         None, None, wc.hInstance, None,
     )
     if not hwnd:
+        from zzz_ddtool.logutil import get_logger
+
+        get_logger("zzz_ddtool.overlay").warning("CreateWindowExW 失败")
         return False
+    _hwnd = hwnd
     user32.SetLayeredWindowAttributes(hwnd, KEY_COLOR, 0, LWA_COLORKEY)
     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
-    _hwnd = hwnd
 
     def _loop():
         msg = MSG()
@@ -202,6 +213,7 @@ def _ensure_window() -> bool:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     threading.Thread(target=_loop, daemon=True, name="ddtool-overlay").start()
+    _ready.set()
     return True
 
 
@@ -233,6 +245,7 @@ def overlay_show(lines: list[str]) -> None:
         user32.ShowWindow(_hwnd, SW_SHOW)
         user32.SetWindowPos(_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
         user32.InvalidateRect(_hwnd, None, True)
+        user32.UpdateWindow(_hwnd)  # 强制同步走一次 WM_PAINT，不等系统调度
     except Exception:
         pass
 

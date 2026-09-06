@@ -18,16 +18,16 @@ from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
-from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_ROWS, GRID_STEP, scale_point
+from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_STEP, scale_point
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
 
-# 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280），
-# 旧值 1240 会把最后一列裁掉，导致每页最右边的盘子永远扫不到。
-LABEL_SCAN_AREA = (60, 150, 1330, 1000)
+# 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280）；
+# 上边界放宽到 80：列表滚动停在半行位置时，首行标签位置会随滚动偏移
+LABEL_SCAN_AREA = (60, 80, 1330, 1020)
 # 单个盘子连续升阶上限（0→15 最多 5 阶，留余量防 OCR 读级错误导致死循环）
 _MAX_STAGE_UPGRADES = 6
 
@@ -306,25 +306,39 @@ class Runner:
         from zzz_ddtool.layout import GRID_LABEL_DY
         from zzz_ddtool.ocr import read_rect
 
-        cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+        # 行聚类：按标签 y 坐标聚成行，不依赖固定行数——列表滚动停在半行
+        # 位置时，固定映射会把首行算到界外、末行超出上限，造成永远丢一行。
+        labels: list[tuple[int, int]] = []
         for line in read_rect(image, LABEL_SCAN_AREA):
             text = line.text.replace(" ", "")
-            if not text.startswith("等级"):
+            if text.startswith("等级"):
+                labels.append(((line.left + line.right) // 2, (line.top + line.bottom) // 2))
+        labels.sort(key=lambda p: p[1])
+        rows: list[list[tuple[int, int]]] = []
+        for lx, ly in labels:
+            if rows and abs(ly - rows[-1][-1][1]) <= 60:
+                rows[-1].append((lx, ly))
+            else:
+                rows.append([(lx, ly)])
+        cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+        for r_idx, cluster in enumerate(rows):
+            tile_cy = cluster[0][1] - GRID_LABEL_DY  # 标签在格子中心上方 87px
+            # 行被窗口边缘切掉的（格子露出不到一半）不点
+            if not (97 <= tile_cy <= 983):
+                self.log.info("row y=%d half-cut at window edge, skip", tile_cy)
                 continue
-            lx = (line.left + line.right) // 2
-            ly = (line.top + line.bottom) // 2
-            col = round((lx - ox) / sx)
-            row = round((ly + GRID_LABEL_DY - oy) / sy)
-            if not (0 <= col < GRID_COLS and 0 <= row < GRID_ROWS):
-                continue
-            cx, cy = ox + col * sx, oy + row * sy
-            if tile_has_portrait(image, cx - 56, cy - 68, cx + 56, cy + 68):
-                self.log.info("cell r%dc%d equipped, skip", row, col)
-                continue
-            if skip_tagged and tile_has_discard_badge(image, cx, cy):
-                self.log.info("cell r%dc%d discard-tagged, skip at scan", row, col)
-                continue
-            cells[(row, col)] = (row, col, cx, cy)
+            for lx, _ly in sorted(cluster):
+                col = round((lx - ox) / sx)
+                if not (0 <= col < GRID_COLS):
+                    continue
+                cx = ox + col * sx
+                if tile_has_portrait(image, cx - 56, tile_cy - 68, cx + 56, tile_cy + 68):
+                    self.log.info("cell r%dc%d equipped, skip", r_idx, col)
+                    continue
+                if skip_tagged and tile_has_discard_badge(image, cx, tile_cy):
+                    self.log.info("cell r%dc%d discard-tagged, skip at scan", r_idx, col)
+                    continue
+                cells[(r_idx, col)] = (r_idx, col, cx, tile_cy)
         # 强制行优先（第1行从左到右，再第2行…），保证处理顺序确定、不跳格
         return [cells[key] for key in sorted(cells)]
 
