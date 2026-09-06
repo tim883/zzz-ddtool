@@ -1213,8 +1213,10 @@ class MainWindow(QMainWindow):
     def _build_bottom(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("footer")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(10, 8, 10, 8)
+        col = QVBoxLayout(bar)
+        col.setContentsMargins(10, 8, 10, 8)
+        col.setSpacing(4)
+        row = QHBoxLayout()
         all_on = QPushButton("全选当前可见")
         all_off = QPushButton("取消当前可见")
         all_on.clicked.connect(lambda: self._check_visible(True))
@@ -1222,14 +1224,56 @@ class MainWindow(QMainWindow):
         self.start_btn = QPushButton("开始强化")
         self.start_btn.setObjectName("primary")
         self.start_btn.setEnabled(False)
-        self.start_btn.setToolTip("OCR 和模拟点击还没做，先把组合勾好。")
+        self.start_btn.setToolTip("先用命令行 zzz_ddtool run 跑，窗口这里显示运行状态。")
         self.status = QLabel()
         self.status.setObjectName("status")
         row.addWidget(all_on)
         row.addWidget(all_off)
         row.addWidget(self.status, 1)
         row.addWidget(self.start_btn)
+        col.addLayout(row)
+        self.run_status_label = QLabel("运行状态：—")
+        self.run_status_label.setObjectName("runStatus")
+        self.run_status_label.setWordWrap(True)
+        col.addWidget(self.run_status_label)
+        self._run_timer = QTimer(self)
+        self._run_timer.setInterval(1000)
+        self._run_timer.timeout.connect(self._refresh_run_status)
+        self._run_timer.start()
+        self._refresh_run_status()
         return bar
+
+    def _refresh_run_status(self) -> None:
+        """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
+        import json
+
+        from zzz_ddtool.paths import out_dir
+
+        text = "运行状态：—（还没有运行记录）"
+        status_file = out_dir() / "run-status.json"
+        if status_file.exists():
+            try:
+                data = json.loads(status_file.read_text(encoding="utf-8"))
+                text = (
+                    f"运行状态：{data.get('phase', '—')}  格子:{data.get('cell', '—')}  "
+                    f"进度:{data.get('processed', 0)}/{data.get('max_discs', 0)}  "
+                    f"时间:{data.get('time', '—')}"
+                )
+            except Exception:
+                pass
+        log_file = out_dir() / "logs" / "ddtool.log"
+        tail: list[str] = []
+        if log_file.exists():
+            try:
+                lines = log_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+                tail = [
+                    ln
+                    for ln in lines[-8:]
+                    if "RapidOCR" not in ln and "captured" not in ln and ln.strip()
+                ][-3:]
+            except Exception:
+                pass
+        self.run_status_label.setText("\n".join([text] + tail))
 
     def _load_path(self, path: Path) -> None:
         if path.exists():
