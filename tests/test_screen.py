@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from zzz_ddtool.layout import scale_point
-from zzz_ddtool.screen import MENU, OVERWORLD, STORAGE, classify_image
+from zzz_ddtool.screen import MENU, OVERWORLD, STORAGE, UNKNOWN, classify_image
 
 
 @pytest.fixture(scope="module")
@@ -47,12 +47,13 @@ def test_classify_overworld(qapp: QApplication) -> None:
     assert classify_image(image) == OVERWORLD
 
 
-def test_classify_storage_keeps_back_without_dock(qapp: QApplication) -> None:
+def test_classify_red_back_alone_is_unknown(qapp: QApplication) -> None:
+    """红色返回箭头不能当 storage 依据——详情/缩放页也有红箭头（2026-09-06 误判实锤）。"""
     image = _blank()
     painter = QPainter(image)
     painter.fillRect(80, 28, 90, 46, QColor(196, 32, 8))
     painter.end()
-    assert classify_image(image) == STORAGE
+    assert classify_image(image) == UNKNOWN
 
 
 def test_warehouse_point_scales() -> None:

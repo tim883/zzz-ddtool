@@ -94,8 +94,8 @@ def _classify_heuristic(image) -> str:
         return MENU
     if _overworld_hint(image) >= 0.04:
         return OVERWORLD
-    if _red_back_hits(image) >= 8:
-        return STORAGE
+    # 注意：不能用「红色返回箭头」判 storage——详情/缩放页顶部也有同样的红箭头，
+    # 会把缩放页误判成仓库页导致后续全错（2026-09-06 实锤）。认不出就老实 unknown。
     return UNKNOWN
 
 
