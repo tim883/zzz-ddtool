@@ -205,9 +205,11 @@ class Runner:
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
             self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
+            maxed = False
             for row, col, cx, cy in cells:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
+                    maxed = True
                     break
                 cell_tag = f"r{row}c{col}"
                 click_client(hwnd, cx, cy)
@@ -277,6 +279,11 @@ class Runner:
                 time.sleep(0.3)
             if rescan:
                 continue
+            if maxed:
+                # max_discs 截停：留在当前页，绝不翻页——
+                # 翻页尾巴的 Esc 按在网格上会把仓库退到功能页（19:13 轮实锤）
+                self.log.info("max_discs hit, stop without page flip")
+                break
             self._checkpoint()
             press_key(hwnd, VK_ESCAPE)  # 关详情再翻页，滚轮才作用在网格上
             time.sleep(0.4)
