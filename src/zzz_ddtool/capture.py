@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ WINDOW_TITLES = ("ZenlessZoneZero", "绝区零")
 PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SW_RESTORE = 9
 DIB_RGB_COLORS = 0
 BI_RGB = 0
 
@@ -96,15 +98,18 @@ def find_game_hwnd() -> int:
     def _each(hwnd: int, _lparam: int) -> bool:
         if not user32.IsWindowVisible(hwnd):
             return True
-        width, height = _client_size(hwnd)
-        if width < 64 or height < 64:
-            return True
         title = _window_title(hwnd)
         exe = _exe_name(_pid_of(hwnd))
+        width, height = _client_size(hwnd)
         area = width * height
         if exe.lower() == PROCESS_NAME.lower():
+            # 游戏本体：最小化时客户区为 0×0，仍要记录，截图前恢复窗口
             by_process.append((area, width, int(hwnd)))
-        elif _title_looks_like_game(title):
+            return True
+        if width < 64 or height < 64:
+            return True
+        # 标题兜底：排除 OneDragon 的 python 窗口（如"绝区零 一条龙 01"）
+        if _title_looks_like_game(title) and "python" not in exe.lower():
             by_title.append((area, width, int(hwnd)))
         return True
 
@@ -199,12 +204,22 @@ def _grab_screen_region(hwnd: int):
     return pixmap.toImage()
 
 
+def _restore_window(hwnd: int) -> None:
+    """游戏窗口最小化时先恢复并提到前台，否则 PrintWindow 截不到（客户区 0×0）。"""
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        time.sleep(0.4)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.25)
+
+
 def grab_game_image(hwnd: int | None = None):
     from PySide6.QtWidgets import QApplication
 
     if QApplication.instance() is None:
         QApplication([])
     target = hwnd if hwnd is not None else find_game_hwnd()
+    _restore_window(target)
     image = _print_window(target)
     method = "printwindow"
     if image is None or _is_mostly_black(image):
