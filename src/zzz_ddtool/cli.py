@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     nav_p = sub.add_parser("goto-warehouse", help="Esc to menu if needed, then click 仓库")
     sub.add_parser("snapshot-pages", help="Click home / menu / warehouse and save named shots")
 
+    run_p = sub.add_parser("run", help="按配置的任务链自动处理驱动盘（强化/弃置）")
+    run_p.add_argument("--config", type=Path, required=True, help="YAML preset")
+
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
     preview_p.add_argument("--out", type=Path, help="HTML path, default workspace out/pattern-cards.html")
@@ -52,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_goto_warehouse()
     if args.cmd == "snapshot-pages":
         return _cmd_snapshot_pages()
+    if args.cmd == "run":
+        return _cmd_run(args)
     if args.cmd == "preview":
         return _cmd_preview(args)
     return 1
@@ -156,6 +161,22 @@ def _cmd_preview(args: argparse.Namespace) -> int:
         title=f"{preset.name} 组合预览",
     )
     print(f"wrote {dest} ({len(cards)} cards, filter by per-stage require in the page)")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from zzz_ddtool.runner import Runner, RunnerError
+
+    preset = load_preset(args.config)
+    runner = Runner(preset)
+    try:
+        results = runner.run()
+    except RunnerError as exc:
+        print(exc)
+        return 2
+    print(f"处理 {len(results)} 个盘子")
+    for r in results:
+        print(f"{r.action:14} {r.reason:30} score={r.score:.2f} level={r.level}")
     return 0
 
 
