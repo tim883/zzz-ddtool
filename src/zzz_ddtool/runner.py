@@ -60,7 +60,14 @@ class Runner:
         if self.hotkeys is not None:
             self.hotkeys.checkpoint()
 
+    _status_lines: list[str] = []
+
     def _set_status(self, phase: str, message: str = "", cell: str = "") -> None:
+        """运行状态三处落点：run-status.json + 游戏画面悬浮层 + 日志。"""
+        stamp = time.strftime("%H:%M:%S")
+        line = " ".join(x for x in (stamp, cell, phase, message) if x)
+        self._status_lines.append(line)
+        del self._status_lines[:-8]
         """把运行状态写到 out/run-status.json，随时可查看工具正在干什么。"""
         try:
             import json
@@ -68,7 +75,7 @@ class Runner:
             from zzz_ddtool.paths import out_dir
 
             payload = {
-                "time": time.strftime("%H:%M:%S"),
+                "time": stamp,
                 "phase": phase,
                 "cell": cell,
                 "message": message,
@@ -79,6 +86,9 @@ class Runner:
             (out_dir() / "run-status.json").write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
             )
+            from zzz_ddtool.overlay import overlay_show
+
+            overlay_show(["F9 暂停 / F10 停止"] + self._status_lines)
         except Exception:
             pass
 
@@ -116,6 +126,7 @@ class Runner:
         """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。"""
         self.results = []
         self._processed = 0
+        self._status_lines = []
         jobs = self._jobs()
         self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), self.preset.max_discs)
         self._set_status("run_start", f"jobs={len(jobs)}")
@@ -132,6 +143,12 @@ class Runner:
         finally:
             if self.hotkeys is not None:
                 self.hotkeys.close()
+            try:
+                from zzz_ddtool.overlay import overlay_hide
+
+                overlay_hide()
+            except Exception:
+                pass
         self.log.info("run done processed=%d", self._processed)
         self._set_status("done", f"processed={self._processed}")
         return list(self.results)
