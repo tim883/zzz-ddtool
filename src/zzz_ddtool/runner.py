@@ -20,7 +20,7 @@ from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_ROWS, GRID_STEP, scale_point
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.models import Action, Decision, Disc
+from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
@@ -28,6 +28,8 @@ from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_
 # 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280），
 # 旧值 1240 会把最后一列裁掉，导致每页最右边的盘子永远扫不到。
 LABEL_SCAN_AREA = (60, 150, 1330, 1000)
+# 单个盘子连续升阶上限（0→15 最多 5 阶，留余量防 OCR 读级错误导致死循环）
+_MAX_STAGE_UPGRADES = 6
 
 
 class RunnerError(RuntimeError):
@@ -181,11 +183,37 @@ class Runner:
                     continue
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 self._record(job, disc, decision)
-                self._act(hwnd, decision.action, disc)
                 self._processed += 1
-                if decision.action == Action.STOP:
-                    self.log.warning("decision STOP (%s), end job", decision.reason)
-                    return
+                # 强化阶段循环：升到 3/6/9/12 后重新解析词条再判，
+                # 该继续升就继续，直到判非升级或满级（accepted 白名单按档生效）。
+                guard = 0
+                while True:
+                    if decision.action == Action.STOP:
+                        self.log.warning("decision STOP (%s), end job", decision.reason)
+                        return
+                    if decision.action != Action.UPGRADE:
+                        self._act(hwnd, decision.action, disc)
+                        break
+                    if disc.level >= MAX_LEVEL:
+                        self.log.info("level %d max, stop upgrading this disc", disc.level)
+                        break
+                    guard += 1
+                    if guard > _MAX_STAGE_UPGRADES:
+                        self.log.warning("stage upgrades exceed %d, next cell", _MAX_STAGE_UPGRADES)
+                        break
+                    self._act(hwnd, Action.UPGRADE, disc)
+                    time.sleep(0.6)
+                    stage_image, page2, *_ = self._grab(allow_esc=False)
+                    new_disc = self._parse_disc(stage_image) if page2 == "unknown" else None
+                    if new_disc is None:
+                        self.log.warning("post-upgrade re-parse failed (page=%s), next cell", page2)
+                        break
+                    if new_disc.level <= disc.level:
+                        self.log.warning("level not increased (%d), stop this disc", new_disc.level)
+                        break
+                    disc = new_disc
+                    decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
+                    self._record(job, disc, decision)
                 time.sleep(0.3)
             if rescan:
                 continue
@@ -278,20 +306,31 @@ class Runner:
         elif action == Action.STOP:
             self.log.info("action=STOP")
 
+    def _dbg_capture(self, tag: str) -> None:
+        """中断点自动存图，供事后标定（存 captures 目录，命名 upg-<tag>）。"""
+        try:
+            from zzz_ddtool.capture import grab_game_image, save_image
+
+            img, method, hwnd2 = grab_game_image()
+            save_image(img, hwnd2, method, name=f"upg-{tag}")
+        except Exception as exc:  # 存图失败不影响主流程
+            self.log.warning("dbg capture %s failed: %s", tag, exc)
+
     def _do_upgrade(self, hwnd: int) -> None:
         """老大截图标定的完整链路：
 
         详情页大按钮(查看) → 缩放页「>>」箭头 → 强化页「阶段添加」→「升级」→ Esc 回列表。
-        每一步 OCR 认按钮，认不出就中断回退（手册 01）。
+        每一步 OCR 认按钮，认不出就存图 + 中断回退（手册 01）。
         """
         from zzz_ddtool.ocr import read_rect
 
-        def _click_line(lines, needle: str, region_desc: str) -> bool:
+        def _click_line(lines, needle: str, region_desc: str, tag: str) -> bool:
             for line in lines:
                 if needle in line.text.replace(" ", ""):
                     click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
                     return True
             self.log.warning("UPGRADE: 没找到%s，中断回退", region_desc)
+            self._dbg_capture(tag)
             return False
 
         # 1) 详情页大按钮（0 级也显示「查看」）
@@ -306,6 +345,7 @@ class Runner:
                 break
         if hit is None:
             self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮，Esc 跳过")
+            self._dbg_capture("step1-查看")
             press_key(hwnd, VK_ESCAPE)
             return
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
@@ -320,6 +360,7 @@ class Runner:
                 break
         if level_line is None:
             self.log.warning("UPGRADE: 缩放页没找到「等级」，中断回退")
+            self._dbg_capture("step2-等级")
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.4)
             press_key(hwnd, VK_ESCAPE)
@@ -331,7 +372,8 @@ class Runner:
 
         # 3) 强化页「阶段添加」加素材
         image, *_ = self._grab()
-        if not _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」"):
+        self._dbg_capture("step3-强化页")  # 强化页还没实拍标定过，先存图再找
+        if not _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step3-无阶段添加"):
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.4)
             press_key(hwnd, VK_ESCAPE)
@@ -342,7 +384,7 @@ class Runner:
 
         # 4) 「升级」确认
         image, *_ = self._grab()
-        if not _click_line(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」"):
+        if not _click_line(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step4-无升级"):
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.4)
             press_key(hwnd, VK_ESCAPE)
