@@ -28,6 +28,25 @@ FILTER_SLOTS = {
     6: (1540, 850),
 }
 
+# 右侧详情面板。坐标来自 scripts/ocr_probe.py 在手册/样张/驱动盘页.png 上的实测。
+DETAIL_PANEL = (1400, 225, 1870, 800)
+DISC_NAME = (1400, 260, 1620, 315)
+DISC_LEVEL = (1450, 390, 1620, 445)
+MAIN_STAT = (1415, 480, 1840, 535)
+SUB_STATS = (1415, 558, 1840, 775)
+ACTION_ROW = (1600, 1000, 1880, 1070)
+# 副属性每行的高度，约 51px；第一行中心距副属性区顶部约 26px
+SUB_STAT_ROW_H = 51
+SUB_STAT_FIRST = 26
+# 副属性行内：名字在左，数值在右，按这个 x 切分
+SUB_STAT_SPLIT_X = 1650
+
+# 左侧格子网格：9 列 x 4 行（实测列间距约 135，行高约 175）
+GRID_COLS = 9
+GRID_ROWS = 4
+GRID_ORIGIN = (134, 340)
+GRID_STEP = (135, 175)
+
 
 def scale_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:
     return round(x * width / DESIGN_W), round(y * height / DESIGN_H)
