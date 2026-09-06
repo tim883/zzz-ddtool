@@ -17,12 +17,17 @@ from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
+from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_ROWS, GRID_STEP, scale_point
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
+
+# 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280），
+# 旧值 1240 会把最后一列裁掉，导致每页最右边的盘子永远扫不到。
+LABEL_SCAN_AREA = (60, 150, 1330, 1000)
 
 
 class RunnerError(RuntimeError):
@@ -41,11 +46,17 @@ class RunResult:
 class Runner:
     """执行一个 Preset。任务链为空时，用 preset 当前槽位合成一个默认任务。"""
 
-    def __init__(self, preset: Preset) -> None:
+    def __init__(self, preset: Preset, *, hotkeys: bool = True) -> None:
         self.preset = preset
         self.log = get_logger("zzz_ddtool.runner")
         self.results: list[RunResult] = []
         self._processed = 0
+        self.hotkeys = HotkeyController() if hotkeys else None
+
+    def _checkpoint(self) -> None:
+        """F9 暂停 / F10 停止的安全检查点（未启用热键时为空操作）。"""
+        if self.hotkeys is not None:
+            self.hotkeys.checkpoint()
 
     def _default_job(self) -> TaskJob:
         return TaskJob(
@@ -78,16 +89,24 @@ class Runner:
         )
 
     def run(self) -> list[RunResult]:
-        """跑完整轮任务链，返回处理结果。"""
+        """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。"""
         self.results = []
         self._processed = 0
         jobs = self._jobs()
-        self.log.info("run start jobs=%d max_discs=%d", len(jobs), self.preset.max_discs)
-        for job in jobs:
-            if self._processed >= self.preset.max_discs:
-                self.log.info("max_discs reached, stop jobs")
-                break
-            self._run_job(job)
+        self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), self.preset.max_discs)
+        try:
+            for job in jobs:
+                if self._processed >= self.preset.max_discs:
+                    self.log.info("max_discs reached, stop jobs")
+                    break
+                try:
+                    self._run_job(job)
+                except RunnerStopped:
+                    self.log.warning("F10 停止：已处理 %d 个盘子，返回已有结果", self._processed)
+                    break
+        finally:
+            if self.hotkeys is not None:
+                self.hotkeys.close()
         self.log.info("run done processed=%d", self._processed)
         return list(self.results)
 
@@ -114,11 +133,20 @@ class Runner:
         w, h = image.width(), image.height()
         gx, gy = scale_point(640, 540, w, h)
 
+        # 筛选过程会滚动列表找 0 级盘，先把列表滚回顶部再扫描，
+        # 否则视口上方的行（可能含未处理的 0 级盘）永远不会被扫到。
+        for _ in range(3):
+            wheel_client(hwnd, gx, gy, 8)  # 正数向上滚，顶部会自动停
+            time.sleep(0.3)
+
         prev_signature: tuple | None = None
-        for page_idx in range(self.preset.max_pages):
-            if self._processed >= self.preset.max_discs:
-                self.log.info("job hit max_discs")
-                break
+        rescan = False  # True=点格子异常后已恢复，需重扫当前页（不翻页）
+        page_idx = 0
+        while page_idx < self.preset.max_pages:
+            self._checkpoint()
+            if rescan:
+                rescan = False
+                prev_signature = None  # 允许同一页重扫
             cells = self._visible_cells(w, h)
             signature = tuple(sorted(cells))
             if not cells or signature == prev_signature:
@@ -127,13 +155,24 @@ class Runner:
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
             for cx, cy in cells:
+                self._checkpoint()
                 if self._processed >= self.preset.max_discs:
                     break
                 click_client(hwnd, cx, cy)
                 time.sleep(0.5)
                 detail_image, page, *_ = self._grab(allow_esc=False)
                 if page in {"menu", "storage", "overworld"}:
-                    self.log.warning("detail click left drive_disc (page=%s), stop job", page)
+                    # 点飞了（如误触弹层）：Esc 退出尝试回驱动盘页；
+                    # 回得来就重扫当前页继续，回不来才中断。
+                    self.log.warning("detail click left drive_disc (page=%s), try recover", page)
+                    press_key(hwnd, VK_ESCAPE)
+                    time.sleep(0.6)
+                    _, page2, *_ = self._grab(allow_esc=False)
+                    if page2 == "drive_disc":
+                        self.log.info("recovered to drive_disc, rescan page")
+                        rescan = True
+                        break
+                    self.log.error("recover failed (page=%s), stop job", page2)
                     return
                 # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
@@ -148,10 +187,14 @@ class Runner:
                     self.log.warning("decision STOP (%s), end job", decision.reason)
                     return
                 time.sleep(0.3)
+            if rescan:
+                continue
+            self._checkpoint()
             press_key(hwnd, VK_ESCAPE)  # 关详情再翻页，滚轮才作用在网格上
             time.sleep(0.4)
             wheel_client(hwnd, gx, gy, -5)  # 翻下一页
             time.sleep(0.8)
+            page_idx += 1
 
     def _visible_cells(self, width: int, height: int) -> list[tuple[int, int]]:
         """OCR 当前页「等级」标签定位格子，返回未装备格子的图标中心点。
@@ -166,7 +209,7 @@ class Runner:
         from zzz_ddtool.ocr import read_rect
 
         cells: list[tuple[int, int]] = []
-        for line in read_rect(image, (60, 150, 1240, 1000)):
+        for line in read_rect(image, LABEL_SCAN_AREA):
             text = line.text.replace(" ", "")
             if not text.startswith("等级"):
                 continue
