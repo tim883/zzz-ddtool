@@ -64,6 +64,11 @@ def _open_drive_disc(hwnd: int, image, page: str, retries: int = 2) -> tuple[obj
         image, page, _method, _hwnd = _grab(hwnd)
         if is_page(image, DRIVE_DISC):
             return image, DRIVE_DISC
+        # 切换失败存现场图，供事后查状态
+        try:
+            save_image(image, _hwnd, _method, name=f"nav-切页签失败{i + 1}")
+        except Exception:
+            pass
     detail = " ".join(f"{name}={score:.2f}/{need:.2f}" for name, score, need in icon_report(image, DRIVE_DISC))
     raise NavError(f"点了驱动盘页签还是没切过去（{detail}），已中断。")
 
