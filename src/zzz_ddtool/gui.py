@@ -524,9 +524,11 @@ class WeightEditor(QWidget):
         remove.clicked.connect(lambda: self._delete(row))
         combo.currentTextChanged.connect(lambda *_: self.changed.emit())
         spin.valueChanged.connect(lambda *_: self.changed.emit())
-        layout.addWidget(combo, 1)
+        combo.setFixedWidth(150)
+        layout.addWidget(combo)
         layout.addWidget(spin)
         layout.addWidget(remove)
+        layout.addStretch()
         self._rows_box.addWidget(row)
         self._rows.append((combo, spin, row))
 
@@ -907,10 +909,11 @@ class MainWindow(QMainWindow):
         game_row = QHBoxLayout(game_box)
         self.filter_summary = QLabel("未设置")
         self.filter_summary.setObjectName("hint")
+        self.filter_summary.hide()  # 长文本不再显示（顶出面板），只留选择按钮
         pick_filter = QPushButton("选择…")
         pick_filter.setFixedWidth(80)
         pick_filter.clicked.connect(self._open_filter_dialog)
-        game_row.addWidget(self.filter_summary, 1)
+        game_row.addStretch()
         game_row.addWidget(pick_filter)
         layout.addWidget(game_box)
         layout.addStretch()
@@ -1259,20 +1262,6 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 pass
-        log_file = out_dir() / "logs" / "ddtool.log"
-        tail: list[str] = []
-        if log_file.exists():
-            try:
-                lines = log_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-                tail = [
-                    ln
-                    for ln in lines[-8:]
-                    if "RapidOCR" not in ln and "captured" not in ln and ln.strip()
-                ][-3:]
-            except Exception:
-                pass
-        if tail:
-            text = f"{text}  ·  {tail[-1]}"
         self.run_status_label.setText(text)
 
     def _load_path(self, path: Path) -> None:
