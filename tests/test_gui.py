@@ -19,7 +19,7 @@ def qapp() -> QApplication:
 
 
 def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
-    window = MainWindow()
+    window = MainWindow(config_path=tmp_path / "t.yaml")
     assert window.windowTitle() == "驱动盘强化辅助"
     assert window.sections
     visible = sum(1 for section in window.sections.values() for card in section.cards if not card.isHidden())
@@ -43,8 +43,8 @@ def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
     window.close()
 
 
-def test_collect_preset_roundtrip(qapp: QApplication) -> None:
-    window = MainWindow()
+def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
     preset = window.collect_preset()
     assert preset.weights
     assert preset.accepted is not None
@@ -52,8 +52,8 @@ def test_collect_preset_roundtrip(qapp: QApplication) -> None:
     window.close()
 
 
-def test_game_filter_checkboxes(qapp: QApplication) -> None:
-    window = MainWindow()
+def test_game_filter_checkboxes(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
     window._filter_sets = ["折枝剑歌"]
     window.filter_slots[4].click()
     qapp.processEvents()
@@ -68,8 +68,8 @@ def test_game_filter_checkboxes(qapp: QApplication) -> None:
     window.close()
 
 
-def test_mainstat_excluded_from_substat_cards(qapp: QApplication) -> None:
-    window = MainWindow()
+def test_mainstat_excluded_from_substat_cards(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
     window.filter_slots[4].click()
     qapp.processEvents()
     window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.2})
@@ -88,8 +88,8 @@ def test_mainstat_excluded_from_substat_cards(qapp: QApplication) -> None:
     window.close()
 
 
-def test_slot_switch_keeps_separate_plans(qapp: QApplication) -> None:
-    window = MainWindow()
+def test_slot_switch_keeps_separate_plans(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
     window.filter_slots[4].click()
     qapp.processEvents()
     window.weight_editor.set_weights({"暴击率": 1.0})
