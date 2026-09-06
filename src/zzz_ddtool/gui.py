@@ -835,22 +835,21 @@ class MainWindow(QMainWindow):
         flags.addLayout(limit_row)
         layout.addWidget(flags_box)
 
-        game_box = QGroupBox("游戏内筛选（进仓库先重置再套用）")
-        game_form = QFormLayout(game_box)
         self._filter_sets: list[str] = []
+        self._filter_dialog = QDialog(self)
+        self._filter_dialog.setWindowTitle("游戏内筛选（进仓库先重置再套用）")
+        self._filter_dialog.setMinimumWidth(420)
+        game_form = QFormLayout(self._filter_dialog)
         self.set_summary = QLabel("未选")
         self.set_summary.setWordWrap(False)
         self.set_summary.setObjectName("hint")
-        self.set_summary.setMaximumWidth(250)
-        self.set_summary.setMaximumHeight(22)
         pick_sets = QPushButton("选择套装")
-        pick_sets.setFixedWidth(92)
         pick_sets.clicked.connect(self._open_set_picker)
         set_row = QHBoxLayout()
         set_row.addWidget(self.set_summary, 1)
         set_row.addWidget(pick_sets)
         self.filter_slots: dict[int, QRadioButton] = {}
-        self.slot_group = QButtonGroup(panel)
+        self.slot_group = QButtonGroup(self._filter_dialog)
         self.slot_group.setExclusive(True)
         slots_row = QHBoxLayout()
         for slot in SLOTS:
@@ -865,7 +864,6 @@ class MainWindow(QMainWindow):
         self.filter_main_boxes: dict[str, QCheckBox] = {}
         self.main_host = QStackedWidget()
         self.main_host.setObjectName("mainHost")
-        self.main_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.main_host.setFixedHeight(80)
         self._mainstat_pages: dict[int, QWidget] = {}
         for slot, names in _MAINSTAT_PAGES.items():
@@ -896,6 +894,22 @@ class MainWindow(QMainWindow):
         game_form.addRow("部位", slots_row)
         game_form.addRow("主词条", self.main_host)
         game_form.addRow("", self.main_hint)
+        done_row = QHBoxLayout()
+        done_row.addStretch()
+        done_btn = QPushButton("完成")
+        done_btn.clicked.connect(self._filter_dialog.accept)
+        done_row.addWidget(done_btn)
+        game_form.addRow("", done_row)
+
+        game_box = QGroupBox("游戏内筛选（进仓库先重置再套用）")
+        game_row = QHBoxLayout(game_box)
+        self.filter_summary = QLabel("未设置")
+        self.filter_summary.setObjectName("hint")
+        pick_filter = QPushButton("选择…")
+        pick_filter.setFixedWidth(80)
+        pick_filter.clicked.connect(self._open_filter_dialog)
+        game_row.addWidget(self.filter_summary, 1)
+        game_row.addWidget(pick_filter)
         layout.addWidget(game_box)
         layout.addStretch()
 
@@ -903,6 +917,7 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(360)
         return scroll
@@ -1072,6 +1087,26 @@ class MainWindow(QMainWindow):
         width = max(self.set_summary.width(), 180)
         self.set_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
         self.set_summary.setToolTip(full)
+        self._update_filter_summary()
+
+    def _update_filter_summary(self) -> None:
+        parts = [f"{self._active_slot} 号位"]
+        if self._filter_sets:
+            parts.append("套装 " + "、".join(self._filter_sets))
+        else:
+            parts.append("套装不限")
+        mains = self._selected_mains()
+        if mains:
+            parts.append("主词条 " + "、".join(mains))
+        text = " · ".join(parts)
+        fm = QFontMetrics(self.filter_summary.font())
+        width = max(self.filter_summary.width(), 160)
+        self.filter_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
+        self.filter_summary.setToolTip(text)
+
+    def _open_filter_dialog(self) -> None:
+        self._update_set_summary()
+        self._filter_dialog.exec()
 
     def _open_set_picker(self) -> None:
         extra = [name for name in self._filter_sets if name not in SETS]
@@ -1155,6 +1190,7 @@ class MainWindow(QMainWindow):
         if self._loading:
             return
         self.weight_editor.set_blocked(set(self._selected_mains()))
+        self._update_filter_summary()
         self._schedule_rebuild()
 
     def _origin_scroll(self, origin: Origin) -> dict[str, object]:
