@@ -45,6 +45,10 @@ NONANTIALIASED_QUALITY = 3  # 关抗锯齿，避免颜色键窗口文字边缘�
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
 
+# 消息参数必须按 64 位宽度转换，否则 DefWindowProcW 收到大 lParam 会 OverflowError
+user32.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM
 )
