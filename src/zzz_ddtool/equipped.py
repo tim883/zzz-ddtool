@@ -26,3 +26,18 @@ def tile_has_portrait(image, left: int, top: int, right: int, bottom: int) -> bo
                 continue
             colorful += 1
     return total > 0 and colorful / total >= 0.12
+
+
+def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
+    """格子中心右上区域的深红圆牌 = 已打弃置标（2026-09-06 实拍标定）。
+
+    标记中心约在 (cx+40, cy-55)，区域 (cx+22..cx+60, cy-75..cy-38)。
+    实测有标 ≈330 红像素、无标 0，阈值 50 余量充足。
+    """
+    red = 0
+    for x in range(cx + 22, cx + 60, 2):
+        for y in range(cy - 75, cy - 38, 2):
+            color = image.pixelColor(x, y)
+            if color.red() > 130 and color.green() < 75 and color.blue() < 75:
+                red += 1
+    return red >= 50

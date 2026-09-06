@@ -165,7 +165,15 @@ def _cmd_preview(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    import logging
+    import sys
+
     from zzz_ddtool.runner import Runner, RunnerError
+
+    # 日志实时打到控制台，运行过程随时可见
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
+    logging.getLogger("zzz_ddtool").addHandler(handler)
 
     preset = load_preset(args.config)
     runner = Runner(preset)

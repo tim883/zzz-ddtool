@@ -60,6 +60,28 @@ class Runner:
         if self.hotkeys is not None:
             self.hotkeys.checkpoint()
 
+    def _set_status(self, phase: str, message: str = "", cell: str = "") -> None:
+        """把运行状态写到 out/run-status.json，随时可查看工具正在干什么。"""
+        try:
+            import json
+
+            from zzz_ddtool.paths import out_dir
+
+            payload = {
+                "time": time.strftime("%H:%M:%S"),
+                "phase": phase,
+                "cell": cell,
+                "message": message,
+                "processed": self._processed,
+                "max_discs": self.preset.max_discs,
+            }
+            out_dir().mkdir(parents=True, exist_ok=True)
+            (out_dir() / "run-status.json").write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
     def _default_job(self) -> TaskJob:
         return TaskJob(
             slot=self.preset.filter_slot,
@@ -96,6 +118,7 @@ class Runner:
         self._processed = 0
         jobs = self._jobs()
         self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), self.preset.max_discs)
+        self._set_status("run_start", f"jobs={len(jobs)}")
         try:
             for job in jobs:
                 if self._processed >= self.preset.max_discs:
@@ -110,6 +133,7 @@ class Runner:
             if self.hotkeys is not None:
                 self.hotkeys.close()
         self.log.info("run done processed=%d", self._processed)
+        self._set_status("done", f"processed={self._processed}")
         return list(self.results)
 
     def _run_job(self, job: TaskJob) -> None:
@@ -135,11 +159,17 @@ class Runner:
         w, h = image.width(), image.height()
         gx, gy = scale_point(640, 540, w, h)
 
-        # 筛选过程会滚动列表找 0 级盘，先把列表滚回顶部再扫描，
-        # 否则视口上方的行（可能含未处理的 0 级盘）永远不会被扫到。
-        for _ in range(3):
-            wheel_client(hwnd, gx, gy, 8)  # 正数向上滚，顶部会自动停
-            time.sleep(0.3)
+        # 滚回列表顶部：滚一轮扫一次，某轮滚动后扫描结果不再变化 = 到顶
+        # （真顶再往上滚页面纹丝不动，这是"到顶"的唯一铁证），保证从第一行开始处理。
+        prev_sig: tuple | None = None
+        for _top_round in range(6):
+            sig = tuple(sorted((r, c) for r, c, _, _ in self._visible_cells(w, h)))
+            if sig == prev_sig:
+                self.log.info("scroll top confirmed after %d rounds", _top_round)
+                break
+            prev_sig = sig
+            wheel_client(hwnd, gx, gy, 8)  # 正数向上滚
+            time.sleep(0.35)
 
         prev_signature: tuple | None = None
         rescan = False  # True=点格子异常后已恢复，需重扫当前页（不翻页）
@@ -150,13 +180,14 @@ class Runner:
             if rescan:
                 rescan = False
                 prev_signature = None  # 允许同一页重扫
-            cells = self._visible_cells(w, h)
+            cells = self._visible_cells(w, h, skip_tagged=self.preset.skip_discarded)
             signature = tuple(sorted(cells))
             if not cells or signature == prev_signature:
                 self.log.info("page %d empty or same as before, job done", page_idx)
                 break
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
+            self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
             for row, col, cx, cy in cells:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
@@ -208,6 +239,7 @@ class Runner:
                             self.log.info(
                                 "cell %s UPGRADE done, level %d -> next stage re-judge", cell_tag, disc.level
                             )
+                            self._set_status("upgraded", f"level {disc.level}", cell_tag)
                         # 无论成败，_do_upgrade 结束后都在仓库页：重扫让升阶后的盘
                         # 在 3/6/9/12 档重新解析词条再判（accepted 白名单按档生效）
                         rescan = True
@@ -224,6 +256,7 @@ class Runner:
                     self.log.info(
                         "cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level
                     )
+                    self._set_status("action", decision.action.value, cell_tag)
                 time.sleep(0.3)
             if rescan:
                 continue
@@ -234,15 +267,18 @@ class Runner:
             time.sleep(0.8)
             page_idx += 1
 
-    def _visible_cells(self, width: int, height: int) -> list[tuple[int, int, int, int]]:
+    def _visible_cells(
+        self, width: int, height: int, *, skip_tagged: bool = False
+    ) -> list[tuple[int, int, int, int]]:
         """OCR 当前页「等级」标签定位格子，返回 (row, col, cx, cy)，按行优先排序去重。
 
-        点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过。
+        点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过；
+        skip_tagged=True 时弃置标记格在扫描阶段直接剔除（连点都不点）。
         """
         image, _method, hwnd = grab_game_image()
         ox, oy = scale_point(*GRID_ORIGIN, width, height)
         sx, sy = scale_point(*GRID_STEP, width, height)
-        from zzz_ddtool.equipped import tile_has_portrait
+        from zzz_ddtool.equipped import tile_has_discard_badge, tile_has_portrait
         from zzz_ddtool.layout import GRID_LABEL_DY
         from zzz_ddtool.ocr import read_rect
 
@@ -260,6 +296,9 @@ class Runner:
             cx, cy = ox + col * sx, oy + row * sy
             if tile_has_portrait(image, cx - 56, cy - 68, cx + 56, cy + 68):
                 self.log.info("cell r%dc%d equipped, skip", row, col)
+                continue
+            if skip_tagged and tile_has_discard_badge(image, cx, cy):
+                self.log.info("cell r%dc%d discard-tagged, skip at scan", row, col)
                 continue
             cells[(row, col)] = (row, col, cx, cy)
         # 强制行优先（第1行从左到右，再第2行…），保证处理顺序确定、不跳格
