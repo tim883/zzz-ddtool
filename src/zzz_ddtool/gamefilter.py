@@ -104,6 +104,16 @@ def _select_names(
     raise FilterClickError(f"弹层里找不到目标，滚动 {_MAX_SCROLL_ROUNDS} 轮未果：{pending}")
 
 
+def _confirm_popup(hwnd: int) -> None:
+    """关弹层必须且只能点「确认筛选」，绝不按 Esc（按了会取消勾选）。
+
+    找不到按钮就中断，保持现状等人处理。
+    """
+    if not _find_and_click(hwnd, "确认筛选", FULL_WINDOW, width=1920, height=1080, cutoff=0.8):
+        raise FilterClickError("没找到「确认筛选」按钮，弹层未关闭。按手册 01 中断。")
+    time.sleep(0.4)
+
+
 def apply_sets_mainstats(
     hwnd: int,
     width: int,
@@ -114,7 +124,8 @@ def apply_sets_mainstats(
 ) -> None:
     """在筛选面板里点开套装/主属性词条选择器并勾选。
 
-    弹层布局未标定，全部靠 OCR 找字点击；认不上就中断（手册 01 底线）。
+    实测弹层（setpicker-live.png）：图标+名字网格，底部「重置 / 确认筛选」。
+    全部靠 OCR 找字点击；认不上就中断（手册 01 底线）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     if sets:
@@ -122,12 +133,12 @@ def apply_sets_mainstats(
             raise FilterClickError("筛选面板里没找到「点击选择」条。")
         time.sleep(0.6)
         _select_names(hwnd, sets, width=width, height=height, scroll_center=(960, 540))
-        press_key(hwnd, VK_ESCAPE)  # 关套装弹层，回到筛选面板
-        time.sleep(0.4)
+        _confirm_popup(hwnd)
         log.info("sets picked: %s", list(sets))
     if mainstats:
         # 主属性词条区在面板下部；先滚到面板底再点名
         _select_names(hwnd, mainstats, width=width, height=height, scroll_center=(1560, 700))
+        _confirm_popup(hwnd)
         log.info("mainstats picked: %s", list(mainstats))
 
 

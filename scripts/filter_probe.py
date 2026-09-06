@@ -28,6 +28,19 @@ def main() -> int:
     out = Path("out/captures")
     out.mkdir(parents=True, exist_ok=True)
 
+    # 不在驱动盘页就先导航过去
+    from zzz_ddtool.screen import classify_image
+    page = classify_image(image)
+    if page != "drive_disc":
+        print(f"当前页 {page}，先导航到仓库驱动盘页…")
+        from zzz_ddtool.nav import goto_warehouse
+        goto_warehouse()
+        image, _method, hwnd = grab_game_image()
+        page = classify_image(image)
+        if page != "drive_disc":
+            print(f"导航后仍在 {page}，中断不点")
+            return 1
+
     fx, fy = scale_point(*FILTER_BTN, width, height)
     click_client(hwnd, fx, fy)
     time.sleep(0.6)
