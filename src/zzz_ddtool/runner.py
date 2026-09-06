@@ -215,6 +215,9 @@ class Runner:
                 elif decision.action == Action.MARK_DISCARD and disc.discarded:
                     # 已带标重判仍判弃置：空操作，不扣 max_discs 额度
                     self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
+                elif decision.action == Action.SKIP and disc.discarded:
+                    # 跳过弃置标记盘：不点击不按键不扣额度
+                    self.log.info("cell %s has discard tag, skip (no count)", cell_tag)
                 else:
                     self._act(hwnd, decision.action, disc)
                     self._processed += 1
