@@ -15,7 +15,17 @@ import cv2
 import numpy as np
 from PySide6.QtGui import QImage
 
-from zzz_ddtool.layout import ACTION_ROW, DISC_LEVEL, MAIN_STAT, SUB_STAT_SPLIT_X, SUB_STATS, scale_rect
+from zzz_ddtool.layout import (
+    ACTION_ROW,
+    DISC_LEVEL,
+    MAIN_STAT,
+    SUB_STAT_SPLIT_X,
+    SUB_STATS,
+    UPGRADE_LEVEL,
+    UPGRADE_SUB_SPLIT_X,
+    UPGRADE_SUB_STATS,
+    scale_rect,
+)
 from zzz_ddtool.models import Disc, Substat
 
 # 副属性可能出现的全部名字（含 % 与 flat 区分）
@@ -212,45 +222,64 @@ def _parse_substat(name_text: str, value_text: str) -> Substat | None:
 
 
 def _pair_substat_lines(lines: list[OcrLine], split_x: int) -> list[tuple[str, str]]:
-    """把 SUB_STATS 区域里的名字行与数值行按垂直位置配对。"""
-    names = [ln for ln in lines if (ln.left + ln.right) // 2 < split_x]
-    values = [ln for ln in lines if (ln.left + ln.right) // 2 >= split_x]
+    """把副属性区域里的名字行与数值行配对。
+
+    副属性是两列布局（名字 数值 | 名字 数值），单一 split_x 切分会把第二列
+    名字误当数值、第一列数值误当名字。改用：名字=含非数字字符（中文），
+    数值=纯数字（可含 %）；按 y 聚成行，行内按 x 排序后「名字 → 右侧最近
+    的数值」相邻配对。split_x 参数保留但不再参与切分。
+    """
+    def _is_value(text: str) -> bool:
+        t = text.replace("%", "").replace("+", "").replace(".", "").replace("-", "").strip()
+        return t.isdigit()
+
+    rows: list[list[OcrLine]] = []
+    for ln in sorted(lines, key=lambda l: (l.top, l.left)):
+        cy = (ln.top + ln.bottom) // 2
+        if rows and abs(cy - ((rows[-1][-1].top + rows[-1][-1].bottom) // 2)) <= 30:
+            rows[-1].append(ln)
+        else:
+            rows.append([ln])
+
     pairs: list[tuple[str, str]] = []
-    used_values: set[int] = set()
-    for name_line in names:
-        ny = (name_line.top + name_line.bottom) // 2
-        best: OcrLine | None = None
-        best_dy = 1e9
-        for idx, value_line in enumerate(values):
-            if idx in used_values:
-                continue
-            vy = (value_line.top + value_line.bottom) // 2
-            dy = abs(vy - ny)
-            if dy < best_dy:
-                best_dy = dy
-                best = value_line
-                best_idx = idx
-        if best is not None and best_dy <= 40:
-            pairs.append((name_line.text, _fix_percent(best.text)))
-            used_values.add(best_idx)
+    for row in rows:
+        row.sort(key=lambda l: l.left)
+        names = [ln for ln in row if not _is_value(ln.text)]
+        values = [ln for ln in row if _is_value(ln.text)]
+        for name in names:
+            nx = (name.left + name.right) // 2
+            best: OcrLine | None = None
+            best_dx = 1e9
+            for val in values:
+                vx = (val.left + val.right) // 2
+                if vx > nx and vx - nx < best_dx:
+                    best_dx = vx - nx
+                    best = val
+            if best is not None:
+                pairs.append((name.text, _fix_percent(best.text)))
+                values.remove(best)
     return pairs
 
 
-def read_level(image: QImage) -> int | None:
-    """读取详情面板等级，返回 0~15 的数字。"""
-    for line in read_rect(image, DISC_LEVEL):
+def read_level(image: QImage, area: tuple[int, int, int, int] = DISC_LEVEL) -> int | None:
+    """读取等级数字（默认详情面板，可传强化页区域），返回 0~15 的数字。"""
+    for line in read_rect(image, area):
         m = re.search(r"(\d+)", line.text)
         if m:
             return int(m.group(1))
     return None
 
 
-def read_substats(image: QImage) -> tuple[Substat, ...]:
-    """读取详情面板副属性，返回 (Substat, ...)。认不出的行跳过。"""
-    lines = read_rect(image, SUB_STATS)
+def read_substats(
+    image: QImage,
+    area: tuple[int, int, int, int] = SUB_STATS,
+    split_x: int = SUB_STAT_SPLIT_X,
+) -> tuple[Substat, ...]:
+    """读取副属性，返回 (Substat, ...)。认不出的行跳过。area/split_x 可传强化页区域。"""
+    lines = read_rect(image, area)
     if not lines:
         return ()
-    split_x_scaled = scale_rect(SUB_STAT_SPLIT_X, 0, SUB_STAT_SPLIT_X, 1, image.width(), image.height())[0]
+    split_x_scaled = scale_rect(split_x, 0, split_x, 1, image.width(), image.height())[0]
     pairs = _pair_substat_lines(lines, split_x_scaled)
     substats: list[Substat] = []
     for name_text, value_text in pairs:
@@ -310,3 +339,18 @@ def parse_disc(image: QImage) -> Disc | None:
         locked=actions["locked"],
         discarded=actions["discarded"],
     )
+
+
+def parse_disc_upgrade_page(image: QImage) -> Disc | None:
+    """从强化页截图解析 Disc（强化页副属性/等级坐标）。
+
+    强化页没有 R/T 按钮，弃置在详情页做；这里只读等级+副属性供 decide 判断
+    升级还是弃置。失败返回 None。
+    """
+    level = read_level(image, UPGRADE_LEVEL)
+    if level is None:
+        return None
+    substats = read_substats(image, UPGRADE_SUB_STATS, UPGRADE_SUB_SPLIT_X)
+    if not substats:
+        return None
+    return Disc(level=level, substats=substats, locked=False, discarded=False)

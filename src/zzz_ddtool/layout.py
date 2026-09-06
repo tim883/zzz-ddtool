@@ -21,18 +21,25 @@ DISMANTLE_FORBID = (210, 890, 460, 990)
 # FILTER_RESET=(1301,1033) 偏到重置按钮左缘图标；FILTER_SLOTS 整表偏到错误按钮上。
 FILTER_RESET = (1432, 1029)
 
-# 右侧详情面板。坐标来自 scripts/ocr_probe.py 在手册/样张/驱动盘页.png 上的实测。
+# 右侧详情面板。2026-09-06 OCR 实测（out/captures/detail-page.png + 老大截图）重新标定：
+# 旧值 DISC_LEVEL/MAIN_STAT/SUB_STATS 偏下约 150px，导致 parse_disc 读不到副属性。
 DETAIL_PANEL = (1400, 225, 1870, 800)
 DISC_NAME = (1400, 260, 1620, 315)
-DISC_LEVEL = (1450, 390, 1620, 445)
-MAIN_STAT = (1415, 480, 1840, 535)
-SUB_STATS = (1415, 558, 1840, 775)
+DISC_LEVEL = (1180, 190, 1310, 250)  # 等级（右上，避开右侧「15」上限数字）
+MAIN_STAT = (1150, 295, 1470, 345)  # 主属性名字+数值
+SUB_STATS = (1160, 390, 1790, 495)  # 副属性（两列：名字 数值 | 名字 数值）
 ACTION_ROW = (1600, 1000, 1880, 1070)
 # 副属性每行的高度，约 51px；第一行中心距副属性区顶部约 26px
 SUB_STAT_ROW_H = 51
 SUB_STAT_FIRST = 26
 # 副属性行内：名字在左，数值在右，按这个 x 切分
 SUB_STAT_SPLIT_X = 1650
+
+# 强化页（点详情页「查看/强化」进入的弹层）。2026-09-06 OCR 实测老大截图：
+# 副属性整体比详情页左移约 300px，判断要在这里做，必须用强化页自己的坐标。
+UPGRADE_SUB_STATS = (883, 419, 1692, 501)
+UPGRADE_LEVEL = (940, 525, 1100, 580)  # 强化页当前等级数字（避开右侧经验 0/1440）
+UPGRADE_SUB_SPLIT_X = 1250  # 强化页副属性名字/数值分界
 
 # 左侧格子网格：9 列 x 4 行。funnel-debug.png 实测：
 # 「等级」标签列中心 x=166 起步长 135，行中心 y=354 起步长 175。
