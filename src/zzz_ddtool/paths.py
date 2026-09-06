@@ -15,6 +15,15 @@ def assets_dir() -> Path:
     return Path(__file__).resolve().parent / "assets"
 
 
+def configs_dir() -> Path:
+    return repo_root() / "configs"
+
+
+def archives_file() -> Path:
+    """权重+档位要求临时存档（所有槽位方案共用的命名模板）。"""
+    return configs_dir() / "archives.json"
+
+
 def out_dir() -> Path:
     return repo_root() / "out"
 

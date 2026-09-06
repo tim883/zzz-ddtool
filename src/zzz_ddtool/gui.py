@@ -799,11 +799,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(4)
 
+        # 预设名称（YAML 的 name 字段，非方案名）不在面板显示，保存时沿用
         self.name_edit = QLineEdit()
-        name_box = QGroupBox("预设")
-        name_form = QFormLayout(name_box)
-        name_form.addRow("名称", self.name_edit)
-        layout.addWidget(name_box)
+        self.name_edit.hide()
 
         weights_box = QGroupBox("词条单价（没写的是废词条）")
         weights_layout = QVBoxLayout(weights_box)
@@ -811,6 +809,29 @@ class MainWindow(QMainWindow):
         self.weight_editor.changed.connect(self._schedule_rebuild)
         weights_layout.addWidget(self.weight_editor)
         layout.addWidget(weights_box)
+
+        archive_box = QGroupBox("存档（权重+档位要求，各槽位共用）")
+        archive_layout = QVBoxLayout(archive_box)
+        archive_layout.setSpacing(4)
+        self.archive_combo = QComboBox()
+        self.archive_combo.setEditable(True)
+        self.archive_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        apply_btn = QPushButton("套用")
+        apply_btn.clicked.connect(self._apply_archive)
+        save_btn = QPushButton("存入当前")
+        save_btn.clicked.connect(self._save_archive)
+        del_btn = QPushButton("删除")
+        del_btn.clicked.connect(self._delete_archive)
+        arow1 = QHBoxLayout()
+        arow1.addWidget(self.archive_combo, 1)
+        arow1.addWidget(apply_btn)
+        arow2 = QHBoxLayout()
+        arow2.addWidget(save_btn)
+        arow2.addWidget(del_btn)
+        arow2.addStretch()
+        archive_layout.addLayout(arow1)
+        archive_layout.addLayout(arow2)
+        layout.addWidget(archive_box)
 
         flags_box = QGroupBox("硬过滤")
         flags = QVBoxLayout(flags_box)
@@ -913,8 +934,8 @@ class MainWindow(QMainWindow):
         pick_filter = QPushButton("选择…")
         pick_filter.setFixedWidth(80)
         pick_filter.clicked.connect(self._open_filter_dialog)
-        game_row.addStretch()
         game_row.addWidget(pick_filter)
+        game_row.addStretch()
         layout.addWidget(game_box)
         layout.addStretch()
 
@@ -1030,7 +1051,21 @@ class MainWindow(QMainWindow):
         job = self._job_from_editor()
         self._jobs.append(job)
         self._editing_job_id = job.job_id
-        self._slot_plans[job.slot] = self._snapshot_slot()
+        snap = self._snapshot_slot()
+        self._slot_plans[job.slot] = snap
+        # 加入任务链后，存为使用的存档：把该方案实际用的权重+档位要求写回所选存档
+        name = self.archive_combo.currentText().strip()
+        if name:
+            data = self._load_archives()
+            data[name] = {
+                "weights": dict(snap.get("weights") or {}),
+                "stage_require": {
+                    origin: dict(table)
+                    for origin, table in (snap.get("stage_require") or {}).items()
+                },
+            }
+            self._write_archives(data)
+            self._refresh_archive_combo(name)
         self._refresh_chain_list(job.job_id)
 
     def _update_job(self) -> None:
@@ -1146,6 +1181,76 @@ class MainWindow(QMainWindow):
                 f"{self._active_slot} 号位主词条固定是{fixed[self._active_slot]}，不用选。右侧只编这个部位的副词条。"
             )
 
+    def _load_archives(self) -> dict:
+        import json
+
+        from zzz_ddtool.paths import archives_file
+
+        f = archives_file()
+        if not f.exists():
+            return {}
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _write_archives(self, data: dict) -> None:
+        import json
+
+        from zzz_ddtool.paths import archives_file
+
+        archives_file().parent.mkdir(parents=True, exist_ok=True)
+        archives_file().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _refresh_archive_combo(self, select: str | None = None) -> None:
+        names = sorted(self._load_archives())
+        self.archive_combo.blockSignals(True)
+        self.archive_combo.clear()
+        self.archive_combo.addItems(names)
+        if select:
+            self.archive_combo.setCurrentText(select)
+        self.archive_combo.blockSignals(False)
+
+    def _save_archive(self) -> None:
+        name = self.archive_combo.currentText().strip()
+        if not name:
+            self.path_label.setText("存档：先在框里输入存档名再点「存入当前」。")
+            return
+        snap = self._snapshot_slot()
+        data = self._load_archives()
+        data[name] = {
+            "weights": dict(snap.get("weights") or {}),
+            "stage_require": {
+                origin: dict(table)
+                for origin, table in (snap.get("stage_require") or {}).items()
+            },
+        }
+        self._write_archives(data)
+        self._refresh_archive_combo(name)
+        self.path_label.setText(f"存档：已保存「{name}」。")
+
+    def _apply_archive(self) -> None:
+        name = self.archive_combo.currentText().strip()
+        data = self._load_archives().get(name)
+        if not data:
+            self.path_label.setText(f"存档：没有叫「{name}」的存档。")
+            return
+        self.weight_editor.set_weights(dict(data.get("weights") or {}))
+        self._apply_stage_require(data.get("stage_require") or {})
+        self._schedule_rebuild()
+        self.path_label.setText(f"存档：已套用「{name}」到 {self._active_slot} 号位。")
+
+    def _delete_archive(self) -> None:
+        name = self.archive_combo.currentText().strip()
+        data = self._load_archives()
+        if name in data:
+            del data[name]
+            self._write_archives(data)
+        self._refresh_archive_combo()
+        self.path_label.setText(f"存档：已删除「{name}」。")
+
     def _snapshot_slot(self) -> dict:
         stage_require = {"three": {}, "four": {}}
         for (origin, checkpoint), section in self.sections.items():
@@ -1242,6 +1347,7 @@ class MainWindow(QMainWindow):
         self._run_timer.timeout.connect(self._refresh_run_status)
         self._run_timer.start()
         self._refresh_run_status()
+        self._refresh_archive_combo()
         return bar
 
     def _refresh_run_status(self) -> None:
@@ -1439,7 +1545,7 @@ class MainWindow(QMainWindow):
         picked = len(self._accepted_ids())
         self.status.setText(
             f"任务链 {len(self._jobs)} 节 · 正在编 {self._active_slot} 号 · "
-            f"可见 {visible} / {total} 张，已勾选 {picked} 张"
+            f"组合库共 {total} 种，当前筛选可见 {visible}，已勾选 {picked}"
         )
 
     def _toggle_on_top(self, on: bool) -> None:
