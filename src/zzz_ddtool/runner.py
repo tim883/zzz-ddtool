@@ -20,7 +20,7 @@ from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_ROWS, GRID_STEP, scale_point
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
+from zzz_ddtool.models import Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
@@ -143,6 +143,7 @@ class Runner:
 
         prev_signature: tuple | None = None
         rescan = False  # True=点格子异常后已恢复，需重扫当前页（不翻页）
+        up_counts: dict[tuple[int, int], int] = {}  # 每格升阶次数（跨重扫累计，防死循环）
         page_idx = 0
         while page_idx < self.preset.max_pages:
             self._checkpoint()
@@ -186,36 +187,29 @@ class Runner:
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 self._record(job, disc, decision)
                 self._processed += 1
-                # 强化阶段循环：升到 3/6/9/12 后重新解析词条再判，
-                # 该继续升就继续，直到判非升级或满级（accepted 白名单按档生效）。
-                guard = 0
-                while True:
-                    if decision.action == Action.STOP:
-                        self.log.warning("decision STOP (%s), end job", decision.reason)
-                        return
-                    if decision.action != Action.UPGRADE:
-                        self._act(hwnd, decision.action, disc)
+                key = (cx, cy)
+                if decision.action == Action.STOP:
+                    self.log.warning("decision STOP (%s), end job", decision.reason)
+                    return
+                if decision.action == Action.UPGRADE:
+                    if up_counts.get(key, 0) >= _MAX_STAGE_UPGRADES:
+                        self.log.warning(
+                            "cell %s upgrades capped at %d, skip action", key, _MAX_STAGE_UPGRADES
+                        )
+                    else:
+                        if disc.discarded:
+                            # 先摘掉旧弃置标签再强化，保证终态统一（R 是开关，按 discarded 条件化）
+                            press_key_once(hwnd, VK_R)
+                            time.sleep(0.5)
+                            self.log.info("UPGRADE：摘除旧弃置标签 (R)")
+                        if self._do_upgrade(hwnd):
+                            up_counts[key] = up_counts.get(key, 0) + 1
+                        # 无论成败，_do_upgrade 结束后都在仓库页：重扫让升阶后的盘
+                        # 在 3/6/9/12 档重新解析词条再判（accepted 白名单按档生效）
+                        rescan = True
                         break
-                    if disc.level >= MAX_LEVEL:
-                        self.log.info("level %d max, stop upgrading this disc", disc.level)
-                        break
-                    guard += 1
-                    if guard > _MAX_STAGE_UPGRADES:
-                        self.log.warning("stage upgrades exceed %d, next cell", _MAX_STAGE_UPGRADES)
-                        break
-                    self._act(hwnd, Action.UPGRADE, disc)
-                    time.sleep(0.6)
-                    stage_image, page2, *_ = self._grab(allow_esc=False)
-                    new_disc = self._parse_disc(stage_image) if page2 == "unknown" else None
-                    if new_disc is None:
-                        self.log.warning("post-upgrade re-parse failed (page=%s), next cell", page2)
-                        break
-                    if new_disc.level <= disc.level:
-                        self.log.warning("level not increased (%d), stop this disc", new_disc.level)
-                        break
-                    disc = new_disc
-                    decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
-                    self._record(job, disc, decision)
+                else:
+                    self._act(hwnd, decision.action, disc)
                 time.sleep(0.3)
             if rescan:
                 continue
@@ -287,16 +281,10 @@ class Runner:
     UPGRADE_CONFIRM_AREA = (1450, 860, 1700, 980)
 
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
+        # UPGRADE 在 _run_job 里内联处理（需要 rescan/计数联动），这里只管其余动作。
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
-        # 翻页前由 _run_job 统一 Esc。
         # R 是开关：按之前必须看 disc.discarded，否则打标签会变成摘标签（反之亦然）。
-        if action == Action.UPGRADE:
-            if disc.discarded:
-                press_key_once(hwnd, VK_R)  # 先摘掉旧弃置标签再强化，保证终态统一
-                time.sleep(0.5)
-                self.log.info("action=UPGRADE：摘除旧弃置标签 (R)")
-            self._do_upgrade(hwnd)
-        elif action == Action.MARK_DISCARD:
+        if action == Action.MARK_DISCARD:
             if disc.discarded:
                 self.log.info("action=MARK_DISCARD：已带弃置标签，跳过按键")
             else:
@@ -308,6 +296,26 @@ class Runner:
         elif action == Action.STOP:
             self.log.info("action=STOP")
 
+    def _esc_back_to_grid(self, hwnd: int, max_esc: int = 4) -> bool:
+        """按 Esc 逐次回退，每按一次截屏认页，回到驱动盘仓库页立即停。
+
+        绝不盲按、绝不退出仓库（老大硬性要求：留在仓库页最安全）。
+        返回 True=已回到仓库页；False=越界离开仓库（调用方应停止动作）。
+        """
+        for i in range(max_esc):
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.5)
+            _, page, *_ = self._grab(allow_esc=False)
+            if page == "drive_disc":
+                self.log.info("esc back to grid after %d esc", i + 1)
+                return True
+            if page in {"menu", "storage", "overworld"}:
+                self.log.error("esc back overshot to %s, stop", page)
+                return False
+            # unknown = 还在详情/缩放/强化层，继续 Esc
+        self.log.error("esc back failed after %d esc, still unknown", max_esc)
+        return False
+
     def _dbg_capture(self, tag: str) -> None:
         """中断点自动存图，供事后标定（存 captures 目录，命名 upg-<tag>）。"""
         try:
@@ -318,11 +326,12 @@ class Runner:
         except Exception as exc:  # 存图失败不影响主流程
             self.log.warning("dbg capture %s failed: %s", tag, exc)
 
-    def _do_upgrade(self, hwnd: int) -> None:
+    def _do_upgrade(self, hwnd: int) -> bool:
         """老大截图标定的完整链路：
 
-        详情页大按钮(查看) → 缩放页「>>」箭头 → 强化页「阶段添加」→「升级」→ Esc 回列表。
-        每一步 OCR 认按钮，认不出就存图 + 中断回退（手册 01）。
+        详情页大按钮(查看) → 缩放页「>>」箭头 → 强化页「阶段添加」→「升级」。
+        每一步 OCR 认按钮，认不出就存图 + 逐次验证 Esc 回仓库页。
+        返回 True=完成一次升级；False=中断（调用方安排重扫）。
         """
         from zzz_ddtool.ocr import read_rect
 
@@ -346,63 +355,62 @@ class Runner:
             if hit:
                 break
         if hit is None:
-            self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮，Esc 跳过")
+            self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮，回仓库页")
             self._dbg_capture("step1-查看")
-            press_key(hwnd, VK_ESCAPE)
-            return
+            self._esc_back_to_grid(hwnd)
+            return False
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
         time.sleep(0.9)
 
-        # 2) 缩放页「>>」金箭头：在「等级00」右侧约 95px
-        image, *_ = self._grab()
-        level_line = None
-        for line in read_rect(image, self.ZOOM_LEVEL_AREA):
-            if "等级" in line.text.replace(" ", ""):
-                level_line = line
-                break
-        if level_line is None:
-            self.log.warning("UPGRADE: 缩放页没找到「等级」，中断回退")
-            self._dbg_capture("step2-等级")
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.4)
-            press_key(hwnd, VK_ESCAPE)
-            return
-        ax = level_line.right + 95
-        ay = (level_line.top + level_line.bottom) // 2
-        click_client(hwnd, ax, ay)
-        time.sleep(1.0)
+        def _zoom_level_line():
+            image, *_ = self._grab()
+            for line in read_rect(image, self.ZOOM_LEVEL_AREA):
+                if "等级" in line.text.replace(" ", ""):
+                    return line
+            return None
 
-        # 3) 强化页「阶段添加」加素材
-        image, *_ = self._grab()
-        self._dbg_capture("step3-强化页")  # 强化页还没实拍标定过，先存图再找
-        if not _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step3-无阶段添加"):
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.4)
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.4)
-            press_key(hwnd, VK_ESCAPE)
-            return
+        # 2) 缩放页「>>」金箭头：OCR「等级00」右缘 +110px（实拍标定：
+        #    等级文字 right≈1305，箭头按钮中心≈1416）
+        level_line = _zoom_level_line()
+        if level_line is None:
+            self.log.warning("UPGRADE: 缩放页没找到「等级」，回仓库页")
+            self._dbg_capture("step2-等级")
+            self._esc_back_to_grid(hwnd)
+            return False
+
+        # 3) 点箭头进强化页，验证「阶段添加」出现；没翻页就重试一次
+        ax = level_line.right + 110
+        ay = (level_line.top + level_line.bottom) // 2
+        stage_clicked = False
+        for attempt in (1, 2):
+            click_client(hwnd, ax, ay)
+            time.sleep(1.0)
+            image, *_ = self._grab()
+            self._dbg_capture(f"step3-尝试{attempt}")  # 强化页还没实拍标定过，先存图再找
+            if _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", f"step3-无阶段添加{attempt}"):
+                stage_clicked = True
+                break
+            level_line = _zoom_level_line()
+            if level_line is None:
+                break  # 页面既不是缩放页也没阶段添加，别乱点，回退
+            ax = level_line.right + 110
+            ay = (level_line.top + level_line.bottom) // 2
+        if not stage_clicked:
+            self.log.warning("UPGRADE: 两次都没进强化页，回仓库页")
+            self._esc_back_to_grid(hwnd)
+            return False
         time.sleep(0.8)
 
         # 4) 「升级」确认
         image, *_ = self._grab()
         if not _click_line(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step4-无升级"):
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.4)
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.4)
-            press_key(hwnd, VK_ESCAPE)
-            return
+            self._esc_back_to_grid(hwnd)
+            return False
         time.sleep(1.5)
         self.log.info("action=UPGRADE 完成（阶段添加→升级）")
-        # 5) 强化页 → 缩放页 → 网格
-        press_key(hwnd, VK_ESCAPE)
-        time.sleep(0.4)
-        press_key(hwnd, VK_ESCAPE)
-        time.sleep(0.4)
-        press_key(hwnd, VK_ESCAPE)
-        press_key(hwnd, VK_ESCAPE)  # 回详情/列表
-        time.sleep(0.4)
+        # 5) 逐次验证 Esc 回仓库页（绝不盲按、绝不退出仓库）
+        self._esc_back_to_grid(hwnd)
+        return True
 
     def _record(self, job: TaskJob, disc: Disc, decision: Decision) -> None:
         self.results.append(
