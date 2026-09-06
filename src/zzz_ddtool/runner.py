@@ -346,7 +346,7 @@ class Runner:
             return False
 
         # 1) 详情页大按钮（0 级也显示「查看」）
-        image, *_ = self._grab()
+        image, *_ = self._grab(allow_esc=False)
         hit = None
         for text in ("查看", "强化"):
             for line in read_rect(image, self.UPGRADE_BTN_AREA):
@@ -364,7 +364,7 @@ class Runner:
         time.sleep(0.9)
 
         def _zoom_level_line():
-            image, *_ = self._grab()
+            image, *_ = self._grab(allow_esc=False)
             for line in read_rect(image, self.ZOOM_LEVEL_AREA):
                 if "等级" in line.text.replace(" ", ""):
                     return line
@@ -388,7 +388,7 @@ class Runner:
             lines: list = []
             for _wait in range(4):  # 弹层渲染可能慢，最多等 ~2.8s
                 time.sleep(0.7)
-                image, *_ = self._grab()
+                image, *_ = self._grab(allow_esc=False)
                 lines = read_rect(image, self.STAGE_ADD_AREA)
                 if any("阶段添加" in ln.text.replace(" ", "") for ln in lines):
                     stage_clicked = True
@@ -412,7 +412,7 @@ class Runner:
         time.sleep(0.8)
 
         # 4) 「升级」确认
-        image, *_ = self._grab()
+        image, *_ = self._grab(allow_esc=False)
         if not _click_line(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step4-无升级"):
             self._esc_back_to_grid(hwnd)
             return False
