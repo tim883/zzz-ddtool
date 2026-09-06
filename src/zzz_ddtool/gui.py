@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QMouseEvent, QPalette
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QStackedWidget,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -66,6 +67,24 @@ KNOWN_SUBSTATS = (
     "穿透率",
     "异常掌控",
 )
+
+# 游戏内筛选-主词条按槽位固定三列网格，每页尺寸一致，切部位不抖动
+_MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
+    4: ("生命值%", "攻击力%", "防御力%", "暴击率", "暴击伤害", "异常精通"),
+    5: (
+        "生命值%",
+        "攻击力%",
+        "防御力%",
+        "穿透率",
+        "物理伤害",
+        "火属性伤害",
+        "冰属性伤害",
+        "电属性伤害",
+        "以太伤害",
+    ),
+    6: ("生命值%", "攻击力%", "防御力%", "能量自动回复", "冲击力", "异常掌控"),
+}
+_MAINSTAT_COLS = 3
 
 STYLESHEET = """
 QMainWindow, QWidget#root, QScrollArea, QScrollArea > QWidget > QWidget {
@@ -820,9 +839,12 @@ class MainWindow(QMainWindow):
         game_form = QFormLayout(game_box)
         self._filter_sets: list[str] = []
         self.set_summary = QLabel("未选")
-        self.set_summary.setWordWrap(True)
+        self.set_summary.setWordWrap(False)
         self.set_summary.setObjectName("hint")
+        self.set_summary.setMaximumWidth(250)
+        self.set_summary.setMaximumHeight(22)
         pick_sets = QPushButton("选择套装")
+        pick_sets.setFixedWidth(92)
         pick_sets.clicked.connect(self._open_set_picker)
         set_row = QHBoxLayout()
         set_row.addWidget(self.set_summary, 1)
@@ -839,12 +861,37 @@ class MainWindow(QMainWindow):
         self.filter_slots[4].setChecked(True)
         self.slot_group.idClicked.connect(self._on_slot_clicked)
         slots_row.addStretch()
+        self._all_main_boxes: dict[str, QCheckBox] = {}
         self.filter_main_boxes: dict[str, QCheckBox] = {}
-        self.main_host = QWidget()
-        self.main_flow = FlowLayout(self.main_host, spacing=6)
+        self.main_host = QStackedWidget()
+        self.main_host.setObjectName("mainHost")
+        self.main_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.main_host.setFixedHeight(80)
+        self._mainstat_pages: dict[int, QWidget] = {}
+        for slot, names in _MAINSTAT_PAGES.items():
+            page = QWidget()
+            page.setFixedHeight(80)
+            grid = QGridLayout(page)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setSpacing(6)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            grid.setColumnStretch(2, 1)
+            for idx, name in enumerate(names):
+                box = QCheckBox(name)
+                box.toggled.connect(self._on_filter_changed)
+                self._all_main_boxes[name] = box
+                grid.addWidget(box, idx // _MAINSTAT_COLS, idx % _MAINSTAT_COLS)
+            self._mainstat_pages[slot] = page
+            self.main_host.addWidget(page)
+        empty_page = QWidget()
+        empty_page.setFixedHeight(80)
+        self.main_host.addWidget(empty_page)
         self.main_hint = QLabel()
         self.main_hint.setObjectName("hint")
         self.main_hint.setWordWrap(True)
+        self.main_hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.main_hint.setFixedHeight(48)
         game_form.addRow("套装", set_row)
         game_form.addRow("部位", slots_row)
         game_form.addRow("主词条", self.main_host)
@@ -1016,9 +1063,15 @@ class MainWindow(QMainWindow):
 
     def _update_set_summary(self) -> None:
         if not self._filter_sets:
-            self.set_summary.setText("未选")
-            return
-        self.set_summary.setText("、".join(self._filter_sets))
+            text = "未选"
+            full = ""
+        else:
+            text = "、".join(self._filter_sets)
+            full = text
+        fm = QFontMetrics(self.set_summary.font())
+        width = max(self.set_summary.width(), 180)
+        self.set_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
+        self.set_summary.setToolTip(full)
 
     def _open_set_picker(self) -> None:
         extra = [name for name in self._filter_sets if name not in SETS]
@@ -1030,19 +1083,21 @@ class MainWindow(QMainWindow):
 
     def _refresh_main_boxes(self, keep: set[str] | None = None) -> None:
         keep = set(keep if keep is not None else self._selected_mains())
-        available = selectable_mainstats(self._selected_slots())
-        while self.main_flow.count():
-            item = self.main_flow.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
-        self.filter_main_boxes = {}
-        for name in available:
-            box = QCheckBox(name)
-            box.setChecked(name in keep)
-            box.toggled.connect(self._on_filter_changed)
-            self.filter_main_boxes[name] = box
-            self.main_flow.addWidget(box)
+        available = set(selectable_mainstats(self._selected_slots()))
+        active_slot = self._active_slot if self._active_slot in self._mainstat_pages else None
+        for name, box in self._all_main_boxes.items():
+            is_available = name in available
+            box.blockSignals(True)
+            box.setChecked(is_available and name in keep)
+            box.setVisible(is_available)
+            box.blockSignals(False)
+        if active_slot is not None:
+            self.main_host.setCurrentWidget(self._mainstat_pages[active_slot])
+        else:
+            self.main_host.setCurrentIndex(self.main_host.count() - 1)
+        self.filter_main_boxes = {
+            name: box for name, box in self._all_main_boxes.items() if name in available
+        }
         if available:
             self.main_hint.setText(f"{self._active_slot} 号位可选主词条。已选主词条不会出现在右侧副词条里。")
         else:
