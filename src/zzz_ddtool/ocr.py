@@ -101,8 +101,10 @@ def qimage_to_bgr(image: QImage) -> np.ndarray:
     """QImage -> OpenCV BGR。中文路径不经过文件系统，直接在内存里转。"""
     img = image.convertToFormat(QImage.Format.Format_RGB888)
     width, height = img.width(), img.height()
+    bpl = img.bytesPerLine()  # 每行可能有 4 字节对齐 padding，不能直接按 width*3 reshape
     bits = memoryview(img.bits())
-    arr = np.frombuffer(bits.tobytes(), np.uint8).reshape(height, width, 3).copy()
+    arr = np.frombuffer(bits.tobytes(), np.uint8, bpl * height).reshape(height, bpl)
+    arr = arr[:, : width * 3].reshape(height, width, 3).copy()
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 

@@ -29,16 +29,28 @@ def tile_has_portrait(image, left: int, top: int, right: int, bottom: int) -> bo
 
 
 def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
-    """格子中心右上的深红圆牌 = 已打弃置标（2026-09-06 实拍标定）。
+    """格子中心(cx,cy)左半区域有深红块 = 已打弃置标。
 
-    红牌包围盒 (cx+27..cx+53, cy-70..cy-46)，圆心约 (cx+40, cy-58)。
-    采样框比红牌还小、完全落在圆心纯红区：(cx+33..cx+47, cy-64..cy-52)。
-    实测有标 31~37 红像素、无标 0，阈值 20 余量充足。
+    标定依据（2026-09-06 `_tile-tagged.png` vs `_tile-notag.png` 像素对比）：
+    - 带标格：左半(含中下)深红像素数千，3×3 分布集中在左列全高 + 中下；
+    - 无标格：仅右下品质框带红（约 560 像素，落在右半 186..279），
+      左半深红像素为 0。
+    因此扫描区限定在**左半 + 全高**（cx-56..cx+4, cy-68..cy+68），
+    彻底避开右下品质框，带标/无标干净区分。阈值 100 余量充足。
     """
     red = 0
-    for x in range(cx + 33, cx + 47):
-        for y in range(cy - 64, cy - 52):
+    w = image.width()
+    h = image.height()
+    for x in range(cx - 56, cx + 4):
+        if not (0 <= x < w):
+            continue
+        for y in range(cy - 68, cy + 68):
+            if not (0 <= y < h):
+                continue
             color = image.pixelColor(x, y)
             if color.red() > 130 and color.green() < 75 and color.blue() < 75:
                 red += 1
-    return red >= 20
+                if red >= 100:
+                    return True
+    return False
+
