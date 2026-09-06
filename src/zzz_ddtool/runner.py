@@ -180,7 +180,7 @@ class Runner:
         # （真顶再往上滚页面纹丝不动，这是"到顶"的唯一铁证），保证从第一行开始处理。
         prev_sig: tuple | None = None
         for _top_round in range(6):
-            sig = tuple(sorted((r, c) for r, c, _, _ in self._visible_cells(w, h)))
+            sig = tuple(sorted((r, c) for r, c, _, _, _ in self._visible_cells(w, h)))
             if sig == prev_sig:
                 self.log.info("scroll top confirmed after %d rounds", _top_round)
                 break
@@ -197,7 +197,12 @@ class Runner:
             if rescan:
                 rescan = False
                 prev_signature = None  # 允许同一页重扫
-            cells = self._visible_cells(w, h, skip_tagged=self.preset.skip_discarded)
+            cells = self._visible_cells(
+                w,
+                h,
+                skip_tagged=self.preset.skip_discarded,
+                skip_max_level=self.preset.skip_max_level,
+            )
             signature = tuple(sorted(cells))
             if not cells or signature == prev_signature:
                 self.log.info("page %d empty or same as before, job done", page_idx)
@@ -206,7 +211,7 @@ class Runner:
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
             self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
             maxed = False
-            for row, col, cx, cy in cells:
+            for row, col, cx, cy, _lv in cells:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
                     maxed = True
@@ -292,9 +297,14 @@ class Runner:
             page_idx += 1
 
     def _visible_cells(
-        self, width: int, height: int, *, skip_tagged: bool = False
-    ) -> list[tuple[int, int, int, int]]:
-        """OCR 当前页「等级」标签定位格子，返回 (row, col, cx, cy)，按行优先排序去重。
+        self,
+        width: int,
+        height: int,
+        *,
+        skip_tagged: bool = False,
+        skip_max_level: bool = True,
+    ) -> list[tuple[int, int, int, int, int]]:
+        """OCR 当前页「等级」标签定位格子，返回 (row, col, cx, cy, level)，行优先去重。
 
         点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过；
         skip_tagged=True 时弃置标记格在扫描阶段直接剔除（连点都不点）。
@@ -308,18 +318,23 @@ class Runner:
 
         # 行聚类：按标签 y 坐标聚成行，不依赖固定行数——列表滚动停在半行
         # 位置时，固定映射会把首行算到界外、末行超出上限，造成永远丢一行。
-        labels: list[tuple[int, int]] = []
+        import re
+
+        labels: list[tuple[int, int, int]] = []
         for line in read_rect(image, LABEL_SCAN_AREA):
             text = line.text.replace(" ", "")
-            if text.startswith("等级"):
-                labels.append(((line.left + line.right) // 2, (line.top + line.bottom) // 2))
+            if not text.startswith("等级"):
+                continue
+            m = re.search(r"等级(\d+)", text)
+            level = int(m.group(1)) if m else -1
+            labels.append(((line.left + line.right) // 2, (line.top + line.bottom) // 2, level))
         labels.sort(key=lambda p: p[1])
-        rows: list[list[tuple[int, int]]] = []
-        for lx, ly in labels:
+        rows: list[list[tuple[int, int, int]]] = []
+        for lx, ly, lv in labels:
             if rows and abs(ly - rows[-1][-1][1]) <= 60:
-                rows[-1].append((lx, ly))
+                rows[-1].append((lx, ly, lv))
             else:
-                rows.append([(lx, ly)])
+                rows.append([(lx, ly, lv)])
         cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
         for r_idx, cluster in enumerate(rows):
             tile_cy = cluster[0][1] - GRID_LABEL_DY  # 标签在格子中心上方 87px
@@ -327,9 +342,12 @@ class Runner:
             if not (97 <= tile_cy <= 983):
                 self.log.info("row y=%d half-cut at window edge, skip", tile_cy)
                 continue
-            for lx, _ly in sorted(cluster):
+            for lx, _ly, lv in sorted(cluster):
                 col = round((lx - ox) / sx)
                 if not (0 <= col < GRID_COLS):
+                    continue
+                if skip_max_level and lv >= 15:
+                    self.log.info("cell r%dc%d level %d max, skip at scan", r_idx, col, lv)
                     continue
                 cx = ox + col * sx
                 if tile_has_portrait(image, cx - 56, tile_cy - 68, cx + 56, tile_cy + 68):
@@ -338,7 +356,7 @@ class Runner:
                 if skip_tagged and tile_has_discard_badge(image, cx, tile_cy):
                     self.log.info("cell r%dc%d discard-tagged, skip at scan", r_idx, col)
                     continue
-                cells[(r_idx, col)] = (r_idx, col, cx, tile_cy)
+                cells[(r_idx, col)] = (r_idx, col, cx, tile_cy, lv)
         # 强制行优先（第1行从左到右，再第2行…），保证处理顺序确定、不跳格
         return [cells[key] for key in sorted(cells)]
 
