@@ -167,6 +167,7 @@ class Runner:
                     # 点飞了（如误触弹层）：Esc 退出尝试回驱动盘页；
                     # 回得来就重扫当前页继续，回不来才中断。
                     self.log.warning("detail click left drive_disc (page=%s), try recover", page)
+                    self._dbg_capture(f"click-anomaly-{page}")
                     press_key(hwnd, VK_ESCAPE)
                     time.sleep(0.6)
                     _, page2, *_ = self._grab(allow_esc=False)
@@ -175,6 +176,7 @@ class Runner:
                         rescan = True
                         break
                     self.log.error("recover failed (page=%s), stop job", page2)
+                    self._dbg_capture(f"recover-failed-{page2}")
                     return
                 # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
