@@ -262,8 +262,8 @@ class Runner:
                             self._upgrade_loop(
                                 hwnd, job, key, cell_tag, sub_preset, accepted_ids, up_counts
                             )
-                        else:
-                            self._esc_back_to_grid(hwnd)
+                        # 注意：_enter_upgrade_page 失败时内部已 _esc_back_to_grid，
+                        # 这里不再重复 Esc（重复 Esc 会把仓库页退到功能页）
                     # 升级/弃置完已回网格：等级排序可能变 + 已弃置的要跳过，重扫当前页
                     rescan = True
                     break
@@ -534,13 +534,19 @@ class Runner:
         return True
 
     def _discard_from_upgrade(self, hwnd: int) -> None:
-        """强化页 Esc 回详情页 → 按 R 弃置 → Esc 回网格。"""
-        press_key(hwnd, VK_ESCAPE)  # 强化页 → 详情页
+        """强化页 Esc 回详情页 → 按 R 弃置 → Esc 回网格。
+
+        页面层级：强化页 →(Esc)→ 缩放页 →(Esc)→ 详情页 →(Esc)→ 网格。
+        强化页和详情页之间隔一层缩放页，所以要 Esc 两次才回到详情页按 R。
+        """
+        press_key(hwnd, VK_ESCAPE)  # 强化页 → 缩放页
+        time.sleep(0.6)
+        press_key(hwnd, VK_ESCAPE)  # 缩放页 → 详情页
         time.sleep(0.6)
         press_key_once(hwnd, VK_R)  # 详情页打弃置标
         time.sleep(0.5)
         self.log.info("action=MARK_DISCARD (R) from upgrade page")
-        self._esc_back_to_grid(hwnd)
+        self._esc_back_to_grid(hwnd)  # 详情页 → 网格
 
     def _upgrade_loop(
         self,
@@ -562,6 +568,10 @@ class Runner:
         upgraded = 0
         while True:
             self._checkpoint()
+            if self._processed >= self.preset.max_discs:
+                self.log.info("cell %s max_discs hit in upgrade loop, stop", cell_tag)
+                self._esc_back_to_grid(hwnd)
+                return
             image, *_ = self._grab(allow_esc=False)
             disc = parse_disc_upgrade_page(image)
             if disc is None:
