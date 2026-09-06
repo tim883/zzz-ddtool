@@ -130,11 +130,12 @@ class Runner:
                 if self._processed >= self.preset.max_discs:
                     break
                 click_client(hwnd, cx, cy)
-                time.sleep(0.4)
-                detail_image, page, *_ = self._grab()
-                if page != "drive_disc":
+                time.sleep(0.5)
+                detail_image, page, *_ = self._grab(allow_esc=False)
+                if page in {"menu", "storage", "overworld"}:
                     self.log.warning("detail click left drive_disc (page=%s), stop job", page)
                     return
+                # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
                 if disc is None:
                     self.log.info("cell (%d,%d) no disc, skip", cx, cy)
@@ -143,7 +144,12 @@ class Runner:
                 self._record(job, disc, decision)
                 self._act(hwnd, decision.action)
                 self._processed += 1
+                if decision.action == Action.STOP:
+                    self.log.warning("decision STOP (%s), end job", decision.reason)
+                    return
                 time.sleep(0.3)
+            press_key(hwnd, VK_ESCAPE)  # 关详情再翻页，滚轮才作用在网格上
+            time.sleep(0.4)
             wheel_client(hwnd, gx, gy, -5)  # 翻下一页
             time.sleep(0.8)
 
@@ -177,12 +183,13 @@ class Runner:
             cells.append((cx, cy))
         return cells
 
-    def _grab(self):
+    def _grab(self, allow_esc: bool = True):
         image, method, hwnd = grab_game_image()
         from zzz_ddtool.screen import classify_image
         page = classify_image(image)
-        if page == "unknown":
-            # 可能筛选面板开着盖住认页图标：Esc 一下再认
+        if page == "unknown" and allow_esc:
+            # 可能筛选面板开着盖住认页图标：Esc 一下再认。
+            # 注意：点格子后的详情页也返回 unknown，调用方须用 allow_esc=False。
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.5)
             image, method, hwnd = grab_game_image()
@@ -207,18 +214,17 @@ class Runner:
     UPGRADE_CONFIRM_AREA = (1450, 860, 1700, 980)
 
     def _act(self, hwnd: int, action: Action) -> None:
+        # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
+        # 翻页前由 _run_job 统一 Esc。
         if action == Action.UPGRADE:
             self._do_upgrade(hwnd)
         elif action == Action.MARK_DISCARD:
             press_key_once(hwnd, VK_R)  # R 打弃置标签
             time.sleep(0.5)
-            press_key(hwnd, VK_ESCAPE)
             self.log.info("action=MARK_DISCARD (R)")
         elif action == Action.SKIP:
-            press_key(hwnd, VK_ESCAPE)
             self.log.info("action=SKIP")
         elif action == Action.STOP:
-            press_key(hwnd, VK_ESCAPE)
             self.log.info("action=STOP")
 
     def _do_upgrade(self, hwnd: int) -> None:
