@@ -157,17 +157,18 @@ class Runner:
                 break
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
-            for cx, cy in cells:
+            for row, col, cx, cy in cells:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
                     break
+                cell_tag = f"r{row}c{col}"
                 click_client(hwnd, cx, cy)
                 time.sleep(0.5)
                 detail_image, page, *_ = self._grab(allow_esc=False)
                 if page in {"menu", "storage", "overworld"}:
                     # 点飞了（如误触弹层）：Esc 退出尝试回驱动盘页；
                     # 回得来就重扫当前页继续，回不来才中断。
-                    self.log.warning("detail click left drive_disc (page=%s), try recover", page)
+                    self.log.warning("cell %s detail click left drive_disc (page=%s), try recover", cell_tag, page)
                     self._dbg_capture(f"click-anomaly-{page}")
                     press_key(hwnd, VK_ESCAPE)
                     time.sleep(0.6)
@@ -182,34 +183,44 @@ class Runner:
                 # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
                 if disc is None:
-                    self.log.info("cell (%d,%d) no disc, skip", cx, cy)
+                    self.log.info("cell %s no disc, skip", cell_tag)
                     continue
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 self._record(job, disc, decision)
-                self._processed += 1
                 key = (cx, cy)
                 if decision.action == Action.STOP:
-                    self.log.warning("decision STOP (%s), end job", decision.reason)
+                    self.log.warning("cell %s decision STOP (%s), end job", cell_tag, decision.reason)
                     return
                 if decision.action == Action.UPGRADE:
                     if up_counts.get(key, 0) >= _MAX_STAGE_UPGRADES:
                         self.log.warning(
-                            "cell %s upgrades capped at %d, skip action", key, _MAX_STAGE_UPGRADES
+                            "cell %s upgrades capped at %d, skip action", cell_tag, _MAX_STAGE_UPGRADES
                         )
                     else:
                         if disc.discarded:
                             # 先摘掉旧弃置标签再强化，保证终态统一（R 是开关，按 discarded 条件化）
                             press_key_once(hwnd, VK_R)
                             time.sleep(0.5)
-                            self.log.info("UPGRADE：摘除旧弃置标签 (R)")
+                            self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
                         if self._do_upgrade(hwnd):
                             up_counts[key] = up_counts.get(key, 0) + 1
+                            self._processed += 1
+                            self.log.info(
+                                "cell %s UPGRADE done, level %d -> next stage re-judge", cell_tag, disc.level
+                            )
                         # 无论成败，_do_upgrade 结束后都在仓库页：重扫让升阶后的盘
                         # 在 3/6/9/12 档重新解析词条再判（accepted 白名单按档生效）
                         rescan = True
                         break
+                elif decision.action == Action.MARK_DISCARD and disc.discarded:
+                    # 已带标重判仍判弃置：空操作，不扣 max_discs 额度
+                    self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
                 else:
                     self._act(hwnd, decision.action, disc)
+                    self._processed += 1
+                    self.log.info(
+                        "cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level
+                    )
                 time.sleep(0.3)
             if rescan:
                 continue
@@ -220,8 +231,8 @@ class Runner:
             time.sleep(0.8)
             page_idx += 1
 
-    def _visible_cells(self, width: int, height: int) -> list[tuple[int, int]]:
-        """OCR 当前页「等级」标签定位格子，返回未装备格子的图标中心点。
+    def _visible_cells(self, width: int, height: int) -> list[tuple[int, int, int, int]]:
+        """OCR 当前页「等级」标签定位格子，返回 (row, col, cx, cy)，按行优先排序去重。
 
         点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过。
         """
@@ -232,7 +243,7 @@ class Runner:
         from zzz_ddtool.layout import GRID_LABEL_DY
         from zzz_ddtool.ocr import read_rect
 
-        cells: list[tuple[int, int]] = []
+        cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
         for line in read_rect(image, LABEL_SCAN_AREA):
             text = line.text.replace(" ", "")
             if not text.startswith("等级"):
@@ -247,8 +258,9 @@ class Runner:
             if tile_has_portrait(image, cx - 56, cy - 68, cx + 56, cy + 68):
                 self.log.info("cell r%dc%d equipped, skip", row, col)
                 continue
-            cells.append((cx, cy))
-        return cells
+            cells[(row, col)] = (row, col, cx, cy)
+        # 强制行优先（第1行从左到右，再第2行…），保证处理顺序确定、不跳格
+        return [cells[key] for key in sorted(cells)]
 
     def _grab(self, allow_esc: bool = True):
         image, method, hwnd = grab_game_image()

@@ -88,6 +88,7 @@ def goto_warehouse() -> Path:
         raise NavError(str(exc)) from exc
 
     try:
+        unknown_streak = 0
         for step in range(8):
             page = classify_image(image)
             log.info("goto warehouse step=%d page=%s", step, page)
@@ -101,7 +102,17 @@ def goto_warehouse() -> Path:
                 time.sleep(0.8)
                 image, page, _dest = _shot("after-warehouse")
                 continue
-            # overworld 或 unknown（详情/缩放/强化弹层）：Esc 剥一层
+            # overworld=Esc 出菜单是正常路径；unknown（详情/缩放/强化弹层）=先存图再剥一层
+            if page == UNKNOWN:
+                unknown_streak += 1
+                if unknown_streak > 3:
+                    raise NavError("连续 3 层都认不出页面，已中断（现场图见 captures）。")
+                try:
+                    save_image(image, hwnd, "printwindow", name=f"nav-unknown{unknown_streak}")
+                except Exception:
+                    pass
+            else:
+                unknown_streak = 0
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.6)
             image = grab_game_image()[0]
