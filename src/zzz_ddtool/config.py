@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from zzz_ddtool.chain import TaskJob, parse_task_chain
+from zzz_ddtool.gamedata import SLOTS
 from zzz_ddtool.models import UPGRADE_STEP
 from zzz_ddtool.origin import Origin
 
@@ -20,6 +22,13 @@ class Preset:
     skip_locked: bool = True
     skip_equipped: bool = True
     skip_discarded: bool = True
+    max_discs: int = 100
+    filter_sets: tuple[str, ...] = ()
+    filter_slot: int = 4
+    filter_slots: tuple[int, ...] = (4,)
+    filter_mainstats: tuple[str, ...] = ()
+    slot_plans: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
+    task_chain: tuple[TaskJob, ...] = ()
     ocr_retry: int = 3
     accepted: tuple[str, ...] | None = None
 
@@ -68,18 +77,80 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
     stage_require = _parse_stage_require(data)
     raw_accepted = data.get("accepted", None)
     accepted = None if raw_accepted is None else tuple(str(item) for item in raw_accepted)
+    run = data.get("run") or {}
+    game_filter = data.get("game_filter") or {}
+    raw_sets = game_filter.get("sets") or ()
+    raw_mains = game_filter.get("mainstats") or ()
+    mains = tuple(str(item).strip() for item in raw_mains if str(item).strip())
+    filter_slot = _parse_filter_slot(game_filter)
+    min_useful = int(data.get("min_useful_types") or 0)
+    slot_plans = _parse_slot_plans(data.get("slot_plans") or {})
+    active = dict(slot_plans.get(filter_slot) or {})
+    if weights or accepted is not None or mains or stage_require:
+        active.setdefault("weights", weights)
+        active.setdefault("stage_require", stage_require)
+        active.setdefault("accepted", accepted)
+        active.setdefault("mainstats", mains)
+        active.setdefault("min_useful_types", min_useful)
+        slot_plans[filter_slot] = active
+    active_weights = dict(active.get("weights") or weights)
+    active_require = dict(active.get("stage_require") or stage_require)
+    active_accepted = active.get("accepted", accepted)
+    if isinstance(active_accepted, list):
+        active_accepted = tuple(str(item) for item in active_accepted)
+    active_mains = tuple(active.get("mainstats") or mains)
     return Preset(
         name=str(data.get("name") or "default"),
-        weights=weights,
-        stage_require=stage_require,
-        min_useful_types=int(data.get("min_useful_types") or 0),
+        weights=active_weights,
+        stage_require=active_require,
+        min_useful_types=int(active.get("min_useful_types") or min_useful),
         require_s_rank=bool(filters.get("require_s_rank", True)),
         skip_locked=bool(filters.get("skip_locked", True)),
         skip_equipped=bool(filters.get("skip_equipped", True)),
         skip_discarded=bool(filters.get("skip_discarded", True)),
+        max_discs=max(1, int(run.get("max_discs") or 100)),
+        filter_sets=tuple(str(item).strip() for item in raw_sets if str(item).strip()),
+        filter_slot=filter_slot,
+        filter_slots=(filter_slot,),
+        filter_mainstats=active_mains,
+        slot_plans=slot_plans,
+        task_chain=parse_task_chain(data.get("task_chain") or ()),
         ocr_retry=int(data.get("ocr_retry") or 3),
-        accepted=accepted,
+        accepted=active_accepted,
     )
+
+
+def _parse_filter_slot(game_filter: Mapping[str, Any]) -> int:
+    raw = game_filter.get("slot")
+    if raw is None:
+        raw_slots = game_filter.get("slots") or ()
+        slots = [int(item) for item in raw_slots if int(item) in SLOTS]
+        raw = slots[0] if slots else 4
+    slot = int(raw)
+    return slot if slot in SLOTS else 4
+
+
+def _parse_slot_plans(raw: Mapping[Any, Any]) -> dict[int, dict[str, Any]]:
+    plans: dict[int, dict[str, Any]] = {}
+    for key, value in (raw or {}).items():
+        slot = int(key)
+        if slot not in SLOTS or not isinstance(value, dict):
+            continue
+        weights = {str(name): float(weight) for name, weight in (value.get("weights") or {}).items()}
+        accepted = value.get("accepted", None)
+        if accepted is not None:
+            accepted = tuple(str(item) for item in accepted)
+        mains = tuple(str(item).strip() for item in (value.get("mainstats") or ()) if str(item).strip())
+        sets = tuple(str(item).strip() for item in (value.get("sets") or ()) if str(item).strip())
+        plans[slot] = {
+            "weights": weights,
+            "stage_require": _parse_stage_require(value) if value.get("stage_require") or value.get("thresholds") else {"three": {}, "four": {}},
+            "accepted": accepted,
+            "mainstats": mains,
+            "sets": sets,
+            "min_useful_types": int(value.get("min_useful_types") or 0),
+        }
+    return plans
 
 
 def preset_to_dict(preset: Preset) -> dict[str, Any]:
@@ -87,12 +158,35 @@ def preset_to_dict(preset: Preset) -> dict[str, Any]:
         "name": preset.name,
         "min_useful_types": preset.min_useful_types,
         "ocr_retry": preset.ocr_retry,
+        "run": {"max_discs": preset.max_discs},
+        "game_filter": {
+            "sets": list(preset.filter_sets),
+            "slot": preset.filter_slot,
+            "slots": [preset.filter_slot],
+            "mainstats": list(preset.filter_mainstats),
+        },
+        "slot_plans": {
+            str(slot): {
+                "weights": {str(name): float(weight) for name, weight in (plan.get("weights") or {}).items()},
+                "stage_require": {
+                    str(origin): {int(level): float(value) for level, value in sorted((table or {}).items())}
+                    for origin, table in (plan.get("stage_require") or {}).items()
+                },
+                "mainstats": list(plan.get("mainstats") or ()),
+                "sets": list(plan.get("sets") or ()),
+                "min_useful_types": int(plan.get("min_useful_types") or 0),
+                **({"accepted": list(plan["accepted"])} if plan.get("accepted") is not None else {}),
+            }
+            for slot, plan in sorted((preset.slot_plans or {}).items())
+            if int(slot) in SLOTS
+        },
         "filters": {
             "require_s_rank": preset.require_s_rank,
             "skip_locked": preset.skip_locked,
             "skip_equipped": preset.skip_equipped,
             "skip_discarded": preset.skip_discarded,
         },
+        "task_chain": [job.to_dict() for job in preset.task_chain],
         "weights": {str(name): float(weight) for name, weight in preset.weights.items()},
         "stage_require": {
             str(origin): {int(level): float(value) for level, value in sorted(table.items())}

@@ -30,6 +30,12 @@ def main(argv: list[str] | None = None) -> int:
     decide_p.add_argument("--discarded", action="store_true")
     decide_p.add_argument("--min-useful", type=int, help="Override min_useful_types")
 
+    cap_p = sub.add_parser("capture", help="Grab the game window into out/captures")
+    cap_p.add_argument("--out", type=Path, help="Directory, default project out/captures")
+
+    nav_p = sub.add_parser("goto-warehouse", help="Esc to menu if needed, then click 仓库")
+    sub.add_parser("snapshot-pages", help="Click home / menu / warehouse and save named shots")
+
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
     preview_p.add_argument("--out", type=Path, help="HTML path, default workspace out/pattern-cards.html")
@@ -40,9 +46,52 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_gui(getattr(args, "config", None))
     if args.cmd == "decide":
         return _cmd_decide(args)
+    if args.cmd == "capture":
+        return _cmd_capture(args)
+    if args.cmd == "goto-warehouse":
+        return _cmd_goto_warehouse()
+    if args.cmd == "snapshot-pages":
+        return _cmd_snapshot_pages()
     if args.cmd == "preview":
         return _cmd_preview(args)
     return 1
+
+
+def _cmd_capture(args: argparse.Namespace) -> int:
+    from zzz_ddtool.capture import CaptureError, capture_game
+
+    try:
+        dest = capture_game(args.out)
+    except CaptureError as exc:
+        print(exc)
+        return 2
+    print(dest)
+    return 0
+
+
+def _cmd_goto_warehouse() -> int:
+    from zzz_ddtool.nav import NavError, goto_warehouse
+
+    try:
+        dest = goto_warehouse()
+    except NavError as exc:
+        print(exc)
+        return 2
+    print(dest)
+    return 0
+
+
+def _cmd_snapshot_pages() -> int:
+    from zzz_ddtool.nav import NavError, snapshot_pages
+
+    try:
+        pages = snapshot_pages()
+    except NavError as exc:
+        print(exc)
+        return 2
+    for name, dest in pages.items():
+        print(f"{name}\t{dest}")
+    return 0
 
 
 def _cmd_gui(config: Path | None) -> int:
@@ -139,6 +188,16 @@ def _load_preset(args: argparse.Namespace):
                 "skip_equipped": preset.skip_equipped,
                 "skip_discarded": preset.skip_discarded,
             },
+            "run": {"max_discs": preset.max_discs},
+            "game_filter": {
+                "sets": list(preset.filter_sets),
+                "slot": preset.filter_slot,
+                "slots": [preset.filter_slot],
+                "mainstats": list(preset.filter_mainstats),
+            },
+            "slot_plans": {
+                str(slot): dict(plan) for slot, plan in (preset.slot_plans or {}).items()
+            },
             "ocr_retry": preset.ocr_retry,
             "accepted": None if preset.accepted is None else list(preset.accepted),
         }
@@ -146,9 +205,9 @@ def _load_preset(args: argparse.Namespace):
 
 
 def _default_preview_path() -> Path:
-    # src/zzz_ddtool/cli.py → workspace/out
-    workspace = Path(__file__).resolve().parents[3]
-    return workspace / "out" / "pattern-cards.html"
+    from zzz_ddtool.paths import out_dir
+
+    return out_dir() / "pattern-cards.html"
 
 
 if __name__ == "__main__":
