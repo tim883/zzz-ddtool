@@ -274,11 +274,12 @@ class Runner:
 
     # 详情页右下大按钮（查看/强化，永远存在），OCR 实测标定
     UPGRADE_BTN_AREA = (1550, 780, 1900, 880)
-    # 缩放页「等级00」文字区，>> 箭头在它右侧约 95px
+    # 缩放页「等级00」文字区，>> 箭头在它右侧约 110px（实拍：文字 right≈1305，箭头中心≈1416）
     ZOOM_LEVEL_AREA = (1100, 150, 1550, 300)
-    # 强化页「阶段添加」与「升级」按钮搜索区（老大截图实测位置）
-    STAGE_ADD_AREA = (1100, 860, 1500, 980)
-    UPGRADE_CONFIRM_AREA = (1450, 860, 1700, 980)
+    # 强化页按钮区（老大 2026-09-06 实拍截图标定）：
+    # 「阶段添加」中心≈(1282,866)，「升级」中心≈(1511,866)。旧区 y=860 起把按钮拦腰切断导致 OCR 认不出。
+    STAGE_ADD_AREA = (1150, 800, 1420, 940)
+    UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
 
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
         # UPGRADE 在 _run_job 里内联处理（需要 rescan/计数联动），这里只管其余动作。
@@ -378,21 +379,30 @@ class Runner:
             self._esc_back_to_grid(hwnd)
             return False
 
-        # 3) 点箭头进强化页，验证「阶段添加」出现；没翻页就重试一次
+        # 3) 点箭头进强化页（弹层），轮询等「阶段添加」出现；确认还在缩放页才重试
         ax = level_line.right + 110
         ay = (level_line.top + level_line.bottom) // 2
         stage_clicked = False
         for attempt in (1, 2):
             click_client(hwnd, ax, ay)
-            time.sleep(1.0)
-            image, *_ = self._grab()
-            self._dbg_capture(f"step3-尝试{attempt}")  # 强化页还没实拍标定过，先存图再找
-            if _click_line(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", f"step3-无阶段添加{attempt}"):
-                stage_clicked = True
+            lines: list = []
+            for _wait in range(4):  # 弹层渲染可能慢，最多等 ~2.8s
+                time.sleep(0.7)
+                image, *_ = self._grab()
+                lines = read_rect(image, self.STAGE_ADD_AREA)
+                if any("阶段添加" in ln.text.replace(" ", "") for ln in lines):
+                    stage_clicked = True
+                    break
+            if stage_clicked:
+                for ln in lines:
+                    if "阶段添加" in ln.text.replace(" ", ""):
+                        click_client(hwnd, (ln.left + ln.right) // 2, (ln.top + ln.bottom) // 2)
+                        break
                 break
+            self._dbg_capture(f"step3-未进{attempt}")
             level_line = _zoom_level_line()
             if level_line is None:
-                break  # 页面既不是缩放页也没阶段添加，别乱点，回退
+                break  # 不是缩放页也没有阶段添加，别乱点，回退
             ax = level_line.right + 110
             ay = (level_line.top + level_line.bottom) // 2
         if not stage_clicked:
