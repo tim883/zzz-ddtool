@@ -567,9 +567,11 @@ class TrialPage(QWidget):
             rolls.setRange(0, 5)
             rolls.setPrefix("+")
             row = QHBoxLayout()
-            row.addWidget(combo, 1)
+            combo.setMaximumWidth(240)
+            row.addWidget(combo)
             row.addWidget(QLabel("强化"))
             row.addWidget(rolls)
+            row.addStretch()
             form.addRow(f"词条 {index + 1}", row)
             self.rows.append((combo, rolls))
 
@@ -1213,10 +1215,8 @@ class MainWindow(QMainWindow):
     def _build_bottom(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("footer")
-        col = QVBoxLayout(bar)
-        col.setContentsMargins(10, 8, 10, 8)
-        col.setSpacing(4)
-        row = QHBoxLayout()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 8, 10, 8)
         all_on = QPushButton("全选当前可见")
         all_off = QPushButton("取消当前可见")
         all_on.clicked.connect(lambda: self._check_visible(True))
@@ -1231,11 +1231,9 @@ class MainWindow(QMainWindow):
         row.addWidget(all_off)
         row.addWidget(self.status, 1)
         row.addWidget(self.start_btn)
-        col.addLayout(row)
-        self.run_status_label = QLabel("运行状态：—")
-        self.run_status_label.setObjectName("runStatus")
-        self.run_status_label.setWordWrap(True)
-        col.addWidget(self.run_status_label)
+        self.run_status_label = QLabel()
+        self.run_status_label.setObjectName("status")
+        row.addWidget(self.run_status_label, 1)
         self._run_timer = QTimer(self)
         self._run_timer.setInterval(1000)
         self._run_timer.timeout.connect(self._refresh_run_status)
@@ -1273,7 +1271,9 @@ class MainWindow(QMainWindow):
                 ][-3:]
             except Exception:
                 pass
-        self.run_status_label.setText("\n".join([text] + tail))
+        if tail:
+            text = f"{text}  ·  {tail[-1]}"
+        self.run_status_label.setText(text)
 
     def _load_path(self, path: Path) -> None:
         if path.exists():
