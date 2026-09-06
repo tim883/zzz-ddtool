@@ -75,6 +75,14 @@ def goto_warehouse() -> Path:
     page = classify_image(image)
     log.info("start page=%s size=%sx%s", page, image.width(), image.height())
 
+    # unknown 多半是详情/强化弹层还开着（比如上次手动操作残留）：先 Esc 关掉再认页
+    if page == UNKNOWN:
+        press_key(hwnd, VK_ESCAPE)
+        time.sleep(0.5)
+        image = grab_game_image()[0]
+        page = classify_image(image)
+        log.info("after esc page=%s", page)
+
     try:
         if is_page(image, DRIVE_DISC):
             dest = capture_game()
