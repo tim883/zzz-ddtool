@@ -51,71 +51,58 @@ def _click(hwnd: int, image, point: tuple[int, int], alt: bool = False) -> None:
     click_client(hwnd, x, y, alt=alt)
 
 
-def _open_drive_disc(hwnd: int, image, page: str) -> tuple[object, str]:
-    if is_page(image, DRIVE_DISC):
-        return image, DRIVE_DISC
-    if not is_page(image, STORAGE) and page not in {STORAGE, UNKNOWN}:
-        raise NavError(f"现在不在仓库（{page}），不能切驱动盘。")
-    _click(hwnd, image, DRIVE_DISC_TAB)
-    time.sleep(0.7)
-    image, page, _method, _hwnd = _grab(hwnd)
-    if is_page(image, DRIVE_DISC):
-        return image, DRIVE_DISC
-    raise NavError("点了驱动盘页签，图标对不上，已中断。")
+def _open_drive_disc(hwnd: int, image, page: str, retries: int = 2) -> tuple[object, str]:
+    """仓库页切到驱动盘页签，切完认页验证；没切过去就再点一次。"""
+    for i in range(max(1, retries)):
+        if is_page(image, DRIVE_DISC):
+            return image, DRIVE_DISC
+        if not (is_page(image, STORAGE) or page in {STORAGE, UNKNOWN}):
+            break
+        get_logger("zzz_ddtool.nav").info("点驱动盘页签 (第%d次)", i + 1)
+        _click(hwnd, image, DRIVE_DISC_TAB)
+        time.sleep(1.2)
+        image, page, _method, _hwnd = _grab(hwnd)
+        if is_page(image, DRIVE_DISC):
+            return image, DRIVE_DISC
+    detail = " ".join(f"{name}={score:.2f}/{need:.2f}" for name, score, need in icon_report(image, DRIVE_DISC))
+    raise NavError(f"点了驱动盘页签还是没切过去（{detail}），已中断。")
 
 
 def goto_warehouse() -> Path:
-    """大地图 ↔ Esc 功能页 → 仓库 → 驱动盘。不点强化 / 弃置 / 拆解。"""
+    """任意正常操作状态 → 驱动盘仓库页。
+
+    逐状态认页处理，循环直到站稳驱动盘页：
+    drive_disc=完事；storage=点驱动盘页签；menu=点仓库；overworld/unknown=Esc 剥一层
+    （unknown=详情/缩放/强化弹层等正常操作残留页，每次 Esc 关一层再认）。
+    全程不点强化/弃置/拆解。
+    """
     log = get_logger("zzz_ddtool.nav")
     try:
         image, _method, hwnd = grab_game_image()
     except CaptureError as exc:
         raise NavError(str(exc)) from exc
 
-    page = classify_image(image)
-    log.info("start page=%s size=%sx%s", page, image.width(), image.height())
-
-    # unknown 多半是详情/强化弹层还开着（比如上次手动操作残留）：先 Esc 关掉再认页
-    if page == UNKNOWN:
-        press_key(hwnd, VK_ESCAPE)
-        time.sleep(0.5)
-        image = grab_game_image()[0]
-        page = classify_image(image)
-        log.info("after esc page=%s", page)
-
     try:
-        if is_page(image, DRIVE_DISC):
-            dest = capture_game()
-            return dest
-        if is_page(image, STORAGE) or page in {STORAGE, UNKNOWN}:
-            image, page = _open_drive_disc(hwnd, image, page)
-            _require(image, DRIVE_DISC, "驱动盘页")
-            dest = capture_game()
-            return dest
-
-        if page == OVERWORLD:
+        for step in range(8):
+            page = classify_image(image)
+            log.info("goto warehouse step=%d page=%s", step, page)
+            if is_page(image, DRIVE_DISC):
+                return capture_game()
+            if is_page(image, STORAGE) or page == STORAGE:
+                image, page = _open_drive_disc(hwnd, image, page)
+                return capture_game()
+            if page == MENU:
+                _click(hwnd, image, WAREHOUSE_BTN)
+                time.sleep(0.8)
+                image, page, _dest = _shot("after-warehouse")
+                continue
+            # overworld 或 unknown（详情/缩放/强化弹层）：Esc 剥一层
             press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.45)
-            image, page, dest = _shot("after-esc")
-            _require(image, MENU, "功能页")
-
-        if page == MENU or is_page(image, MENU):
-            _click(hwnd, image, WAREHOUSE_BTN)
-            time.sleep(0.7)
-            image, page, dest = _shot("after-warehouse")
-            if is_page(image, MENU):
-                raise NavError("点了仓库还在功能页。用管理员开工具再试，或确认没被别的窗口挡住。")
-            if is_page(image, OVERWORLD):
-                raise NavError("点了仓库却回到大地图，已中断。")
-            _require(image, STORAGE, "仓库页")
-            image, page = _open_drive_disc(hwnd, image, page)
-            _require(image, DRIVE_DISC, "驱动盘页")
-            dest = capture_game()
-            return dest
+            time.sleep(0.6)
+            image = grab_game_image()[0]
+        raise NavError("转了 8 圈都没站上驱动盘页，已中断（页面状态见日志）。")
     except InputError as exc:
         raise NavError(str(exc)) from exc
-
-    raise NavError("当前不是大地图或菜单，已中断。先按 Esc 看能不能出菜单。")
 
 
 def snapshot_pages() -> dict[str, Path]:
