@@ -15,6 +15,5 @@ dist/
 build/
 *.egg-info/
 
-# Local captures / logs (use workspace ../out instead)
-*.log
-captures/
+# Runtime captures and logs stay in the repo folder, not committed
+out/

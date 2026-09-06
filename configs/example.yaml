@@ -1,6 +1,13 @@
 name: 双暴攻击-示例
 min_useful_types: 0
 ocr_retry: 3
+run:
+  max_discs: 100
+game_filter:
+  sets: []
+  slot: 4
+  slots: [4]
+  mainstats: []
 filters:
   require_s_rank: true
   skip_locked: true

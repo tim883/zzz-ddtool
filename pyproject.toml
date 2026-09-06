@@ -21,6 +21,9 @@ zzz-ddtool = "zzz_ddtool.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+zzz_ddtool = ["assets/templates/**/*.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
