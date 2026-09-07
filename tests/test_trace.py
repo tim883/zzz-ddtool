@@ -83,35 +83,26 @@ def test_decide_does_not_shoot() -> None:
     assert trace._shots == []
 
 
-def test_middle_discs_pruned_but_path_and_failures_kept(tmp_path: Path) -> None:
-    """只留最初 5 个 + 最近 5 个盘；路径类步骤和失败的图一律保住。"""
-    trace = Trace(tag="tag-keep")
+class _FakeImage:
+    """假装是 QImage。这台机器没游戏窗口，现截必然失败，测试得自己喂图。"""
 
-    def make(name: str, disc_no: int, keep: bool) -> None:
-        path = tmp_path / name
-        path.write_bytes(b"x")
-        trace._shots.append((path, disc_no, keep))
+    def __init__(self, root: Path) -> None:
+        self.root = root
 
-    # 12 个盘，每个盘一张图
-    for disc_no in range(1, 13):
-        make(f"{disc_no:04d}-识别盘面.png", disc_no, False)
-    make("0001-导航到仓库.png", 1, True)  # 路径类
-    make("0002-进强化页.png", 1, True)  # 失败
+    def save(self, path: str, _fmt: str) -> bool:
+        Path(path).write_bytes(b"x")
+        return True
 
-    removed = trace._prune()
-    alive = {p.name for p in tmp_path.iterdir()}
 
-    # 中间的 6、7 号盘被删（12 - 前5 - 后5 = 2）
-    assert removed == 2
-    assert "0006-识别盘面.png" not in alive
-    assert "0007-识别盘面.png" not in alive
-    # 最初 5 个 + 最近 5 个 + 路径类 + 失败，全在
-    assert "0001-识别盘面.png" in alive
-    assert "0005-识别盘面.png" in alive
-    assert "0008-识别盘面.png" in alive
-    assert "0012-识别盘面.png" in alive
-    assert "0001-导航到仓库.png" in alive
-    assert "0002-进强化页.png" in alive
+def test_every_step_gets_a_photo_except_decide(tmp_path: Path) -> None:
+    """一步一扫。判断是纯计算例外——不碰屏幕，截出来跟上一张一样。"""
+    trace = Trace(tag="tag-steps")
+    img = _FakeImage(tmp_path)
+    trace.ok("detail", "click_cell", "第2行第3列", image=img)
+    trace.ok("detail", "parse", "等级3", image=img)
+    trace.ok("detail", "decide", "继续强化", image=img)  # 判断不截
+    # 前两步各记一张，判断不记
+    assert len(trace._shots) == 2
 
 
 def test_note_does_not_consume_a_step() -> None:

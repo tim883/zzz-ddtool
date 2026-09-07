@@ -24,13 +24,31 @@ def archives_file() -> Path:
     return configs_dir() / "archives.json"
 
 
-def out_dir() -> Path:
-    return repo_root() / "out"
+def log_dir() -> Path:
+    """所有运行时产出的根目录，第一层就叫 log。
+
+    文本和图片分开两个明确路径：
+        log/ddtool.log            文本日志
+        log/captures/<时间戳>/    本轮截图
+    """
+    return repo_root() / "log"
 
 
 def captures_dir() -> Path:
-    return out_dir() / "captures"
+    """图片日志：一轮一个子目录。"""
+    return log_dir() / "captures"
 
 
 def logs_dir() -> Path:
-    return out_dir() / "logs"
+    """文本日志目录（里面是 ddtool.log）。"""
+    return log_dir() / "text"
+
+
+def status_file() -> Path:
+    """运行状态（给界面读的临时文件）。"""
+    return log_dir() / "run-status.json"
+
+
+def debug_dir() -> Path:
+    """调试用的零散截图（标定、探测等一次性产物）。"""
+    return log_dir() / "debug"

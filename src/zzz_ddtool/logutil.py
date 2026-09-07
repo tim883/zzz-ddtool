@@ -18,7 +18,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 
 from zzz_ddtool.paths import logs_dir
-from zzz_ddtool.retain import retain_logs
+from zzz_ddtool.retain import MAX_LOG_FILES
 
 _configured = False
 _level = logging.INFO
@@ -59,7 +59,7 @@ def setup(level: int | str = logging.INFO, *, console: bool = False) -> None:
     file_handler = RotatingFileHandler(
         folder / "ddtool.log",
         maxBytes=2 * 1024 * 1024,
-        backupCount=6,
+        backupCount=MAX_LOG_FILES,
         encoding="utf-8",
     )
     file_handler.setFormatter(ChineseFormatter())
@@ -73,7 +73,6 @@ def setup(level: int | str = logging.INFO, *, console: bool = False) -> None:
     root.setLevel(_level)
     root.propagate = False
     _configured = True
-    retain_logs(folder)
 
 
 def set_level(level: int | str) -> None:

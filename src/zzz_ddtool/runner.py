@@ -71,11 +71,11 @@ class Runner:
         line = " ".join(x for x in (stamp, cell, phase, message) if x)
         self._status_lines.append(line)
         del self._status_lines[:-8]
-        """把运行状态写到 out/run-status.json，随时可查看工具正在干什么。"""
+        """把运行状态写到 log/run-status.json，随时可查看工具正在干什么。"""
         try:
             import json
 
-            from zzz_ddtool.paths import out_dir
+            from zzz_ddtool.paths import status_file
 
             payload = {
                 "time": stamp,
@@ -85,8 +85,8 @@ class Runner:
                 "processed": self._processed,
                 "max_discs": self.preset.max_discs,
             }
-            out_dir().mkdir(parents=True, exist_ok=True)
-            (out_dir() / "run-status.json").write_text(
+            status_file().parent.mkdir(parents=True, exist_ok=True)
+            status_file().write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
             )
             from zzz_ddtool.overlay import overlay_show

@@ -25,7 +25,7 @@ def main() -> int:
     name = sys.argv[1] if len(sys.argv) > 1 else "setpicker-live"
     image, _method, hwnd = grab_game_image()
     width, height = image.width(), image.height()
-    out = Path("out/captures")
+    out = Path("log/captures")
     out.mkdir(parents=True, exist_ok=True)
 
     # 不在驱动盘页就先导航过去

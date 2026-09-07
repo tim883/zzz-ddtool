@@ -236,7 +236,7 @@ def save_image(image, hwnd: int, method: str, name: str | None = None, dest_dir:
     dest = folder / f"{name}.png" if name else folder / f"zzz-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
     if not image.save(str(dest), "PNG"):
         raise CaptureError(f"写文件失败：{dest}")
-    removed = retain_captures(folder)
+    removed = retain_captures()
     get_logger("zzz_ddtool.capture").info(
         "captured %s (%sx%s) hwnd=%s method=%s removed=%s",
         dest.name,

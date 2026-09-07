@@ -31,7 +31,7 @@ def tile_has_portrait(image, left: int, top: int, right: int, bottom: int) -> bo
 def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
     """格子右下角的纯红矩形小牌 = 已打弃置标。
 
-    实拍标定（out/captures/verify-discard.png, 1920×1080）：
+    实拍标定（log/captures/verify-discard.png, 1920×1080）：
     - 红牌 RGB(203,0,0) 纯红，约 16×16，位于格子右下角
     - 相对格子中心偏移约 (dx=+34, dy=+28)
     - 扫描区 (cx+20..cx+50, cy+15..cy+45)

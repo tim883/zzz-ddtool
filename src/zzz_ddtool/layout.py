@@ -21,7 +21,7 @@ DISMANTLE_FORBID = (210, 890, 460, 990)
 # FILTER_RESET=(1301,1033) 偏到重置按钮左缘图标；FILTER_SLOTS 整表偏到错误按钮上。
 FILTER_RESET = (1432, 1029)
 
-# 右侧详情面板。2026-09-06 OCR 实测（out/captures/detail-page.png + 老大截图）重新标定：
+# 右侧详情面板。2026-09-06 OCR 实测（log/captures/detail-page.png + 老大截图）重新标定：
 # 旧值 DISC_LEVEL/MAIN_STAT/SUB_STATS 偏下约 150px，导致 parse_disc 读不到副属性。
 DETAIL_PANEL = (1400, 225, 1870, 800)
 DISC_NAME = (1400, 260, 1620, 315)

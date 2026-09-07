@@ -777,10 +777,13 @@ class MainWindow(QMainWindow):
         save_as_btn.clicked.connect(self.save_as)
         self.stay_on_top = QCheckBox("置顶")
         self.stay_on_top.toggled.connect(self._toggle_on_top)
+        settings_btn = QPushButton("日志设置")
+        settings_btn.clicked.connect(self.open_settings)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.stay_on_top)
+        actions.addWidget(settings_btn)
         actions.addWidget(capture_btn)
         actions.addWidget(warehouse_btn)
         actions.addWidget(open_btn)
@@ -1350,14 +1353,24 @@ class MainWindow(QMainWindow):
         self._refresh_archive_combo()
         return bar
 
+    def open_settings(self) -> None:
+        """日志设置：级别 + 截图容量。"""
+        from zzz_ddtool.logsettings import LogSettingsDialog
+
+        dialog = LogSettingsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        dialog.apply_settings()
+        self.status.setText("日志设置已保存")
+
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
         import json
 
-        from zzz_ddtool.paths import out_dir
+        from zzz_ddtool.paths import status_file as _status_file_path
 
         text = "运行状态：—（还没有运行记录）"
-        status_file = out_dir() / "run-status.json"
+        status_file = _status_file_path()
         if status_file.exists():
             try:
                 data = json.loads(status_file.read_text(encoding="utf-8"))

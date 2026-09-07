@@ -15,5 +15,5 @@ dist/
 build/
 *.egg-info/
 
-# Runtime captures and logs stay in the repo folder, not committed
-out/
+# Runtime output (text log + screenshots), not committed
+log/

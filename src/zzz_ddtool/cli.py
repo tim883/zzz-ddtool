@@ -36,8 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     decide_p.add_argument("--discarded", action="store_true")
     decide_p.add_argument("--min-useful", type=int, help="Override min_useful_types")
 
-    cap_p = sub.add_parser("capture", help="Grab the game window into out/captures")
-    cap_p.add_argument("--out", type=Path, help="Directory, default project out/captures")
+    cap_p = sub.add_parser("capture", help="Grab the game window into log/captures")
+    cap_p.add_argument("--out", type=Path, help="Directory, default project log/captures")
 
     nav_p = sub.add_parser("goto-warehouse", help="Esc to menu if needed, then click 仓库")
     sub.add_parser("snapshot-pages", help="Click home / menu / warehouse and save named shots")
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
 
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
-    preview_p.add_argument("--out", type=Path, help="HTML path, default workspace out/pattern-cards.html")
+    preview_p.add_argument("--out", type=Path, help="HTML path, default log/pattern-cards.html")
     preview_p.add_argument("--show-junk-bonus", action="store_true", help="Also show rolls that landed on junk")
 
     args = parser.parse_args(argv)
@@ -243,9 +243,9 @@ def _load_preset(args: argparse.Namespace):
 
 
 def _default_preview_path() -> Path:
-    from zzz_ddtool.paths import out_dir
+    from zzz_ddtool.paths import log_dir
 
-    return out_dir() / "pattern-cards.html"
+    return log_dir() / "pattern-cards.html"
 
 
 if __name__ == "__main__":

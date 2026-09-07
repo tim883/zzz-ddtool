@@ -21,10 +21,9 @@
       这类步骤正是坐标可能偏的地方，图是核对坐标的唯一依据。
 
 容量怎么控（截图 1.5MB 一张，不控会撑爆磁盘）：
-    - 路径类步骤（导航/筛选/扫描/翻页）：全存，数量少且最常出问题
-    - 盘的处理：只留最初 KEEP_FIRST_DISCS 个 + 最近 KEEP_LAST_DISCS 个
-    - 失败/告警：永远保留，不被任何清理删掉
-    - 一轮一个目录，只留最近 KEEP_ROUNDS 轮
+    纯按总张数。超了从最旧的轮次开始整轮删。
+    不做「失败永远保留」——排错靠 debug 重跑复现，不靠翻旧图回溯，
+    留着失败图只会把正常的挤掉。见 retain.py。
 """
 
 from __future__ import annotations
@@ -66,14 +65,6 @@ ACTION_NAMES = {
     "scroll": "翻页",
 }
 
-# 路径类步骤：数量少、最容易出岔子，一律全存
-PATH_ACTIONS = frozenset({"navigate", "filter", "scan", "scroll"})
-
-KEEP_FIRST_DISCS = 5  # 前几个盘全留：刚启动时的异常最多
-KEEP_LAST_DISCS = 5  # 最近几个盘全留：跑了一阵才跑偏的情况
-KEEP_ROUNDS = 3  # 只留最近几轮
-
-
 def page_name(page: str) -> str:
     """把页面标识翻成人话；认不出来就原样返回，别编。"""
     return PAGE_NAMES.get(page, page)
@@ -92,7 +83,7 @@ class Trace:
         self._dir: Path | None = None
         self.failed = False
         self._disc_no = 0  # 当前在处理第几个盘（0=还没进盘）
-        self._shots: list[tuple[Path, int, bool]] = []  # (路径, 盘号, 是否必留)
+        self._shots: list[Path] = []  # 本轮存过的图，收尾时用来算数
 
     @property
     def dir(self) -> Path:
@@ -150,7 +141,7 @@ class Trace:
         message = f"{page_name(page)} · {action_name(action)} → 失败"
         if reason:
             message += f"：{reason}"
-        name = self._persist(action, image, keep=True)
+        name = self._persist(action, image)
         if name:
             message += f"  截图={name}"
         else:
@@ -163,7 +154,7 @@ class Trace:
         message = f"{page_name(page)} · {action_name(action)} → 注意"
         if reason:
             message += f"：{reason}"
-        name = self._persist(action, image, keep=True)
+        name = self._persist(action, image)
         if name:
             message += f"  截图={name}"
         get_logger("zzz_ddtool.trace").warning(message)
@@ -172,7 +163,7 @@ class Trace:
         """补充说明，不推进步骤号、不截图。"""
         get_logger("zzz_ddtool.trace").info("    · %s", message)
 
-    def _persist(self, action: str, image, keep: bool = False) -> str | None:
+    def _persist(self, action: str, image) -> str | None:
         """存一步的图。image 为空则现截一张（这步没做 OCR）。"""
         if image is None:
             try:
@@ -188,57 +179,22 @@ class Trace:
         except Exception as exc:
             get_logger("zzz_ddtool.trace").warning("存图失败：%s", exc)
             return None
-        # 路径类步骤和失败/告警：必留
-        self._shots.append((target, self._disc_no, keep or action in PATH_ACTIONS))
+        self._shots.append(target)
         return f"{self.tag}/{name}"
 
     def finish(self) -> None:
-        """收尾：按容量策略清理，再回收旧轮次。"""
+        """收尾：按总张数回收旧轮次（纯按数量，不做特殊保留）。"""
         log = get_logger("zzz_ddtool.trace")
-        removed = self._prune()
+        from zzz_ddtool.retain import MAX_CAPTURE_FILES, retain_captures
+
+        removed = retain_captures()
         log.info(
-            "本轮结束：共 %d 步，处理 %d 个盘，%s，截图在 captures/%s",
+            "本轮结束：共 %d 步，处理 %d 个盘，%s，本轮 %d 张图，截图在 captures/%s",
             self._step,
             self._disc_no,
             ("有失败" if self.failed else "无失败"),
+            len(self._shots),
             self.tag,
         )
         if removed:
-            log.info(
-                "按容量策略清理了 %d 张（只留最初 %d 个 + 最近 %d 个盘）",
-                removed,
-                KEEP_FIRST_DISCS,
-                KEEP_LAST_DISCS,
-            )
-        self._prune_rounds()
-
-    def _prune(self) -> int:
-        """删掉中间那些盘的图：只留最初 N 个 + 最近 N 个，必留的不动。"""
-        if not self._shots:
-            return 0
-        disc_nos = sorted({no for _p, no, _k in self._shots if no > 0})
-        keep_nos = set(disc_nos[:KEEP_FIRST_DISCS]) | set(disc_nos[-KEEP_LAST_DISCS:])
-        removed = 0
-        for path, disc_no, keep in self._shots:
-            if keep or disc_no == 0 or disc_no in keep_nos:
-                continue
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                pass
-        return removed
-
-    def _prune_rounds(self) -> None:
-        """只留最近 KEEP_ROUNDS 轮，更早的整目录删掉。"""
-        root = captures_dir()
-        if not root.exists():
-            return
-        rounds = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
-        for old in rounds[:-KEEP_ROUNDS]:
-            try:
-                for f in old.glob("*.png"):
-                    f.unlink()
-                old.rmdir()
-            except OSError as exc:
-                get_logger("zzz_ddtool.trace").warning("清理旧轮次失败：%s", exc)
+            log.info("截图总数超 %d 张，清理了最旧的 %d 张", MAX_CAPTURE_FILES, len(removed))
