@@ -24,7 +24,8 @@ PAGE_MARKS: dict[str, tuple[IconMark, ...]] = {
     DRIVE_DISC: (
         IconMark("驱动仓库标题", "discs/title.png", (74, 112, 164, 168), 0.85),
         IconMark("拆解", "discs/dismantle.png", (250, 900, 438, 960), 0.94),
-        IconMark("驱动盘页签", "discs/tab.png", (1510, 126, 1588, 210), 0.85),
+        # 不用「驱动盘页签」做锚点：页签切过去后变选中态(黄底)，模板分掉到 0.81
+        # 左右摇摆；驱动仓库标题本身已能区分音擎/驱动两个仓。
     ),
 }
 
