@@ -9,10 +9,10 @@
 
 | 入口 | 内容 |
 |------|------|
-| [doc/README.md](doc/README.md) | **技术手册**：识别标定、截图与坐标、参考项目（开发/排查先看这里） |
+| [doc/README.md](doc/README.md) | **技术手册**：识别标定、截图与坐标、日志与截图（开发/排查先看这里） |
 | [手册/README.md](手册/README.md) | **用户手册**：页面识别、运行限制与筛选 |
 
-## 装与跑
+## 装与跑（开发用）
 
 需要 **Python 3.11+**，以及系统缩放 100%、游戏窗口化 16:9（坐标按 1920×1080 标定）。
 
@@ -22,9 +22,13 @@ py -3.13 -m pip install -e ".[dev]"
 py -3.13 -m zzz_ddtool        # 开窗口（默认子命令就是 gui）
 ```
 
-也可以双击 `打开窗口.bat`。Python 版本不同的机器另建一个 bat 改版本号即可。
+依赖：`PySide6-Essentials`（窗口）、`opencv-python` + `numpy` + `rapidocr`（OCR）、`pyyaml`（配置）。
 
-依赖：`PySide6-Essentials`（窗口）、`opencv-python` + `numpy` + `rapidocr-onnxruntime`（OCR）、`pyyaml`（配置）。
+> **坑**：包名是 `rapidocr`，不是 `rapidocr-onnxruntime`。
+> 后者是旧版，装了会报 `No module named 'rapidocr'`。
+>
+> 打包成 exe 的方案（给别人用、检查更新）见工作区
+> `dev-docs/打包与更新改造手册.md`。
 
 ## 窗口里能做什么
 
@@ -34,7 +38,9 @@ py -3.13 -m zzz_ddtool        # 开窗口（默认子命令就是 gui）
 - **任务链**：按部位（1–6 号）排多个任务，每个部位一套自己的权重和勾选
 
 点「截取游戏」把当前游戏窗口存到本仓库 `out/captures/`，日志在 `out/logs/`。
-截图最多 40 张 / 200MB，日志最多 15 文件 / 16MB，超出删最旧的。
+每一步都存一张图，命名 `0007-进强化页.png`，前缀就是日志里的步骤号。
+容量：路径类（导航/筛选/扫描/翻页）全存，盘只留最初 5 个 + 最近 5 个，
+失败的一律保留，只留最近 3 轮。见 [doc/日志与截图.md](doc/日志与截图.md)。
 
 ## 命令行
 
