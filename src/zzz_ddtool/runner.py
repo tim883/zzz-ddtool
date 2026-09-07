@@ -55,6 +55,7 @@ class Runner:
         self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
         self.results: list[RunResult] = []
         self._processed = 0
+        self._scan_image = None  # 最近一次整页扫描的图（存盘用）
         self.hotkeys = HotkeyController() if hotkeys else None
 
     def _checkpoint(self) -> None:
@@ -226,16 +227,21 @@ class Runner:
                 break
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
-            self.trace.ok("drive_disc", "scan", f"第 {page_idx + 1} 页扫到 {len(cells)} 个盘")
+            self.trace.ok(
+                "drive_disc", "scan", f"第 {page_idx + 1} 页扫到 {len(cells)} 个盘", image=self._scan_image
+            )
             self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
             maxed = False
-            for row, col, cx, cy, _lv in cells:
+            total_cells = len(cells)
+            for cell_no, (row, col, cx, cy, _lv) in enumerate(cells, start=1):
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
                     maxed = True
                     break
                 cell_tag = f"r{row}c{col}"
-                where = f"第{row + 1}行第{col + 1}列"
+                # 队列位置 + 网格位置都要有：前者知道进度，后者知道点哪
+                where = f"第 {cell_no} 个/共 {total_cells} 个 · 第{row + 1}行第{col + 1}列"
+                self.trace.new_disc()  # 盘号决定这批图最后留不留
                 click_client(hwnd, cx, cy)
                 time.sleep(0.5)
                 detail_image, page, *_ = self._grab(allow_esc=False)
@@ -243,26 +249,29 @@ class Runner:
                     # 点飞了（如误触弹层）：Esc 退出尝试回驱动盘页；
                     # 回得来就重扫当前页继续，回不来才中断。
                     self.log.warning("cell %s detail click left drive_disc (page=%s), try recover", cell_tag, page)
-                    self._dbg_capture(f"click-anomaly-{page}")
-                    self.trace.warn(page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回")
+                    self.trace.warn(
+                        page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回",
+                        image=detail_image,
+                    )
                     press_key(hwnd, VK_ESCAPE)
                     time.sleep(0.6)
-                    _, page2, *_ = self._grab(allow_esc=False)
+                    back_image, page2, *_ = self._grab(allow_esc=False)
                     if page2 == "drive_disc":
                         self.log.info("recovered to drive_disc, rescan page")
                         self.trace.note("已退回驱动盘仓库，重扫本页")
                         rescan = True
                         break
                     self.log.error("recover failed (page=%s), stop job", page2)
-                    self._dbg_capture(f"recover-failed-{page2}")
-                    self.trace.fail(page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工")
+                    self.trace.fail(
+                        page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工", image=back_image
+                    )
                     return
-                self.trace.ok("detail", "click_cell", where)
+                self.trace.ok("detail", "click_cell", where, image=detail_image)
                 # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
                 if disc is None:
                     self.log.info("cell %s no disc, skip", cell_tag)
-                    self.trace.warn("detail", "parse", f"{where} 没读出盘面，跳过")
+                    self.trace.warn("detail", "parse", f"{where} 没读出盘面，跳过", image=detail_image)
                     continue
                 self.trace.ok(
                     "detail",
@@ -270,6 +279,7 @@ class Runner:
                     f"{where} 等级{disc.level} 副词条{len(disc.substats)}条"
                     + ("（已锁定）" if disc.locked else "")
                     + ("（已弃置）" if disc.discarded else ""),
+                    image=detail_image,
                 )
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 key = (cx, cy)
@@ -360,6 +370,7 @@ class Runner:
         skip_tagged=True 时弃置标记格在扫描阶段直接剔除（连点都不点）。
         """
         image, _method, hwnd = grab_game_image()
+        self._scan_image = image  # 整页长什么样，交给 trace 存（这一页的唯一现场）
         ox, oy = scale_point(*GRID_ORIGIN, width, height)
         sx, sy = scale_point(*GRID_STEP, width, height)
         from zzz_ddtool.equipped import tile_has_discard_badge, tile_has_portrait
@@ -477,25 +488,14 @@ class Runner:
         self.log.error("esc back failed after %d esc, still unknown", max_esc)
         return False
 
-    def _dbg_capture(self, tag: str) -> None:
-        """中断点自动存图，供事后标定（存 captures 目录，命名 upg-<tag>）。"""
-        try:
-            from zzz_ddtool.capture import grab_game_image, save_image
-
-            img, method, hwnd2 = grab_game_image()
-            save_image(img, hwnd2, method, name=f"upg-{tag}")
-        except Exception as exc:  # 存图失败不影响主流程
-            self.log.warning("dbg capture %s failed: %s", tag, exc)
-
-    def _click_text(self, hwnd: int, lines, needle: str, region_desc: str, tag: str) -> bool:
+    def _click_text(self, hwnd: int, lines, needle: str, region_desc: str, tag: str, image=None) -> bool:
         """在 OCR 结果里找含 needle 的行并点中心，找不到存图返回 False。"""
         for line in lines:
             if needle in line.text.replace(" ", ""):
                 click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
                 return True
         self.log.warning("UPGRADE: 没找到%s，中断回退", region_desc)
-        self._dbg_capture(tag)
-        self.trace.fail("upgrade", "click_cell", f"在{region_desc}没找到「{needle}」")
+        self.trace.fail("upgrade", "click_cell", f"在{region_desc}没找到「{needle}」", image=image)
         return False
 
     def _enter_upgrade_page(self, hwnd: int) -> bool:
@@ -517,8 +517,7 @@ class Runner:
                 break
         if hit is None:
             self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮")
-            self._dbg_capture("step1-查看")
-            self.trace.fail("detail", "enter_upgrade", "没找到「查看/强化」大按钮")
+            self.trace.fail("detail", "enter_upgrade", "没找到「查看/强化」大按钮", image=image)
             self._esc_back_to_grid(hwnd)
             return False
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
@@ -533,8 +532,7 @@ class Runner:
                 break
         if level_line is None:
             self.log.warning("UPGRADE: 缩放页没找到「等级」")
-            self._dbg_capture("step2-等级")
-            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字")
+            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字", image=image)
             self._esc_back_to_grid(hwnd)
             return False
         ax = level_line.right + 110
@@ -553,7 +551,7 @@ class Runner:
                     break
             if stage_clicked:
                 break
-            self._dbg_capture(f"step3-未进{attempt}")
+            self.trace.warn("zoom", "enter_upgrade", f"第 {attempt} 次点箭头没进强化页", image=image)
             image, *_ = self._grab(allow_esc=False)
             level_line = None
             for line in read_rect(image, self.ZOOM_LEVEL_AREA):
@@ -578,11 +576,15 @@ class Runner:
         from zzz_ddtool.ocr import read_rect
 
         image, *_ = self._grab(allow_esc=False)
-        if not self._click_text(read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add"):
+        if not self._click_text(
+            read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add", image=image
+        ):
             return False
         time.sleep(0.6)
         image, *_ = self._grab(allow_esc=False)
-        if not self._click_text(read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step-upgrade-confirm"):
+        if not self._click_text(
+            read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step-upgrade-confirm", image=image
+        ):
             return False
         time.sleep(1.5)
         self.log.info("action=UPGRADE 完成（阶段添加→升级）")
@@ -634,8 +636,7 @@ class Runner:
             disc = parse_disc_upgrade_page(image)
             if disc is None:
                 self.log.warning("cell %s 强化页解析失败，回网格", cell_tag)
-                self._dbg_capture("upg-parse-fail")
-                self.trace.fail("upgrade", "parse", "认不出强化页上的盘面，回列表")
+                self.trace.fail("upgrade", "parse", "认不出强化页上的盘面，回列表", image=image)
                 self._esc_back_to_grid(hwnd)
                 return
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)

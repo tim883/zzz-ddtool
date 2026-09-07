@@ -1,6 +1,7 @@
 """步骤跟踪的中文命名与步骤号（日志给人看，错了就白记）。"""
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -68,11 +69,49 @@ def test_screenshot_filename_uses_step_number() -> None:
     """截图名带步骤号，才能和日志那一行对上。"""
     trace = Trace(tag="tag")
     trace.ok("detail", "parse")
-    name = trace._shoot("parse")
-    # 这台机器没装 PySide6 会截不了图，此时返回 None 也算正常
+    name = trace._persist("parse", image=None)
+    # 这台机器没有游戏窗口时会截不了图，返回 None 也算正常
     if name is not None:
-        assert name.startswith("0001-")
+        assert name.startswith("tag/0001-")
         assert name.endswith(".png")
+
+
+def test_decide_does_not_shoot() -> None:
+    """判断是纯计算不碰屏幕，截图跟上一张一模一样，不该截。"""
+    trace = Trace(tag="tag-decide")
+    trace.ok("detail", "decide", "继续强化")
+    assert trace._shots == []
+
+
+def test_middle_discs_pruned_but_path_and_failures_kept(tmp_path: Path) -> None:
+    """只留最初 5 个 + 最近 5 个盘；路径类步骤和失败的图一律保住。"""
+    trace = Trace(tag="tag-keep")
+
+    def make(name: str, disc_no: int, keep: bool) -> None:
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        trace._shots.append((path, disc_no, keep))
+
+    # 12 个盘，每个盘一张图
+    for disc_no in range(1, 13):
+        make(f"{disc_no:04d}-识别盘面.png", disc_no, False)
+    make("0001-导航到仓库.png", 1, True)  # 路径类
+    make("0002-进强化页.png", 1, True)  # 失败
+
+    removed = trace._prune()
+    alive = {p.name for p in tmp_path.iterdir()}
+
+    # 中间的 6、7 号盘被删（12 - 前5 - 后5 = 2）
+    assert removed == 2
+    assert "0006-识别盘面.png" not in alive
+    assert "0007-识别盘面.png" not in alive
+    # 最初 5 个 + 最近 5 个 + 路径类 + 失败，全在
+    assert "0001-识别盘面.png" in alive
+    assert "0005-识别盘面.png" in alive
+    assert "0008-识别盘面.png" in alive
+    assert "0012-识别盘面.png" in alive
+    assert "0001-导航到仓库.png" in alive
+    assert "0002-进强化页.png" in alive
 
 
 def test_note_does_not_consume_a_step() -> None:

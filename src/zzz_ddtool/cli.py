@@ -13,13 +13,11 @@ from zzz_ddtool.patterns import enumerate_all
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="zzz-ddtool", description="绝区零驱动盘自动强化辅助")
-    # 日志级别决定截图多少：debug=每一步都截图，info=只记动作不截图
     parser.add_argument(
-        "--log-level",
-        "-l",
-        default="info",
-        choices=["debug", "info", "warning", "error"],
-        help="日志详细程度。debug=每一步都截图（排查用），默认 info=只记关键动作",
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="日志里额外打出每一步的步骤号（截图始终全量，不受这个开关影响）",
     )
     sub = parser.add_subparsers(dest="cmd", required=False)
 
@@ -55,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     from zzz_ddtool.logutil import setup
 
-    setup(args.log_level.upper(), console=True)
+    setup("DEBUG" if args.verbose else "INFO", console=True)
     if args.cmd in (None, "gui"):
         return _cmd_gui(getattr(args, "config", None))
     if args.cmd == "decide":
