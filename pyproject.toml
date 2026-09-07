@@ -5,11 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "zzz-ddtool"
 version = "0.1.0"
-description = "ZZZ drive disc upgrade helper: local OCR + click (decision engine first)"
+description = "绝区零驱动盘自动强化辅助：本地截屏 + OCR + 模拟点击"
 requires-python = ">=3.11"
+# 缺一个都跑不起来：PySide6 管窗口和图像，opencv/numpy 是 OCR 前置，
+# rapidocr 是本地 OCR（不联网、不装 Paddle 全家桶）。
+# 注意包名是 rapidocr，不是 rapidocr-onnxruntime（那是旧版，API 对不上，
+# 装了会报 ModuleNotFoundError: No module named 'rapidocr'）。
 dependencies = [
   "pyyaml>=6.0",
   "PySide6-Essentials>=6.6",
+  "opencv-python>=4.8",
+  "numpy>=1.24",
+  "rapidocr>=3.0",
 ]
 
 [project.optional-dependencies]

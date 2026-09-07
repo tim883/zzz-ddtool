@@ -96,7 +96,7 @@ def _get_engine():
         try:
             from rapidocr import ModelType, OCRVersion, RapidOCR
         except ImportError as exc:  # pragma: no cover - 依赖缺失才走这里
-            raise OcrError("没装 rapidocr。装：py -3.11 -m pip install rapidocr onnxruntime") from exc
+            raise OcrError("没装 rapidocr。装：py -3.13 -m pip install rapidocr（不是 rapidocr-onnxruntime）") from exc
         _engine = RapidOCR(
             params={
                 "Det.model_type": ModelType.SMALL,

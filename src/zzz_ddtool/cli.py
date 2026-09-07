@@ -12,7 +12,15 @@ from zzz_ddtool.patterns import enumerate_all
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="zzz-ddtool", description="Drive disc upgrade helper")
+    parser = argparse.ArgumentParser(prog="zzz-ddtool", description="绝区零驱动盘自动强化辅助")
+    # 日志级别决定截图多少：debug=每一步都截图，info=只记动作不截图
+    parser.add_argument(
+        "--log-level",
+        "-l",
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="日志详细程度。debug=每一步都截图（排查用），默认 info=只记关键动作",
+    )
     sub = parser.add_subparsers(dest="cmd", required=False)
 
     gui_p = sub.add_parser("gui", help="Open the desktop window")
@@ -45,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     preview_p.add_argument("--show-junk-bonus", action="store_true", help="Also show rolls that landed on junk")
 
     args = parser.parse_args(argv)
+    from zzz_ddtool.logutil import setup
+
+    setup(args.log_level.upper(), console=True)
     if args.cmd in (None, "gui"):
         return _cmd_gui(getattr(args, "config", None))
     if args.cmd == "decide":

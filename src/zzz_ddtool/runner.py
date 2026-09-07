@@ -23,6 +23,7 @@ from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
 from zzz_ddtool.ocr import OcrError, parse_disc
+from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
 
 # 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280）；
@@ -51,6 +52,7 @@ class Runner:
     def __init__(self, preset: Preset, *, hotkeys: bool = True) -> None:
         self.preset = preset
         self.log = get_logger("zzz_ddtool.runner")
+        self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
         self.results: list[RunResult] = []
         self._processed = 0
         self.hotkeys = HotkeyController() if hotkeys else None
@@ -130,15 +132,19 @@ class Runner:
         jobs = self._jobs()
         self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), self.preset.max_discs)
         self._set_status("run_start", f"jobs={len(jobs)}")
+        self.trace.ok("unknown", "run", f"共 {len(jobs)} 个任务，本轮最多处理 {self.preset.max_discs} 个盘")
         try:
             for job in jobs:
                 if self._processed >= self.preset.max_discs:
-                    self.log.info("max_discs reached, stop jobs")
+                    self.trace.ok("unknown", "run", f"到上限 {self.preset.max_discs} 个，收工")
                     break
                 try:
                     self._run_job(job)
                 except RunnerStopped:
-                    self.log.warning("F10 停止：已处理 %d 个盘子，返回已有结果", self._processed)
+                    self.trace.ok("unknown", "run", f"按了 F10 停止，已处理 {self._processed} 个")
+                    break
+                except RunnerError as exc:
+                    self.trace.fail("unknown", "run", str(exc))
                     break
         finally:
             if self.hotkeys is not None:
@@ -149,6 +155,8 @@ class Runner:
                 overlay_hide()
             except Exception:
                 pass
+        self.trace.ok("unknown", "run", f"本轮共处理 {self._processed} 个盘")
+        self.trace.finish()
         self.log.info("run done processed=%d", self._processed)
         self._set_status("done", f"processed={self._processed}")
         return list(self.results)
@@ -157,7 +165,9 @@ class Runner:
         self.log.info("job start slot=%d sets=%s mains=%s", job.slot, job.sets, job.mainstats)
         try:
             goto_warehouse()
+            self.trace.ok("drive_disc", "navigate", "已到驱动盘仓库")
         except NavError as exc:
+            self.trace.fail("unknown", "navigate", str(exc))
             raise RunnerError(f"导航失败：{exc}") from exc
 
         image, page, method, hwnd = self._grab()
@@ -168,6 +178,13 @@ class Runner:
             slots=[job.slot],
             sets=job.sets,
             mainstats=job.mainstats,
+        )
+        self.trace.ok(
+            "drive_disc",
+            "filter",
+            f"{job.slot}号位"
+            + (f" 套装 {'、'.join(job.sets)}" if job.sets else "")
+            + (f" 主词条 {'、'.join(job.mainstats)}" if job.mainstats else ""),
         )
         time.sleep(0.3)
 
@@ -209,6 +226,7 @@ class Runner:
                 break
             prev_signature = signature
             self.log.info("page %d: %d cells to process", page_idx, len(cells))
+            self.trace.ok("drive_disc", "scan", f"第 {page_idx + 1} 页扫到 {len(cells)} 个盘")
             self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
             maxed = False
             for row, col, cx, cy, _lv in cells:
@@ -217,6 +235,7 @@ class Runner:
                     maxed = True
                     break
                 cell_tag = f"r{row}c{col}"
+                where = f"第{row + 1}行第{col + 1}列"
                 click_client(hwnd, cx, cy)
                 time.sleep(0.5)
                 detail_image, page, *_ = self._grab(allow_esc=False)
@@ -225,31 +244,54 @@ class Runner:
                     # 回得来就重扫当前页继续，回不来才中断。
                     self.log.warning("cell %s detail click left drive_disc (page=%s), try recover", cell_tag, page)
                     self._dbg_capture(f"click-anomaly-{page}")
+                    self.trace.warn(page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回")
                     press_key(hwnd, VK_ESCAPE)
                     time.sleep(0.6)
                     _, page2, *_ = self._grab(allow_esc=False)
                     if page2 == "drive_disc":
                         self.log.info("recovered to drive_disc, rescan page")
+                        self.trace.note("已退回驱动盘仓库，重扫本页")
                         rescan = True
                         break
                     self.log.error("recover failed (page=%s), stop job", page2)
                     self._dbg_capture(f"recover-failed-{page2}")
+                    self.trace.fail(page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工")
                     return
+                self.trace.ok("detail", "click_cell", where)
                 # drive_disc=没点开详情（空格）；unknown=详情开着盖住认页图标，直接解析
                 disc = self._parse_disc(detail_image)
                 if disc is None:
                     self.log.info("cell %s no disc, skip", cell_tag)
+                    self.trace.warn("detail", "parse", f"{where} 没读出盘面，跳过")
                     continue
+                self.trace.ok(
+                    "detail",
+                    "parse",
+                    f"{where} 等级{disc.level} 副词条{len(disc.substats)}条"
+                    + ("（已锁定）" if disc.locked else "")
+                    + ("（已弃置）" if disc.discarded else ""),
+                )
                 decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
                 key = (cx, cy)
                 if decision.action == Action.STOP:
                     self._record(job, disc, decision)
                     self.log.warning("cell %s decision STOP (%s), end job", cell_tag, decision.reason)
+                    self.trace.fail("detail", "decide", f"判断不了：{decision.reason}，收工")
                     return
+                self.trace.ok(
+                    "detail",
+                    "decide",
+                    f"{trace_action(decision.action.value)}：{decision.reason}",
+                )
                 if decision.action == Action.UPGRADE:
                     if up_counts.get(key, 0) >= _MAX_STAGE_UPGRADES:
                         self.log.warning(
                             "cell %s upgrades capped at %d, skip action", cell_tag, _MAX_STAGE_UPGRADES
+                        )
+                        self.trace.warn(
+                            "detail",
+                            "upgrade",
+                            f"{where} 已升 {up_counts.get(key, 0)} 次，到上限不再升",
                         )
                     else:
                         if disc.discarded:
@@ -257,6 +299,7 @@ class Runner:
                             press_key_once(hwnd, VK_R)
                             time.sleep(0.5)
                             self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
+                            self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
                         # 进强化页，在强化页循环判断+升级（升完留原地，不每次 Esc 回网格）
                         if self._enter_upgrade_page(hwnd):
                             self._upgrade_loop(
@@ -270,15 +313,22 @@ class Runner:
                 elif decision.action == Action.MARK_DISCARD and disc.discarded:
                     # 已带标重判仍判弃置：空操作，不扣 max_discs 额度
                     self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
+                    self.trace.note(f"{where} 已经打过弃置标记，不动")
                 elif decision.action == Action.SKIP and disc.discarded:
                     # 跳过弃置标记盘：不点击不按键不扣额度
                     self.log.info("cell %s has discard tag, skip (no count)", cell_tag)
+                    self.trace.note(f"{where} 有弃置标记，跳过")
                 else:
                     self._record(job, disc, decision)
                     self._act(hwnd, decision.action, disc)
                     self._processed += 1
                     self.log.info(
                         "cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level
+                    )
+                    self.trace.ok(
+                        "detail",
+                        decision.action.value,
+                        f"{where} 已{trace_action(decision.action.value)}",
                     )
                     self._set_status("action", decision.action.value, cell_tag)
                 time.sleep(0.3)
@@ -445,6 +495,7 @@ class Runner:
                 return True
         self.log.warning("UPGRADE: 没找到%s，中断回退", region_desc)
         self._dbg_capture(tag)
+        self.trace.fail("upgrade", "click_cell", f"在{region_desc}没找到「{needle}」")
         return False
 
     def _enter_upgrade_page(self, hwnd: int) -> bool:
@@ -467,6 +518,7 @@ class Runner:
         if hit is None:
             self.log.warning("UPGRADE: 详情页没找到「查看/强化」大按钮")
             self._dbg_capture("step1-查看")
+            self.trace.fail("detail", "enter_upgrade", "没找到「查看/强化」大按钮")
             self._esc_back_to_grid(hwnd)
             return False
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
@@ -482,6 +534,7 @@ class Runner:
         if level_line is None:
             self.log.warning("UPGRADE: 缩放页没找到「等级」")
             self._dbg_capture("step2-等级")
+            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字")
             self._esc_back_to_grid(hwnd)
             return False
         ax = level_line.right + 110
@@ -513,9 +566,11 @@ class Runner:
             ay = (level_line.top + level_line.bottom) // 2
         if not stage_clicked:
             self.log.warning("UPGRADE: 两次都没进强化页")
+            self.trace.fail("zoom", "enter_upgrade", "点了两次箭头都没进强化页")
             self._esc_back_to_grid(hwnd)
             return False
         time.sleep(0.8)
+        self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
         return True
 
     def _upgrade_once(self, hwnd: int) -> bool:
@@ -531,6 +586,7 @@ class Runner:
             return False
         time.sleep(1.5)
         self.log.info("action=UPGRADE 完成（阶段添加→升级）")
+        self.trace.ok("upgrade", "upgrade", "强化了一阶")
         return True
 
     def _discard_from_upgrade(self, hwnd: int) -> None:
@@ -546,6 +602,7 @@ class Runner:
         press_key_once(hwnd, VK_R)  # 详情页打弃置标
         time.sleep(0.5)
         self.log.info("action=MARK_DISCARD (R) from upgrade page")
+        self.trace.ok("detail", "discard", "已按 R 打上弃置标记")
         self._esc_back_to_grid(hwnd)  # 详情页 → 网格
 
     def _upgrade_loop(
@@ -570,6 +627,7 @@ class Runner:
             self._checkpoint()
             if self._processed >= self.preset.max_discs:
                 self.log.info("cell %s max_discs hit in upgrade loop, stop", cell_tag)
+                self.trace.ok("upgrade", "run", f"到上限 {self.preset.max_discs} 个，回列表")
                 self._esc_back_to_grid(hwnd)
                 return
             image, *_ = self._grab(allow_esc=False)
@@ -577,6 +635,7 @@ class Runner:
             if disc is None:
                 self.log.warning("cell %s 强化页解析失败，回网格", cell_tag)
                 self._dbg_capture("upg-parse-fail")
+                self.trace.fail("upgrade", "parse", "认不出强化页上的盘面，回列表")
                 self._esc_back_to_grid(hwnd)
                 return
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
@@ -584,6 +643,12 @@ class Runner:
                 if upgraded >= _MAX_STAGE_UPGRADES or disc.level >= MAX_LEVEL:
                     self.log.info(
                         "cell %s 升级停止（level %d / 升了 %d 次），回网格", cell_tag, disc.level, upgraded
+                    )
+                    self.trace.ok(
+                        "upgrade",
+                        "run",
+                        f"升到 {disc.level} 级"
+                        + ("（已满级）" if disc.level >= MAX_LEVEL else "（到升阶上限）"),
                     )
                     self._esc_back_to_grid(hwnd)
                     return
@@ -599,6 +664,7 @@ class Runner:
                 continue  # 留强化页再判断
             elif decision.action == Action.MARK_DISCARD:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)
+                self.trace.ok("upgrade", "decide", f"判为弃置：{decision.reason}")
                 self._record(job, disc, decision)
                 self._processed += 1
                 self._discard_from_upgrade(hwnd)
@@ -606,6 +672,7 @@ class Runner:
             else:
                 # SKIP / STOP：不动，直接 Esc 回网格
                 self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
+                self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
                 self._record(job, disc, decision)
                 self._esc_back_to_grid(hwnd)
                 return

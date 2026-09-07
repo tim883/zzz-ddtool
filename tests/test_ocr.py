@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-# 这个模块要靠 QImage 造图喂给 OCR，没装 PySide6 就整模块跳过，
-# 否则收集阶段直接 ImportError，会把整轮 pytest 打断（其他测试也跑不了）。
-pytest.importorskip("PySide6.QtGui")
-from PySide6.QtGui import QImage  # noqa: E402
+from PySide6.QtGui import QImage
 
-from zzz_ddtool.models import Substat  # noqa: E402
-from zzz_ddtool.ocr import (  # noqa: E402
+from zzz_ddtool.models import Substat
+from zzz_ddtool.ocr import (
     _best_match,
     _fix_percent,
     _parse_substat,
