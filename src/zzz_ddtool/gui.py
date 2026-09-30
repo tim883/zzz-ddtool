@@ -1339,7 +1339,7 @@ class MainWindow(QMainWindow):
         all_off = QPushButton("取消当前可见")
         all_on.clicked.connect(lambda: self._check_visible(True))
         all_off.clicked.connect(lambda: self._check_visible(False))
-        self.start_btn = QPushButton("开始强化")
+        self.start_btn = QPushButton("开始任务")
         self.start_btn.setObjectName("primary")
         self.start_btn.setToolTip("用当前配置开始处理；运行中游戏内按 F9 暂停 / F10 停止。")
         self.start_btn.clicked.connect(self._on_start_clicked)
@@ -1376,7 +1376,7 @@ class MainWindow(QMainWindow):
     def _on_run_finished(self) -> None:
         """子线程结束（完成 / F10 停止 / 异常）后恢复按钮。"""
         self.start_btn.setEnabled(True)
-        self.start_btn.setText("开始强化")
+        self.start_btn.setText("开始任务")
 
     def open_settings(self) -> None:
         """日志设置：级别 + 截图容量。"""
