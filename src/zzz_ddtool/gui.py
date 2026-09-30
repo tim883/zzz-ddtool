@@ -1370,20 +1370,45 @@ class MainWindow(QMainWindow):
         self.status.setText("日志设置已保存")
 
     def check_update(self) -> None:
-        """检查更新：读 Gitee 发行版，对比本地版本号，弹窗提示。"""
-        from zzz_ddtool.updater import check_for_update
+        """检查更新：读 Gitee 发行版，对比本地版本号，用户确认后下载更新。
+
+        - 有程序包：下载后在重启时替换（退出 + 替身 bat）。
+        - 只有数据包：下载覆盖 data/，立即生效、不退出。
+        """
+        from zzz_ddtool.updater import apply_data_update, apply_program_update, check_for_update
 
         st = check_for_update()
         if st.error:
             QMessageBox.information(self, "检查更新", st.error)
-        elif st.available:
-            QMessageBox.information(
-                self,
-                "检查更新",
-                f"发现新版本 {st.latest_version}（当前 {st.current_version}）\n\n{st.body}",
-            )
-        else:
+            return
+        if not st.available:
             QMessageBox.information(self, "检查更新", f"已是最新版本 {st.current_version}")
+            return
+
+        detail = f"发现新版本 {st.latest_version}（当前 {st.current_version}）\n\n{st.body}".rstrip()
+        yes = QMessageBox.StandardButton.Yes
+        no = QMessageBox.StandardButton.No
+
+        if st.program_url:
+            ask = f"{detail}\n\n将下载完整程序包，程序会退出、重启后完成更新。现在更新？"
+            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) != yes:
+                return
+            try:
+                apply_program_update(st.program_url)
+            except Exception as exc:  # 网络 / 解压失败
+                QMessageBox.warning(self, "检查更新", f"更新失败：{exc}")
+        elif st.data_url:
+            ask = f"{detail}\n\n将下载数据包（套装名/词条名/图片），立即生效、无需重启。现在更新？"
+            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) != yes:
+                return
+            try:
+                apply_data_update(st.data_url)
+            except Exception as exc:
+                QMessageBox.warning(self, "检查更新", f"更新失败：{exc}")
+                return
+            QMessageBox.information(self, "检查更新", "数据已更新，立即生效。")
+        else:
+            QMessageBox.information(self, "检查更新", f"{detail}\n\n该版本未附带可下载的更新包。")
 
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""

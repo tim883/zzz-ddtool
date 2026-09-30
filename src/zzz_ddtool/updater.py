@@ -22,6 +22,8 @@ class UpdateStatus:
     latest_version: str      # 远程最新版本号（无更新/出错时可能为空）
     current_version: str     # 本地版本号
     body: str = ""           # 更新说明
+    data_url: str = ""       # 数据更新包 zip（约定文件名以 data 开头）
+    program_url: str = ""    # 程序更新包 zip（其余 zip）
     error: str | None = None # 出错信息（网络错误 / 无发行版等）
 
 
@@ -38,6 +40,26 @@ def _parse_version(v: str) -> tuple[int, ...]:
 
 def _is_newer(latest: str, current: str) -> bool:
     return _parse_version(latest) > _parse_version(current)
+
+
+def _pick_urls(assets: list) -> tuple[str, str]:
+    """从发行版附件里挑下载地址。
+
+    约定：zip 文件名以 ``data`` 开头 = 数据包；其余 zip = 程序包。
+    缺哪类就返回空串。
+    """
+    data_url = ""
+    program_url = ""
+    for asset in assets:
+        name = str(asset.get("name") or "").lower()
+        url = str(asset.get("browser_download_url") or "")
+        if not url or not name.endswith(".zip"):
+            continue
+        if name.startswith("data"):
+            data_url = data_url or url
+        else:
+            program_url = program_url or url
+    return data_url, program_url
 
 
 def check_for_update() -> UpdateStatus:
@@ -57,8 +79,9 @@ def check_for_update() -> UpdateStatus:
     body = str(data.get("body") or "")
     if not latest:
         return UpdateStatus(False, "", current, body, error="发行版缺版本号")
+    data_url, program_url = _pick_urls(data.get("assets") or [])
     available = _is_newer(latest, current)
-    return UpdateStatus(available, latest, current, body)
+    return UpdateStatus(available, latest, current, body, data_url, program_url)
 
 
 def _download(url: str, dest) -> None:

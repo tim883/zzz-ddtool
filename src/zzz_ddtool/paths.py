@@ -50,11 +50,12 @@ def archives_file() -> Path:
 def log_dir() -> Path:
     """所有运行时产出的根目录，第一层就叫 log。
 
+    开发态=仓库根/log，打包态=exe 同级/log（运行时产出，不随包分发）。
     文本和图片分开两个明确路径：
         log/ddtool.log            文本日志
         log/captures/<时间戳>/    本轮截图
     """
-    return repo_root() / "log"
+    return base_dir() / "log"
 
 
 def captures_dir() -> Path:
