@@ -25,6 +25,11 @@ def user_dir() -> Path:
     return base_dir() / "user"
 
 
+def version_file() -> Path:
+    """本地版本号文件，exe 同级（开发态=仓库根）。打包脚本负责写入。"""
+    return base_dir() / "version.txt"
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 

@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -781,11 +782,14 @@ class MainWindow(QMainWindow):
         self.stay_on_top.toggled.connect(self._toggle_on_top)
         settings_btn = QPushButton("日志设置")
         settings_btn.clicked.connect(self.open_settings)
+        check_btn = QPushButton("检查更新")
+        check_btn.clicked.connect(self.check_update)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.stay_on_top)
         actions.addWidget(settings_btn)
+        actions.addWidget(check_btn)
         actions.addWidget(capture_btn)
         actions.addWidget(warehouse_btn)
         actions.addWidget(open_btn)
@@ -1364,6 +1368,22 @@ class MainWindow(QMainWindow):
             return
         dialog.apply_settings()
         self.status.setText("日志设置已保存")
+
+    def check_update(self) -> None:
+        """检查更新：读 Gitee 发行版，对比本地版本号，弹窗提示。"""
+        from zzz_ddtool.updater import check_for_update
+
+        st = check_for_update()
+        if st.error:
+            QMessageBox.information(self, "检查更新", st.error)
+        elif st.available:
+            QMessageBox.information(
+                self,
+                "检查更新",
+                f"发现新版本 {st.latest_version}（当前 {st.current_version}）\n\n{st.body}",
+            )
+        else:
+            QMessageBox.information(self, "检查更新", f"已是最新版本 {st.current_version}")
 
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
