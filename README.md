@@ -51,9 +51,9 @@ py -3.13 -m zzz_ddtool        # 开窗口（默认子命令就是 gui）
 py -3.13 -m zzz_ddtool capture          # 截一张游戏窗口
 py -3.13 -m zzz_ddtool goto-warehouse   # 导航到仓库页
 py -3.13 -m zzz_ddtool snapshot-pages   # 逐个页面存样张
-py -3.13 -m zzz_ddtool run --config configs/example.yaml   # 跑任务链
-py -3.13 -m zzz_ddtool preview --config configs/example.yaml  # 导出组合卡片 HTML
-py -3.13 -m zzz_ddtool decide --config configs/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
+py -3.13 -m zzz_ddtool run --config user/example.yaml   # 跑任务链
+py -3.13 -m zzz_ddtool preview --config user/example.yaml  # 导出组合卡片 HTML
+py -3.13 -m zzz_ddtool decide --config user/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
 ```
 
 跑任务时 **F9 暂停 / F10 停止**，检查点在格子级——当前这件处理完才停，不会在弹层中间撂挑子。

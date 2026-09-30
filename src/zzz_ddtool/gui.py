@@ -200,7 +200,9 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 
 def default_config_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "configs" / "example.yaml"
+    from zzz_ddtool.paths import data_dir
+
+    return data_dir() / "example.yaml"
 
 
 class FlowLayout(QLayout):

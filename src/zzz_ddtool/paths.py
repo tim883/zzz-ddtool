@@ -1,6 +1,28 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def base_dir() -> Path:
+    """程序运行根：开发态=仓库根，打包态=exe 同级目录。"""
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def data_dir() -> Path:
+    """程序自带数据（套装名/词条名 json、套装图）。更新时可覆盖。"""
+    return base_dir() / "data"
+
+
+def user_dir() -> Path:
+    """用户数据（存档、预设）。更新永不碰。"""
+    return base_dir() / "user"
 
 
 def repo_root() -> Path:
@@ -15,13 +37,9 @@ def assets_dir() -> Path:
     return Path(__file__).resolve().parent / "assets"
 
 
-def configs_dir() -> Path:
-    return repo_root() / "configs"
-
-
 def archives_file() -> Path:
-    """权重+档位要求临时存档（所有槽位方案共用的命名模板）。"""
-    return configs_dir() / "archives.json"
+    """权重+档位要求临时存档（所有槽位方案共用的命名模板）。用户数据，更新永不碰。"""
+    return user_dir() / "archives.json"
 
 
 def log_dir() -> Path:

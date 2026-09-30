@@ -27,45 +27,7 @@ from zzz_ddtool.layout import (
     scale_rect,
 )
 from zzz_ddtool.models import Disc, Substat
-
-# 副属性可能出现的全部名字（含 % 与 flat 区分）
-_SUBSTAT_NAMES = (
-    "生命值",
-    "生命值%",
-    "攻击力",
-    "攻击力%",
-    "防御力",
-    "防御力%",
-    "异常精通",
-    "穿透值",
-    "异常掌控",
-    "冲击力",
-    "暴击率",
-    "暴击伤害",
-    "能量自动回复",
-)
-
-# 主属性名。部分与副属性重叠，但主属性区用来识别套装部位/主词条。
-_MAINSTAT_NAMES = (
-    "生命值",
-    "生命值%",
-    "攻击力",
-    "攻击力%",
-    "防御力",
-    "防御力%",
-    "暴击率",
-    "暴击伤害",
-    "异常精通",
-    "穿透率",
-    "异常掌控",
-    "能量自动回复",
-    "冲击力",
-    "物理伤害",
-    "火属性伤害",
-    "冰属性伤害",
-    "电属性伤害",
-    "以太伤害",
-)
+from zzz_ddtool.gamedata import MAINSTAT_NAMES as _MAINSTAT_NAMES, SUBSTAT_NAMES as _SUBSTAT_NAMES
 
 _engine = None
 _engine_lock = threading.Lock()

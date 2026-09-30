@@ -17,3 +17,6 @@ build/
 
 # Runtime output (text log + screenshots), not committed
 log/
+
+# User data (archives + presets), not committed
+user/

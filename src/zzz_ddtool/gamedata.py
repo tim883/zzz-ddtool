@@ -1,49 +1,31 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 
-# 游戏仓库筛选会用到的主词条名。5 号盘还有属性伤害。
-MAINSTATS = (
-    "生命值",
-    "生命值%",
-    "攻击力",
-    "攻击力%",
-    "防御力",
-    "防御力%",
-    "暴击率",
-    "暴击伤害",
-    "异常精通",
-    "异常掌控",
-    "穿透率",
-    "能量自动回复",
-    "冲击力",
-    "物理伤害",
-    "火属性伤害",
-    "冰属性伤害",
-    "电属性伤害",
-    "以太伤害",
-)
+from zzz_ddtool.paths import data_dir
+
+
+def _load_json(name: str):
+    return json.loads((data_dir() / name).read_text(encoding="utf-8"))
+
+
+_stats = _load_json("stats.json")
+
+# 副属性名（OCR 识别词典）。副属性有「穿透值」，主属性是「穿透率」。
+SUBSTAT_NAMES = tuple(_stats["substat_names"])
+
+# 主属性名（OCR 识别词典 + 游戏仓库筛选用，共用一份）。
+MAINSTAT_NAMES = tuple(_stats["mainstat_names"])
+
+# 兼容旧名：tests 里 import MAINSTATS。
+MAINSTATS = MAINSTAT_NAMES
 
 SLOTS = (1, 2, 3, 4, 5, 6)
 
 # 1–3 号位主词条固定，筛选不用选。4–6 和游戏仓库一致。
 SLOT_MAINSTATS: dict[int, tuple[str, ...]] = {
-    1: (),
-    2: (),
-    3: (),
-    4: ("生命值%", "攻击力%", "防御力%", "异常精通", "暴击率", "暴击伤害"),
-    5: (
-        "生命值%",
-        "攻击力%",
-        "防御力%",
-        "穿透率",
-        "物理伤害",
-        "火属性伤害",
-        "冰属性伤害",
-        "电属性伤害",
-        "以太伤害",
-    ),
-    6: ("生命值%", "攻击力%", "防御力%", "能量自动回复", "冲击力", "异常掌控"),
+    int(k): tuple(v) for k, v in _stats["slot_mainstats"].items()
 }
 
 
@@ -87,44 +69,4 @@ def selectable_mainstats(slots: Sequence[int]) -> tuple[str, ...]:
     return tuple(names)
 
 # 简中套装名，按 biligame「分类:驱动盘」2026-09。新套装可往下加。
-SETS = (
-    "沧浪行歌",
-    "谶羽之誓",
-    "独角兽电音",
-    "法厄同之歌",
-    "拂晓生花",
-    "拂晓行纪",
-    "河豚电音",
-    "呼啸沙龙",
-    "混沌爵士",
-    "混沌重金属",
-    "极地重金属",
-    "季风放克",
-    "激素朋克",
-    "荆棘玫瑰",
-    "静听嘉音",
-    "狂欢朋克",
-    "雷暴重金属",
-    "獠牙重金属",
-    "灵魂摇滚",
-    "流光咏叹",
-    "流浪民谣",
-    "猛犸电音",
-    "末日碾核",
-    "囚徒手记",
-    "如影相随",
-    "杀手民谣",
-    "山大王",
-    "歪曲碾核",
-    "喧闹波普",
-    "雪兔梦游仙境",
-    "炎狱重金属",
-    "摇摆爵士",
-    "原始朋克",
-    "月光骑士颂",
-    "云岿如我",
-    "折枝剑歌",
-    "震星迪斯科",
-    "啄木鸟电音",
-    "自由蓝调",
-)
+SETS = tuple(_load_json("sets.json"))
