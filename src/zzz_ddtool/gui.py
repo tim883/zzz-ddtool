@@ -10,7 +10,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -731,6 +731,7 @@ class MainWindow(QMainWindow):
         self._slot_plans: dict[int, dict] = {slot: empty_slot_plan(slot) for slot in SLOTS}
         self._jobs: list[TaskJob] = []
         self._editing_job_id: str | None = None
+        self._run_thread = None
         app = QApplication.instance()
         if app is not None and not app.styleSheet():
             apply_light_style(app)
@@ -1340,8 +1341,8 @@ class MainWindow(QMainWindow):
         all_off.clicked.connect(lambda: self._check_visible(False))
         self.start_btn = QPushButton("开始强化")
         self.start_btn.setObjectName("primary")
-        self.start_btn.setEnabled(False)
-        self.start_btn.setToolTip("先用命令行 zzz_ddtool run 跑，窗口这里显示运行状态。")
+        self.start_btn.setToolTip("用当前配置开始处理；运行中游戏内按 F9 暂停 / F10 停止。")
+        self.start_btn.clicked.connect(self._on_start_clicked)
         self.status = QLabel()
         self.status.setObjectName("status")
         row.addWidget(all_on)
@@ -1358,6 +1359,24 @@ class MainWindow(QMainWindow):
         self._refresh_run_status()
         self._refresh_archive_combo()
         return bar
+
+    def _on_start_clicked(self) -> None:
+        """用当前 UI 配置在子线程启动 Runner；运行期间禁用按钮，结束自动恢复。"""
+        try:
+            preset = self.collect_preset()
+        except Exception as exc:  # 配置缺失 / 构建失败
+            QMessageBox.warning(self, "无法启动", f"配置构建失败：{exc}")
+            return
+        self.start_btn.setEnabled(False)
+        self.start_btn.setText("运行中…")
+        self._run_thread = _RunThread(preset)
+        self._run_thread.finished.connect(self._on_run_finished)
+        self._run_thread.start()
+
+    def _on_run_finished(self) -> None:
+        """子线程结束（完成 / F10 停止 / 异常）后恢复按钮。"""
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("开始强化")
 
     def open_settings(self) -> None:
         """日志设置：级别 + 截图容量。"""
@@ -1687,6 +1706,23 @@ def apply_light_style(app: QApplication) -> None:
     if font.exactMatch():
         app.setFont(font)
     app.setStyleSheet(STYLESHEET)
+
+
+class _RunThread(QThread):
+    """在子线程跑 Runner，避免阻塞 GUI 事件循环；Runner 内部 F9/F10 热键照常生效。"""
+
+    def __init__(self, preset: Preset) -> None:
+        super().__init__()
+        self._preset = preset
+
+    def run(self) -> None:
+        try:
+            from zzz_ddtool.runner import Runner
+
+            Runner(self._preset).run()
+        except Exception:
+            # Runner.run() 已自行捕获全部异常；此处兜底，绝不影响 GUI
+            pass
 
 
 def run_gui(config: Path | None = None) -> int:
