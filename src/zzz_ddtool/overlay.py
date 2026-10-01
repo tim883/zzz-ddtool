@@ -1,7 +1,7 @@
 """游戏画面上的状态悬浮层（Win32 分层窗口 + GDI，纯 ctypes，零依赖）。
 
 技术来自 March7thAssistant debug_overlay：
-- WS_EX_LAYERED + LWA_COLORKEY：品红底色键透明，只显示画上去的文字
+- WS_EX_LAYERED + LWA_ALPHA：深色半透明背景，确保日志可读
 - WS_EX_TRANSPARENT + WM_NCHITTEST→HTTRANSPARENT：鼠标完全穿透到游戏
 - WS_EX_TOPMOST + SWP_NOACTIVATE：浮在游戏上但不抢焦点
 - 后台线程消息循环 + WM_PAINT 里 GDI 绘制
@@ -13,15 +13,15 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 import threading
 from ctypes import wintypes
 
-MAX_LINES = 8
+MAX_LINES = 9
 LINE_H = 24
 FONT_H = 17
 TEXT_COLOR = 0x00FFFFFF  # COLORREF 白
-KEY_COLOR = 0x00FF00FF  # COLORREF 品红 = 透明键
 
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
@@ -35,15 +35,19 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOPMOST = 0x00000008
-LWA_COLORKEY = 0x00000001
 HWND_TOPMOST = -1
 SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # NOMOVE | NOSIZE | NOACTIVATE
 SW_SHOW = 5
 SW_HIDE = 0
+WM_UPDATE = 0x8001
+WM_HIDE = 0x8002
+WM_TIMER = 0x0113
+FOLLOW_INTERVAL_MS = 100
 NONANTIALIASED_QUALITY = 3  # 关抗锯齿，避免颜色键窗口文字边缘杂色
 
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 # 消息参数必须按 64 位宽度转换，否则 DefWindowProcW 收到大 lParam 会 OverflowError
 user32.DefWindowProcW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
@@ -101,16 +105,68 @@ class WNDCLASSW(ctypes.Structure):
 
 
 CLASS_NAME = "ZZZDDToolOverlay"
+
+
+def _bind(dll, name, args, result):
+    fn = getattr(dll, name)
+    fn.argtypes, fn.restype = args, result
+
+
+# ctypes 默认返回 int 会截断 64 位 GDI/窗口句柄，字符串参数也必须声明。
+_bind(kernel32, "GetModuleHandleW", [wintypes.LPCWSTR], wintypes.HMODULE)
+_bind(user32, "RegisterClassW", [ctypes.POINTER(WNDCLASSW)], wintypes.ATOM)
+_bind(user32, "UnregisterClassW", [wintypes.LPCWSTR, wintypes.HINSTANCE], wintypes.BOOL)
+_bind(user32, "CreateWindowExW", [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+      ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+      wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID], wintypes.HWND)
+_bind(user32, "BeginPaint", [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)], wintypes.HDC)
+_bind(user32, "EndPaint", [wintypes.HWND, ctypes.POINTER(PAINTSTRUCT)], wintypes.BOOL)
+_bind(user32, "FillRect", [wintypes.HDC, ctypes.POINTER(RECT), wintypes.HBRUSH], ctypes.c_int)
+_bind(user32, "GetMessageW", [ctypes.POINTER(MSG), wintypes.HWND, ctypes.c_uint, ctypes.c_uint], ctypes.c_int)
+_bind(user32, "TranslateMessage", [ctypes.POINTER(MSG)], wintypes.BOOL)
+_bind(user32, "DispatchMessageW", [ctypes.POINTER(MSG)], ctypes.c_ssize_t)
+_bind(user32, "PostMessageW", [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL)
+_bind(user32, "DestroyWindow", [wintypes.HWND], wintypes.BOOL)
+_bind(user32, "ShowWindow", [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
+_bind(user32, "IsWindowVisible", [wintypes.HWND], wintypes.BOOL)
+_bind(user32, "IsWindow", [wintypes.HWND], wintypes.BOOL)
+_bind(user32, "IsIconic", [wintypes.HWND], wintypes.BOOL)
+_bind(user32, "GetClientRect", [wintypes.HWND, ctypes.POINTER(RECT)], wintypes.BOOL)
+_bind(user32, "GetWindowRect", [wintypes.HWND, ctypes.POINTER(RECT)], wintypes.BOOL)
+_bind(user32, "SetTimer", [wintypes.HWND, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p], ctypes.c_size_t)
+_bind(user32, "KillTimer", [wintypes.HWND, ctypes.c_size_t], wintypes.BOOL)
+_bind(user32, "ClientToScreen", [wintypes.HWND, ctypes.POINTER(wintypes.POINT)], wintypes.BOOL)
+_bind(user32, "SetWindowPos", [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+      ctypes.c_int, ctypes.c_int, ctypes.c_uint], wintypes.BOOL)
+_bind(user32, "SetLayeredWindowAttributes", [wintypes.HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD], wintypes.BOOL)
+_bind(user32, "InvalidateRect", [wintypes.HWND, ctypes.POINTER(RECT), wintypes.BOOL], wintypes.BOOL)
+_bind(gdi32, "CreateFontW", [ctypes.c_int] * 5 + [wintypes.DWORD] * 8 + [wintypes.LPCWSTR], wintypes.HANDLE)
+_bind(gdi32, "CreateCompatibleDC", [wintypes.HDC], wintypes.HDC)
+_bind(gdi32, "CreateCompatibleBitmap", [wintypes.HDC, ctypes.c_int, ctypes.c_int], wintypes.HBITMAP)
+_bind(gdi32, "CreateSolidBrush", [wintypes.DWORD], wintypes.HBRUSH)
+_bind(gdi32, "SelectObject", [wintypes.HDC, wintypes.HANDLE], wintypes.HANDLE)
+_bind(gdi32, "DeleteObject", [wintypes.HANDLE], wintypes.BOOL)
+_bind(gdi32, "DeleteDC", [wintypes.HDC], wintypes.BOOL)
+_bind(gdi32, "SetTextColor", [wintypes.HDC, wintypes.DWORD], wintypes.DWORD)
+_bind(gdi32, "SetBkMode", [wintypes.HDC, ctypes.c_int], ctypes.c_int)
+_bind(gdi32, "TextOutW", [wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.LPCWSTR, ctypes.c_int], wintypes.BOOL)
+_bind(gdi32, "BitBlt", [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+      wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD], wintypes.BOOL)
 _proc_ref = None  # 防 WNDPROC 被 GC
 _hwnd = None
 _ready = threading.Event()
 _msg_counts: dict[int, int] = {}
 _lines: list[str] = []
 _lock = threading.Lock()
-_screen_w = user32.GetSystemMetrics(0)
-_screen_h = user32.GetSystemMetrics(1)
-_game_origin = [40, 40]  # 文字绘制原点（屏幕坐标），每次 update 按游戏窗口刷新
+_screen_w = 1100
+_screen_h = MAX_LINES * LINE_H + 16
+_game_origin = [0, 0]  # 绘制用窗口内坐标；窗口自身定位到游戏客户区
 _font = None
+_thread = None
+_init_lock = threading.Lock()
+_target_hwnd = None
+_last_geometry = None
+_wanted_visible = False
 
 
 def _make_font() -> int:
@@ -131,7 +187,7 @@ def _paint(hdc: wintypes.HDC) -> None:
     mem_dc = gdi32.CreateCompatibleDC(hdc)
     bmp = gdi32.CreateCompatibleBitmap(hdc, _screen_w, _screen_h)
     old_bmp = gdi32.SelectObject(mem_dc, bmp)
-    key_brush = gdi32.CreateSolidBrush(KEY_COLOR)
+    key_brush = gdi32.CreateSolidBrush(0x00202020)
     full = RECT(0, 0, _screen_w, _screen_h)
     user32.FillRect(mem_dc, ctypes.byref(full), key_brush)
     gdi32.DeleteObject(key_brush)
@@ -154,12 +210,28 @@ def _paint(hdc: wintypes.HDC) -> None:
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
+    global _wanted_visible
     _msg_counts[msg] = _msg_counts.get(msg, 0) + 1
     if msg == WM_PAINT:
         ps = PAINTSTRUCT()
         hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
         _paint(hdc)
         user32.EndPaint(hwnd, ctypes.byref(ps))
+        return 0
+    if msg == WM_UPDATE:
+        _wanted_visible = True
+        user32.ShowWindow(hwnd, 4 if _refresh_game_origin() else SW_HIDE)
+        user32.InvalidateRect(hwnd, None, True)
+        return 0
+    if msg == WM_TIMER:
+        if _wanted_visible:
+            visible = _refresh_game_origin()
+            if bool(user32.IsWindowVisible(hwnd)) != visible:
+                user32.ShowWindow(hwnd, 4 if visible else SW_HIDE)  # 不激活、不抢焦点
+        return 0
+    if msg == WM_HIDE:
+        _wanted_visible = False
+        user32.ShowWindow(hwnd, SW_HIDE)
         return 0
     if msg == WM_ERASEBKGND:
         return 1
@@ -169,26 +241,25 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
         user32.DestroyWindow(hwnd)
         return 0
     if msg == WM_DESTROY:
+        user32.KillTimer(hwnd, 1)
         user32.PostQuitMessage(0)
         return 0
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
 
-def _ensure_window() -> bool:
-    global _hwnd, _proc_ref
-    if _hwnd:
-        return True
-    _ready.clear()
+def _window_loop() -> None:
+    global _hwnd, _proc_ref, _font, _target_hwnd, _last_geometry, _wanted_visible
     _proc_ref = WNDPROC(_wnd_proc)
     wc = WNDCLASSW()
     wc.lpfnWndProc = _proc_ref
-    wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+    wc.hInstance = kernel32.GetModuleHandleW(None)
     wc.lpszClassName = CLASS_NAME
     if not user32.RegisterClassW(ctypes.byref(wc)):
         from zzz_ddtool.logutil import get_logger
 
-        get_logger("zzz_ddtool.overlay").warning("RegisterClassW 失败")
-        return False
+        get_logger("zzz_ddtool.overlay").warning("RegisterClassW 失败：%s", ctypes.WinError(ctypes.get_last_error()))
+        _ready.set()
+        return
     hwnd = user32.CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         CLASS_NAME,
@@ -200,35 +271,69 @@ def _ensure_window() -> bool:
     if not hwnd:
         from zzz_ddtool.logutil import get_logger
 
-        get_logger("zzz_ddtool.overlay").warning("CreateWindowExW 失败")
-        return False
+        get_logger("zzz_ddtool.overlay").warning("CreateWindowExW 失败：%s", ctypes.WinError(ctypes.get_last_error()))
+        user32.UnregisterClassW(CLASS_NAME, wc.hInstance)
+        _ready.set()
+        return
     _hwnd = hwnd
-    user32.SetLayeredWindowAttributes(hwnd, KEY_COLOR, 0, LWA_COLORKEY)
+    user32.SetLayeredWindowAttributes(hwnd, 0, 220, 2)  # 深色半透明背景，保证文字可读
     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
+    user32.SetTimer(hwnd, 1, FOLLOW_INTERVAL_MS, None)
 
-    def _loop():
+    _ready.set()
+    try:
         msg = MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+    finally:
+        _hwnd = None
+        _target_hwnd = None
+        _last_geometry = None
+        _wanted_visible = False
+        if _font:
+            gdi32.DeleteObject(_font)
+            _font = None
+        user32.UnregisterClassW(CLASS_NAME, wc.hInstance)
 
-    threading.Thread(target=_loop, daemon=True, name="ddtool-overlay").start()
-    _ready.set()
-    return True
+
+def _ensure_window() -> bool:
+    global _thread
+    with _init_lock:
+        if _thread is None or not _thread.is_alive():
+            _ready.clear()
+            _thread = threading.Thread(target=_window_loop, daemon=True, name="ddtool-overlay")
+            _thread.start()
+        return _ready.wait(3) and _hwnd is not None
 
 
-def _refresh_game_origin() -> None:
-    """把文字绘制原点对齐游戏窗口客户区左上角。"""
+def _refresh_game_origin() -> bool:
+    """定时跟随客户区，仅几何变化时移动；目标隐藏/最小化时隐藏日志。"""
+    global _target_hwnd, _last_geometry, _screen_w
     try:
         from zzz_ddtool.capture import find_game_hwnd
 
-        hwnd = find_game_hwnd()
+        if _target_hwnd is None or not user32.IsWindow(_target_hwnd):
+            _target_hwnd = find_game_hwnd()
+            _last_geometry = None
+        hwnd = _target_hwnd
+        if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+            return False
         pt = wintypes.POINT(0, 0)
-        user32.ClientToScreen(hwnd, ctypes.byref(pt))
-        _game_origin[0] = max(0, pt.x)
-        _game_origin[1] = max(0, pt.y)
+        rect = RECT()
+        if not user32.ClientToScreen(hwnd, ctypes.byref(pt)) or not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+            return False
+        width = min(1100, max(1, rect.right - rect.left - 24))
+        geometry = (pt.x + 12, pt.y + 12, width, _screen_h)
+        if geometry != _last_geometry:
+            if not user32.SetWindowPos(_hwnd, wintypes.HWND(-1), *geometry, 0x0010):
+                return False
+            _screen_w = width
+            _last_geometry = geometry
+            user32.InvalidateRect(_hwnd, None, True)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def overlay_show(lines: list[str]) -> None:
@@ -241,18 +346,45 @@ def overlay_show(lines: list[str]) -> None:
             return
         with _lock:
             _lines[:] = lines[-MAX_LINES:]
-        _refresh_game_origin()
-        user32.ShowWindow(_hwnd, SW_SHOW)
-        user32.SetWindowPos(_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
-        user32.InvalidateRect(_hwnd, None, True)
-        user32.UpdateWindow(_hwnd)  # 强制同步走一次 WM_PAINT，不等系统调度
+        user32.PostMessageW(_hwnd, WM_UPDATE, 0, 0)
     except Exception:
-        pass
+        from zzz_ddtool.logutil import get_logger
+
+        get_logger("zzz_ddtool.overlay").exception("游戏悬浮日志更新失败")
 
 
 def overlay_hide() -> None:
     try:
         if _hwnd:
-            user32.ShowWindow(_hwnd, SW_HIDE)
+            user32.PostMessageW(_hwnd, WM_HIDE, 0, 0)
     except Exception:
         pass
+
+
+def overlay_shutdown() -> None:
+    if _hwnd:
+        user32.PostMessageW(_hwnd, WM_CLOSE, 0, 0)
+    if _thread and _thread is not threading.current_thread():
+        _thread.join(timeout=3)
+
+
+class OverlayLogHandler(logging.Handler):
+    """订阅统一日志，游戏里也能看到导航/OCR 的实际步骤及错误。"""
+
+    def __init__(self):
+        super().__init__()
+        from zzz_ddtool.logutil import ChineseFormatter
+
+        self.setFormatter(ChineseFormatter())
+        self.lines = []
+
+    def emit(self, record):
+        # 悬浮窗自己的错误只落文本日志，避免创建失败时递归调用自己。
+        if record.name.startswith("zzz_ddtool.overlay"):
+            return
+        try:
+            self.lines.extend(self.format(record).splitlines())
+            del self.lines[:-(MAX_LINES - 1)]
+            overlay_show(["F9 暂停/恢复 · F10 停止（在安全检查点生效）"] + self.lines)
+        except Exception:
+            self.handleError(record)

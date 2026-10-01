@@ -14,12 +14,13 @@
 
 ## 装与跑（开发用）
 
-需要 **Python 3.11+**，以及系统缩放 100%、游戏窗口化 16:9（坐标按 1920×1080 标定）。
+开发与打包统一 **Python 3.13.5**，使用项目内 `.venv`；系统缩放 100%、游戏窗口化 16:9（坐标按 1920×1080 标定）。
 
 ```powershell
 cd zzz-ddtool
-py -3.13 -m pip install -e ".[dev]"
-py -3.13 -m zzz_ddtool        # 开窗口（默认子命令就是 gui）
+uv venv --python 3.13.5 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements-lock.txt "pytest==9.1.1" -e .
+.venv\Scripts\python.exe -m zzz_ddtool   # 开源码窗口，也可用开发用「打开窗口.bat」
 ```
 
 依赖：`PySide6-Essentials`（窗口）、`opencv-python` + `numpy` + `rapidocr`（OCR）、`pyyaml`（配置）。
@@ -48,12 +49,12 @@ py -3.13 -m zzz_ddtool        # 开窗口（默认子命令就是 gui）
 ## 命令行
 
 ```powershell
-py -3.13 -m zzz_ddtool capture          # 截一张游戏窗口
-py -3.13 -m zzz_ddtool goto-warehouse   # 导航到仓库页
-py -3.13 -m zzz_ddtool snapshot-pages   # 逐个页面存样张
-py -3.13 -m zzz_ddtool run --config user/example.yaml   # 跑任务链
-py -3.13 -m zzz_ddtool preview --config user/example.yaml  # 导出组合卡片 HTML
-py -3.13 -m zzz_ddtool decide --config user/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
+.venv\Scripts\python.exe -m zzz_ddtool capture          # 截一张游戏窗口
+.venv\Scripts\python.exe -m zzz_ddtool goto-warehouse   # 导航到仓库页
+.venv\Scripts\python.exe -m zzz_ddtool snapshot-pages   # 逐个页面存样张
+.venv\Scripts\python.exe -m zzz_ddtool run --config data/example.yaml   # 跑任务链
+.venv\Scripts\python.exe -m zzz_ddtool preview --config data/example.yaml  # 导出组合卡片 HTML
+.venv\Scripts\python.exe -m zzz_ddtool decide --config data/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
 ```
 
 跑任务时 **F9 暂停 / F10 停止**，检查点在格子级——当前这件处理完才停，不会在弹层中间撂挑子。

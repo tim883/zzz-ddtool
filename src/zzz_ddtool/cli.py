@@ -39,6 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     cap_p = sub.add_parser("capture", help="Grab the game window into log/captures")
     cap_p.add_argument("--out", type=Path, help="Directory, default project log/captures")
 
+    read_p = sub.add_parser("read-disc", help="读取已保存的盘面截图，不操作游戏")
+    read_p.add_argument("image", type=Path)
+    read_p.add_argument("--out", type=Path, help="识别结果 JSON，默认 log/debug/disc-reading.json")
+
     nav_p = sub.add_parser("goto-warehouse", help="Esc to menu if needed, then click 仓库")
     sub.add_parser("snapshot-pages", help="Click home / menu / warehouse and save named shots")
 
@@ -60,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_decide(args)
     if args.cmd == "capture":
         return _cmd_capture(args)
+    if args.cmd == "read-disc":
+        return _cmd_read_disc(args)
     if args.cmd == "goto-warehouse":
         return _cmd_goto_warehouse()
     if args.cmd == "snapshot-pages":
@@ -81,6 +87,30 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         return 2
     print(dest)
     return 0
+
+
+def _cmd_read_disc(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+    from PySide6.QtGui import QImage
+    from zzz_ddtool.ocr import parse_disc
+    from zzz_ddtool.paths import debug_dir
+    from zzz_ddtool.logutil import get_logger
+
+    dest = args.out or debug_dir() / "disc-reading.json"
+    try:
+        image = QImage(str(args.image))
+        if image.isNull():
+            raise ValueError(f"无法读取截图：{args.image}")
+        disc = parse_disc(image)
+        if disc is None:
+            raise ValueError("未识别出盘面")
+        payload = {"ok": True, "image": str(args.image.resolve()), "disc": asdict(disc)}
+    except Exception as exc:
+        payload = {"ok": False, "error": str(exc)}
+        get_logger("zzz_ddtool.ocr").exception("截图回放识别失败")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if payload["ok"] else 2
 
 
 def _cmd_goto_warehouse() -> int:
@@ -191,10 +221,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except RunnerError as exc:
         print(exc)
         return 2
-    print(f"处理 {len(results)} 个盘子")
+    print(f"{runner.outcome}：处理 {runner.processed_disc_count} 个盘子；{runner.end_reason}")
     for r in results:
         print(f"{r.action:14} {r.reason:30} score={r.score:.2f} level={r.level}")
-    return 0
+    return 2 if runner.outcome == "failed" else 0
 
 
 def _load_preset(args: argparse.Namespace):

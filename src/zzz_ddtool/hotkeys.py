@@ -66,5 +66,17 @@ class HotkeyController:
         if self.stopped:
             raise RunnerStopped("F10 请求停止")
 
+    def toggle_pause(self) -> bool:
+        with self._lock:
+            if not self.stopped:
+                self.paused = not self.paused
+            return self.paused
+
+    def request_stop(self) -> None:
+        with self._lock:
+            self.stopped = True
+
     def close(self) -> None:
         self._closed.set()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=0.2)

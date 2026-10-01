@@ -65,3 +65,21 @@ def test_parse_disc(sample_image: QImage) -> None:
     assert "防御力" in names
     assert "攻击力%" in names
     assert "暴击率" in names
+
+
+def test_warehouse_sidebar_regression() -> None:
+    # 用户 2026-10-01 的失败现场；右侧单列面板不能套用放大页的两列区域。
+    image = QImage("tests/fixtures/warehouse-detail.png")
+    assert not image.isNull()
+    disc = parse_disc(image)
+    assert disc is not None
+    assert disc.level == 3
+    assert disc.substats == tuple(Substat(name) for name in ("暴击伤害", "暴击率", "攻击力", "异常精通"))
+    assert read_mainstat(image) == "生命值"
+
+
+def test_level_rejects_unrelated_numbers(monkeypatch) -> None:
+    from zzz_ddtool import ocr
+
+    monkeypatch.setattr(ocr, "read_rect", lambda *args: [ocr.OcrLine("15%暴击伤害", 1, 0, 0, 100, 20)])
+    assert read_level(QImage()) is None

@@ -9,6 +9,13 @@ STORAGE = "storage"
 DRIVE_DISC = "drive_disc"
 UNKNOWN = "unknown"
 
+# 盘面查看/强化弹窗右上角关闭 X。只有确认弹窗存在，才允许 Esc 回退。
+DISC_MODAL_CLOSE = IconMark("盘面弹窗关闭", "discs/modal-close.png", (1625, 187, 1694, 234), 0.90)
+
+
+def is_disc_modal(image) -> bool:
+    return all_marks_hit(image, (DISC_MODAL_CLOSE,))
+
 PAGE_MARKS: dict[str, tuple[IconMark, ...]] = {
     OVERWORLD: (
         IconMark("快捷轮盘", "world/quick_wheel.png", (40, 990, 230, 1068), 0.80),

@@ -193,8 +193,13 @@ def _print_window(hwnd: int):
 
 def _grab_screen_region(hwnd: int):
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QThread
 
     app = QApplication.instance() or QApplication([])
+    if QThread.currentThread() != app.thread():
+        from zzz_ddtool.capturebridge import grab_from_worker
+
+        return grab_from_worker(hwnd)
     screen = app.primaryScreen()
     if screen is None:
         raise CaptureError("没有可用屏幕，截不了图。")
@@ -216,8 +221,9 @@ def _restore_window(hwnd: int) -> None:
 def grab_game_image(hwnd: int | None = None):
     from PySide6.QtWidgets import QApplication
 
+    global _qt_app
     if QApplication.instance() is None:
-        QApplication([])
+        _qt_app = QApplication([])  # CLI 保持强引用，避免被回收
     target = hwnd if hwnd is not None else find_game_hwnd()
     _restore_window(target)
     image = _print_window(target)

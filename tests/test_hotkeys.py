@@ -51,3 +51,34 @@ def test_stop_raises_runner_stopped() -> None:
             ctrl.checkpoint()
     finally:
         ctrl.close()
+
+
+def test_global_polling_edges_pause_resume_stop(monkeypatch):
+    import time
+    from zzz_ddtool import hotkeys
+
+    pressed = set()
+    monkeypatch.setattr(hotkeys.user32, "GetAsyncKeyState", lambda vk: 0x8000 if vk in pressed else 0)
+    ctrl = HotkeyController(poll_interval=0.01)
+
+    def wait_for(predicate):
+        until = time.monotonic() + 2
+        while not predicate() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert predicate()
+
+    try:
+        pressed.add(hotkeys.VK_F9)
+        wait_for(lambda: ctrl.paused)
+        time.sleep(0.05)
+        assert ctrl.paused  # 按住只触发一次
+        pressed.clear()
+        wait_for(lambda: hotkeys.VK_F9 not in ctrl._pressed)
+        pressed.add(hotkeys.VK_F9)
+        wait_for(lambda: not ctrl.paused)
+        pressed.add(hotkeys.VK_F10)
+        wait_for(lambda: ctrl.stopped)
+        with pytest.raises(RunnerStopped):
+            ctrl.checkpoint()
+    finally:
+        ctrl.close()

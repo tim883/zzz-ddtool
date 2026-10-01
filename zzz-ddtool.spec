@@ -2,6 +2,17 @@
 # PyInstaller onedir 打包：薄壳 exe + _internal/（依赖）+ data/（build.py 复制到 exe 同级）
 
 import os
+import sys
+
+# 仅约束此构建进程，避免用户 PATH 上的其他工具提供同名 DLL。
+# QtCore 使用 Windows ICU；曾误收 Codex/Poppler 的 icuuc.dll，导致 exe 报错 127。
+_windows_dir = os.environ.get("SystemRoot", r"C:\Windows")
+os.environ["PATH"] = os.pathsep.join([
+    os.path.dirname(sys.executable),
+    sys.base_prefix,
+    os.path.join(_windows_dir, "System32"),
+    _windows_dir,
+])
 
 import rapidocr
 
@@ -14,6 +25,8 @@ a = Analysis(
     datas=[
         # rapidocr 模型是 .onnx，PyInstaller 收集不到，必须手动带进 _internal
         (_rapidocr_models, "rapidocr/models"),
+        (os.path.join(os.path.dirname(rapidocr.__file__), "config.yaml"), "rapidocr"),
+        (os.path.join(os.path.dirname(rapidocr.__file__), "default_models.yaml"), "rapidocr"),
         # 认页模板，运行时 assets_dir() 从包内读
         ("src/zzz_ddtool/assets/templates", "zzz_ddtool/assets/templates"),
     ],

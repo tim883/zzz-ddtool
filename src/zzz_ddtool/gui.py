@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QRadioButton,
     QScrollArea,
     QSizePolicy,
@@ -732,6 +733,12 @@ class MainWindow(QMainWindow):
         self._jobs: list[TaskJob] = []
         self._editing_job_id: str | None = None
         self._run_thread = None
+        self._controller = None
+        self._close_after_run = False
+        self._task_status = None
+        from zzz_ddtool.capturebridge import install_capture_bridge
+
+        install_capture_bridge()
         app = QApplication.instance()
         if app is not None and not app.styleSheet():
             apply_light_style(app)
@@ -745,6 +752,7 @@ class MainWindow(QMainWindow):
         outer.addLayout(self._build_header())
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._config_splitter = splitter
         splitter.addWidget(self._build_chain())
         splitter.addWidget(self._build_left())
         splitter.addWidget(self._build_right())
@@ -754,6 +762,23 @@ class MainWindow(QMainWindow):
         splitter.setSizes([240, 340, 740])
         outer.addWidget(splitter, 1)
         outer.addWidget(self._build_bottom())
+        log_box = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(log_box)
+        self.run_log = QPlainTextEdit()
+        self.run_log.setReadOnly(True)
+        self.run_log.setMaximumBlockCount(300)
+        self.run_log.setPlaceholderText("开始任务后，这里实时显示识别、判断、操作及失败原因。")
+        self.run_log.setMinimumHeight(100)
+        self.run_log.setMaximumHeight(160)
+        log_layout.addWidget(self.run_log)
+        from zzz_ddtool.paths import logs_dir
+
+        log_path = QLabel(f"日志文件：{logs_dir() / 'ddtool.log'}")
+        log_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        log_layout.addWidget(log_path)
+        outer.addWidget(log_box)
+        self._log_tail = None
+        self._refresh_run_status()
         self._load_path(self._path)
 
     def _build_header(self) -> QHBoxLayout:
@@ -785,6 +810,7 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.open_settings)
         check_btn = QPushButton("检查更新")
         check_btn.clicked.connect(self.check_update)
+        self._task_controls = [capture_btn, warehouse_btn, open_btn, save_btn, save_as_btn, check_btn]
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -1339,6 +1365,7 @@ class MainWindow(QMainWindow):
         all_off = QPushButton("取消当前可见")
         all_on.clicked.connect(lambda: self._check_visible(True))
         all_off.clicked.connect(lambda: self._check_visible(False))
+        self._task_controls.extend([all_on, all_off])
         self.start_btn = QPushButton("开始任务")
         self.start_btn.setObjectName("primary")
         self.start_btn.setToolTip("用当前配置开始处理；运行中游戏内按 F9 暂停 / F10 停止。")
@@ -1349,6 +1376,14 @@ class MainWindow(QMainWindow):
         row.addWidget(all_off)
         row.addWidget(self.status, 1)
         row.addWidget(self.start_btn)
+        self.pause_btn = QPushButton("暂停 / F9")
+        self.stop_btn = QPushButton("停止 / F10")
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._toggle_run_pause)
+        self.stop_btn.clicked.connect(self._stop_run)
+        row.addWidget(self.pause_btn)
+        row.addWidget(self.stop_btn)
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
         row.addWidget(self.run_status_label, 1)
@@ -1362,6 +1397,8 @@ class MainWindow(QMainWindow):
 
     def _on_start_clicked(self) -> None:
         """用当前 UI 配置在子线程启动 Runner；运行期间禁用按钮，结束自动恢复。"""
+        if self._run_thread is not None:
+            return
         try:
             preset = self.collect_preset()
         except Exception as exc:  # 配置缺失 / 构建失败
@@ -1369,7 +1406,19 @@ class MainWindow(QMainWindow):
             return
         self.start_btn.setEnabled(False)
         self.start_btn.setText("运行中…")
-        self._run_thread = _RunThread(preset)
+        self._config_splitter.setEnabled(False)
+        for button in self._task_controls:
+            button.setEnabled(False)
+        self._task_status = {"phase": "starting", "message": "正在启动任务"}
+        self._show_run_status(self._task_status)
+        from zzz_ddtool.hotkeys import HotkeyController
+        from copy import deepcopy
+
+        self._controller = HotkeyController()
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self._run_thread = _RunThread(deepcopy(preset), self._controller)
+        self._run_thread.status_changed.connect(self._on_task_status)
         self._run_thread.finished.connect(self._on_run_finished)
         self._run_thread.start()
 
@@ -1377,6 +1426,43 @@ class MainWindow(QMainWindow):
         """子线程结束（完成 / F10 停止 / 异常）后恢复按钮。"""
         self.start_btn.setEnabled(True)
         self.start_btn.setText("开始任务")
+        self._config_splitter.setEnabled(True)
+        for button in self._task_controls:
+            button.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.pause_btn.setText("暂停 / F9")
+        self.stop_btn.setText("停止 / F10")
+        self._controller.close()
+        self._controller = None
+        self._run_thread.deleteLater()
+        self._run_thread = None
+        self._refresh_run_status()
+        if self._close_after_run:
+            self.close()
+
+    def _toggle_run_pause(self) -> None:
+        if self._controller is not None:
+            self._controller.toggle_pause()
+
+    def _stop_run(self) -> None:
+        if self._controller is not None:
+            self._controller.request_stop()
+            self.stop_btn.setText("等待安全停止…")
+            self.stop_btn.setEnabled(False)
+            self.pause_btn.setEnabled(False)
+
+    def _show_run_status(self, data: dict) -> None:
+        self.run_status_label.setText(
+            f"运行状态：{data.get('phase', '—')}  格子:{data.get('cell') or '—'}  "
+            f"进度:{data.get('processed', 0)}/{data.get('max_discs', 0)}\n"
+            f"{data.get('message', '')}"
+        )
+        self.run_status_label.setWordWrap(True)
+
+    def _on_task_status(self, data: dict) -> None:
+        self._task_status = dict(data)
+        self._show_run_status(data)
 
     def open_settings(self) -> None:
         """日志设置：级别 + 截图容量。"""
@@ -1433,6 +1519,13 @@ class MainWindow(QMainWindow):
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
         import json
 
+        if self._controller is not None:
+            self.pause_btn.setText("恢复 / F9" if self._controller.paused else "暂停 / F9")
+            if self._controller.stopped:
+                self.stop_btn.setText("等待安全停止…")
+                self.stop_btn.setEnabled(False)
+                self.pause_btn.setEnabled(False)
+
         from zzz_ddtool.paths import status_file as _status_file_path
 
         text = "运行状态：—（还没有运行记录）"
@@ -1440,14 +1533,37 @@ class MainWindow(QMainWindow):
         if status_file.exists():
             try:
                 data = json.loads(status_file.read_text(encoding="utf-8"))
-                text = (
-                    f"运行状态：{data.get('phase', '—')}  格子:{data.get('cell', '—')}  "
-                    f"进度:{data.get('processed', 0)}/{data.get('max_discs', 0)}  "
-                    f"时间:{data.get('time', '—')}"
-                )
+                self._show_run_status(data)
+                text = self.run_status_label.text()
             except Exception:
                 pass
         self.run_status_label.setText(text)
+        if self._task_status is not None:
+            self._show_run_status(self._task_status)
+        # 读取统一日志文件，覆盖导航、OCR、执行器等模块；日志轮转/设置重建也能继续读取。
+        if not hasattr(self, "run_log"):
+            return
+        from zzz_ddtool.paths import logs_dir
+
+        try:
+            with (logs_dir() / "ddtool.log").open("rb") as stream:
+                size = stream.seek(0, 2)
+                offset = max(0, size - 128 * 1024)
+                stream.seek(offset)
+                raw = stream.read()
+            if offset:
+                raw = raw.partition(b"\n")[2]
+            tail = "\n".join(raw.decode("utf-8", errors="replace").splitlines()[-300:])
+        except OSError:
+            return
+        if tail == self._log_tail:
+            return
+        self._log_tail = tail
+        bar = self.run_log.verticalScrollBar()
+        follow = bar.value() >= bar.maximum() - 2
+        position = bar.value()
+        self.run_log.setPlainText(tail)
+        bar.setValue(bar.maximum() if follow else position)
 
     def _load_path(self, path: Path) -> None:
         if path.exists():
@@ -1687,6 +1803,14 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._run_thread is not None:
+            self._close_after_run = True
+            self._stop_run()
+            event.ignore()
+            return
+        from zzz_ddtool.overlay import overlay_shutdown
+
+        overlay_shutdown()
         event.accept()
 
 
@@ -1711,18 +1835,25 @@ def apply_light_style(app: QApplication) -> None:
 class _RunThread(QThread):
     """在子线程跑 Runner，避免阻塞 GUI 事件循环；Runner 内部 F9/F10 热键照常生效。"""
 
-    def __init__(self, preset: Preset) -> None:
+    status_changed = Signal(dict)
+
+    def __init__(self, preset: Preset, controller) -> None:
         super().__init__()
         self._preset = preset
+        self._controller = controller
 
     def run(self) -> None:
         try:
             from zzz_ddtool.runner import Runner
 
-            Runner(self._preset).run()
-        except Exception:
-            # Runner.run() 已自行捕获全部异常；此处兜底，绝不影响 GUI
-            pass
+            Runner(self._preset, controller=self._controller, on_status=self.status_changed.emit).run()
+        except Exception as exc:
+            from zzz_ddtool.logutil import get_logger
+
+            get_logger("zzz_ddtool.gui").exception("任务线程失败")
+            self.status_changed.emit({"phase": "failed", "message": str(exc)})
+        finally:
+            self._controller.close()
 
 
 def run_gui(config: Path | None = None) -> int:
@@ -1731,3 +1862,4 @@ def run_gui(config: Path | None = None) -> int:
     window = MainWindow(config)
     window.show()
     return app.exec()
+

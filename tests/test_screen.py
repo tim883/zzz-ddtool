@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +11,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from zzz_ddtool.layout import scale_point
-from zzz_ddtool.screen import MENU, OVERWORLD, STORAGE, UNKNOWN, classify_image
+from zzz_ddtool.screen import DRIVE_DISC, MENU, OVERWORLD, STORAGE, UNKNOWN, classify_image, is_disc_modal
 
 
 @pytest.fixture(scope="module")
@@ -60,3 +61,14 @@ def test_warehouse_point_scales() -> None:
     assert scale_point(1122, 970, 1920, 1080) == (1122, 970)
     x, y = scale_point(1122, 970, 2560, 1440)
     assert (x, y) == (1496, 1293)
+
+
+@pytest.mark.parametrize("name,page,modal", [
+    ("upgrade-modal.png", UNKNOWN, True),
+    ("warehouse-after-upgrade-discard.png", DRIVE_DISC, False),
+    ("menu-after-extra-escape.png", MENU, False),
+])
+def test_upgrade_return_real_screens(qapp, name, page, modal):
+    image = QImage(str(Path(__file__).parent / "fixtures" / name))
+    assert classify_image(image) == page
+    assert is_disc_modal(image) is modal

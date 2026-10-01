@@ -24,6 +24,9 @@ from zzz_ddtool.layout import (
     UPGRADE_LEVEL,
     UPGRADE_SUB_SPLIT_X,
     UPGRADE_SUB_STATS,
+    WAREHOUSE_DISC_LEVEL,
+    WAREHOUSE_MAIN_STAT,
+    WAREHOUSE_SUB_STATS,
     scale_rect,
 )
 from zzz_ddtool.models import Disc, Substat
@@ -226,8 +229,10 @@ def _pair_substat_lines(lines: list[OcrLine], split_x: int) -> list[tuple[str, s
 def read_level(image: QImage, area: tuple[int, int, int, int] = DISC_LEVEL) -> int | None:
     """读取等级数字（默认详情面板，可传强化页区域），返回 0~15 的数字。"""
     for line in read_rect(image, area):
-        m = re.search(r"(\d+)", line.text)
-        if m:
+        m = re.search(r"等级\s*(\d+)", line.text)
+        if m is None and area == UPGRADE_LEVEL:
+            m = re.fullmatch(r"\s*(\d+)\s*", line.text)
+        if m and 0 <= int(m.group(1)) <= 15:
             return int(m.group(1))
     return None
 
@@ -253,7 +258,8 @@ def read_substats(
 
 def read_mainstat(image: QImage) -> str | None:
     """读取主属性名（用来复核部位/套装信息，不做决策主键）。"""
-    lines = read_rect(image, MAIN_STAT)
+    area = WAREHOUSE_MAIN_STAT if read_level(image, WAREHOUSE_DISC_LEVEL) is not None else MAIN_STAT
+    lines = read_rect(image, area)
     if not lines:
         return None
     # 取左侧那行作为名字
@@ -288,10 +294,15 @@ def parse_disc(image: QImage) -> Disc | None:
 
     失败返回 None，调用方应中断流程。
     """
-    level = read_level(image)
+    # 只有在等级标签成功匹配时才选择布局，避免把套装说明里的数字当等级。
+    level = read_level(image, WAREHOUSE_DISC_LEVEL)
+    area = WAREHOUSE_SUB_STATS
+    if level is None:
+        level = read_level(image)
+        area = SUB_STATS
     if level is None:
         return None
-    substats = read_substats(image)
+    substats = read_substats(image, area)
     if not substats:
         return None
     actions = read_action_state(image)
