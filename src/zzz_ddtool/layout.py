@@ -13,6 +13,10 @@ OVERWORLD_HINT = (20, 980, 280, 1060)
 # OneDragon storage_wengine.yml TAB-驱动盘 (1510,126)-(1588,210)
 DRIVE_DISC_TAB = (1549, 168)
 DRIVE_DISC_TAB_REGION = (1510, 126, 1588, 210)
+# 音擎仓库页签。2026-10-02 真机标定：4 个页签圆中心约 x=1453/1546/1642/1736 (y=168)，
+# 点最左 (1453,168) 后 classify_image 认到 storage（「音擎仓库标题」+「回收」），
+# 再点 (1549,168) 回驱动盘。这就是切页置顶的路径。
+ENGINE_TAB = (1453, 168)
 # 漏斗白圈中心（filter-panel-bottom.png 实测圆心）。右边青蓝圆是拆解，点到会进拆解页。
 FILTER_BTN = (149, 930)
 # 拆解蓝标 +「拆解」字。任何点击落在这里都要拒绝。

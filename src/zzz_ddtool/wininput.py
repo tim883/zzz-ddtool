@@ -172,7 +172,10 @@ def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
 
 
 def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
-    """把光标移到窗口客户区 (x,y) 后滚动。delta 负数向下翻页。一格约 120。"""
+    """把光标移到窗口客户区 (x,y) 后滚动。delta 负数向下翻页。一格约 120。
+
+    保持既有调用兼容（一次缩放 delta、自带聚焦/移光标/随机等待）。批量按行
+    发送请用 send_wheel_event，不要用这个。"""
     _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
     sx, sy = client_to_screen(hwnd, x, y)
     focus_window(hwnd)
@@ -181,6 +184,21 @@ def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
     user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
     time.sleep(0.15)
     pause()
+
+
+def send_wheel_event(delta_units: int) -> None:
+    """只发送一条原始滚轮事件（spec §5.2）。
+
+    不聚焦、不移光标、不做随机等待、不发多条。调用方（scroll_rows）负责
+    开始时聚焦与光标定位，并按标定间隔在事件之间自行等待。
+
+    delta_units 为滚轮格数，一格固定 120：负数向下、正数向上。禁止用一条
+    放大的 delta 代替已标定的多事件序列——游戏可能对单条大事件限幅或合并。
+    """
+    if delta_units == 0:
+        raise InputError("滚轮事件格数不能为 0。")
+    _input_log.info("wheel_event delta_units=%d", delta_units)
+    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_units * 120, 0)
 
 
 def press_key_once(hwnd: int, vk: int) -> None:

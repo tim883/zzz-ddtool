@@ -4,7 +4,14 @@ import time
 from pathlib import Path
 
 from zzz_ddtool.capture import CaptureError, capture_game, find_game_hwnd, grab_game_image, save_image
-from zzz_ddtool.layout import BACK_BTN, DRIVE_DISC_TAB, OVERWORLD_MENU_BTN, WAREHOUSE_BTN, scale_point
+from zzz_ddtool.layout import (
+    BACK_BTN,
+    DRIVE_DISC_TAB,
+    ENGINE_TAB,
+    OVERWORLD_MENU_BTN,
+    WAREHOUSE_BTN,
+    scale_point,
+)
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.screen import (
     DRIVE_DISC,
@@ -119,6 +126,72 @@ def goto_warehouse() -> Path:
         raise NavError("转了 8 圈都没站上驱动盘页，已中断（页面状态见日志）。")
     except InputError as exc:
         raise NavError(str(exc)) from exc
+
+
+def _switch_tab(
+    hwnd: int,
+    image,
+    point: tuple[int, int],
+    page: str,
+    what: str,
+    *,
+    clicks: int = 2,
+    ocr_retry: int = 3,
+):
+    """点一个仓库页签并认页（spec §5.3 的页签重试规则）。
+
+    同一页签最多点 ``clicks`` 次；每次点击后的认页最多取 ``max(1, ocr_retry)``
+    张截图（含首次）。仍认不出就存现场图并抛错，不盲点更多次。
+    """
+    log = get_logger("zzz_ddtool.nav")
+    last = image
+    for i in range(max(1, clicks)):
+        _click(hwnd, last, point)
+        time.sleep(1.1)
+        for shot in range(max(1, ocr_retry)):
+            img, _page, method, target = _grab(hwnd)
+            if is_page(img, page):
+                log.info("切页 %s 成功（第%d次点击，认页第%d张）", what, i + 1, shot + 1)
+                return img, method, target
+            last = img
+        try:
+            save_image(last, hwnd, "printwindow", name=f"nav-{what}切换失败{i + 1}")
+        except Exception:
+            pass
+    detail = " ".join(f"{name}={score:.2f}/{need:.2f}" for name, score, need in icon_report(last, page))
+    raise NavError(f"切{what}失败（{detail}），已中断以免进错页。")
+
+
+def reset_to_top(*, ocr_retry: int = 3) -> Path:
+    """切页置顶：驱动盘仓库 → 音擎仓库 → 驱动盘仓库（spec §4.3 reset_to_top）。
+
+    只切页，不改筛选、不强化、不打标。游戏在切回驱动盘时把列表滚回顶部；
+    成功返回置顶后的驱动盘页截图，调用方据此确认原点与行对齐。
+    失败一律抛 NavError，由上层按任务失败终止，不发送额外归位操作掩盖失败。
+    """
+    log = get_logger("zzz_ddtool.nav")
+    try:
+        image, _method, hwnd = grab_game_image()
+    except CaptureError as exc:
+        raise NavError(str(exc)) from exc
+
+    if not is_page(image, DRIVE_DISC):
+        log.info("置顶前不在驱动盘页（%s），先走导航站稳", classify_image(image))
+        goto_warehouse()
+        image, _method, hwnd = grab_game_image(hwnd)
+        if not is_page(image, DRIVE_DISC):
+            raise NavError("置顶前到不了驱动盘仓库，已中断。")
+
+    try:
+        _switch_tab(hwnd, image, ENGINE_TAB, STORAGE, "音擎仓库", ocr_retry=ocr_retry)
+        image, method, hwnd = _switch_tab(
+            hwnd, image, DRIVE_DISC_TAB, DRIVE_DISC, "驱动盘仓库", ocr_retry=ocr_retry
+        )
+    except InputError as exc:
+        raise NavError(str(exc)) from exc
+
+    log.info("置顶完成，已回到驱动盘仓库顶部")
+    return save_image(image, hwnd, method, name="置顶-驱动盘页")
 
 
 def snapshot_pages() -> dict[str, Path]:
