@@ -9,12 +9,17 @@ from __future__ import annotations
 import pytest
 
 from zzz_ddtool.traversal import (
+    CAL_OK,
+    CAL_OVER,
+    CAL_SHORT,
+    AnchorObservation,
     CellStatus,
+    ResumePoint,
     GridCell,
     GridMetrics,
     PositionError,
-    SliderMapping,
     TraversalState,
+    bottom_evidence,
     check_forward_move,
     check_layout_reference,
     forward_top_limit,
@@ -25,9 +30,9 @@ from zzz_ddtool.traversal import (
     make_filter_signature,
     map_labels,
     max_restore_rows,
+    rate_candidate,
     restore_request_rows,
     split_stable_cells,
-    target_offset_unique,
 )
 
 W, H = 1920, 1080
@@ -258,13 +263,12 @@ def test_single_resume_point_for_multi_stage_upgrade():
     state.commit_prefix()
     assert state.next_index == 100
 
-    first = state.begin_upgrade(100, slider=(100, 300))
+    first = state.begin_upgrade(100)
     for _ in range(3):  # 0→3→6→9，焦点每档都变
-        assert state.begin_upgrade(100, slider=(100, 120)) is first
+        assert state.begin_upgrade(100) is first
     assert state.resume_point.next_index == 101
     assert state.resume_point.viewport_top_row0 == 10
-    assert state.resume_point.row_phase_px == 50.0
-    assert state.resume_point.slider == (100, 300)  # 不被后续焦点覆盖
+    assert state.resume_point.row_phase_px == 50.0  # 不被后续焦点覆盖
 
     assert state.finish_upgrade() == 101
     assert state.resume_point is None
@@ -376,32 +380,78 @@ def test_layout_reference_reports_mismatch(origin, pitch):
 
 
 # --------------------------------------------------------------------------
-# 滑块定位区间（spec §5.4）
+# 锚点位移证据、标定候选与端点依据（spec §5.1、§5.2、§5.4）
+#
+# 全局位置不依赖滑块：本模块无滑块字段，也没有任何以滑块读数为条件的判据。
 # --------------------------------------------------------------------------
 
 
-def test_slider_interval_accepts_unique_target():
-    mapping = SliderMapping(px_per_row=100.0, error_px=0.5)
-    low, high = mapping.row_offset_interval(100, 400)
-    assert low <= 3 <= high
-    assert target_offset_unique(low, high, 3)
+def test_state_has_no_slider_fields():
+    """spec §8：确认无测距字段及依赖。"""
+    state = TraversalState(job_id="j1")
+    payload = state.status_payload()
+    assert not any("slider" in key.lower() for key in payload)
+    assert not hasattr(state, "slider_mapping")
+    assert not hasattr(state, "task_restore_limit_rows")
+    point = ResumePoint(viewport_top_row0=0, row_phase_px=0.0, next_index=1)
+    assert not any("slider" in key.lower() for key in point.as_payload())
 
 
-def test_slider_interval_rejects_when_resolution_too_coarse():
-    mapping = SliderMapping(px_per_row=100.0, error_px=150.0)  # 误差盖过一整行
-    low, high = mapping.row_offset_interval(100, 400)
-    assert not target_offset_unique(low, high, 3)
+def test_anchor_advanced_rows_counts_screen_row_movement():
+    obs = AnchorObservation(anchor_index=30, screen_row0_before=2, screen_row0_after=0, requested_rows=2)
+    assert obs.advanced_rows == 2
+    assert not obs.shortfall and not obs.stopped
 
 
-def test_slider_interval_rejects_when_target_not_in_range():
-    mapping = SliderMapping(px_per_row=100.0, error_px=0.5)
-    low, high = mapping.row_offset_interval(100, 400)
-    assert not target_offset_unique(low, high, 10)
+def test_anchor_shortfall_marks_endpoint_stop():
+    obs = AnchorObservation(anchor_index=30, screen_row0_before=2, screen_row0_after=1, requested_rows=2)
+    assert obs.advanced_rows == 1 and obs.shortfall
+    assert not obs.stopped
 
 
-def test_slider_mapping_rejects_zero_slope():
-    with pytest.raises(PositionError):
-        SliderMapping(px_per_row=0.0).row_offset_interval(0, 10)
+def test_anchor_no_movement_at_all_is_stopped():
+    obs = AnchorObservation(anchor_index=30, screen_row0_before=2, screen_row0_after=2, requested_rows=2)
+    assert obs.advanced_rows == 0 and obs.stopped and obs.shortfall
+
+
+@pytest.mark.parametrize(
+    "displacement,expected",
+    [
+        (175.0, CAL_OK),
+        (171.5, CAL_OK),  # -2%
+        (178.5, CAL_OK),  # +2%
+        (100.0, CAL_SHORT),
+        (227.5, CAL_OVER),  # 0.6 行直接跳成 1.3 行
+    ],
+)
+def test_rate_candidate_windows(displacement, expected):
+    assert rate_candidate(displacement, 175.0) == expected
+
+
+def test_over_candidate_is_never_chosen_by_rounding():
+    """0.6 行跳成 1.3 行：该间隔无合格整数协议，不插值也不舍入。"""
+    assert rate_candidate(1.3 * 175.0, 175.0) == CAL_OVER
+
+
+def test_bottom_evidence_requires_both_endpoint_and_tail():
+    full = AnchorObservation(30, 2, 0, 2)
+    short = AnchorObservation(30, 2, 1, 2)
+    assert not bottom_evidence([full], tail_slots_confirmed=True)
+    assert not bottom_evidence([short], tail_slots_confirmed=False)  # 末尾占位未确认
+    assert bottom_evidence([short], tail_slots_confirmed=True)
+    assert bottom_evidence([full, short], tail_slots_confirmed=True)
+
+
+def test_restore_request_rows_is_internal_limit_not_measured_distance():
+    """H 只是内部请求上界，不代表已测量 H 行（spec §5.1）。"""
+    state = TraversalState(job_id="j1")
+    state.confirm_viewport(10, 87.5, row_pitch_px=175.0)  # top=10、半行相位
+    state.restore_request_limit_rows = max_restore_rows(20)  # H=39
+    state.begin_upgrade(global_index(10, 0))
+    assert state.restore_request_rows() == 11  # ceil(10.5)
+    assert state.within_restore_limit()
+    state.restore_request_limit_rows = 5  # 逻辑错误导致的过小上界
+    assert not state.within_restore_limit()
 
 
 # --------------------------------------------------------------------------
@@ -475,7 +525,7 @@ def test_status_payload_exposes_required_keys():
     for index in range(100):
         state.set_status(index, CellStatus.DONE)
     state.commit_prefix()
-    state.begin_upgrade(99, slider=(100, 300))
+    state.begin_upgrade(99)
     state.begin_scroll(2, 5)
     state.mark_event_sent()
     payload = state.status_payload()

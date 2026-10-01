@@ -76,9 +76,13 @@ def forward_top_limit(batch_no: int) -> int:
 
 
 def max_restore_rows(max_pages: int) -> int:
-    """开局可计算的恢复请求行数上界 H（spec §5.1）。
+    """开局可计算的恢复请求行数上界 H（spec §4.2、§5.1）。
 
-    H = 0（P=1，无正常前进）或 2*(P-1)+1（含半行相位余量）。
+    H = 0（P=1，无正常前进）或 2*(P-1)+1（含半行相位余量）。默认 P=20 时 H=39。
+
+    H 只是内部请求上界，不是测得的列表长度或验证距离：不要求每个任务开局发送
+    H 行，也不要求先算列表长度。已取消以滑块测距为基础的长距离能力门槛、持久
+    validated_max_rows 和本任务底部 B 预试验。
     """
     if max_pages <= 1:
         return 0
@@ -309,31 +313,81 @@ def split_stable_cells(
 
 
 # --------------------------------------------------------------------------
-# 滚动定位与滑块关系（spec §5.2、§5.4）
+# 滚动定位：锚点位移证据与端点依据（spec §5.2、§5.4）
+#
+# 全局位置依据是「置顶原点 + 实测滚轮协议 + 累计行数」。禁止把滑块长度、位置
+# 或移动像素换算成行数、列表长度或全局格位；本模块不保存任何滑块量，也没有
+# 任何依赖滑块读数的判据（spec §5.4、§8「确认无测距字段及依赖」）。
 # --------------------------------------------------------------------------
+
+# 标定候选位移的合格窗口（spec §5.1 第 2 条）：相对独立测得的行距 ±2%。
+CALIBRATION_TOLERANCE = 0.02
+
+CAL_OK = "ok"
+CAL_SHORT = "short"
+CAL_OVER = "over"
+
+
+def rate_candidate(displacement_px: float, row_pitch_px: float) -> str:
+    """判定一个标定候选事件数的实测位移（spec §5.1 第 2 条）。
+
+    `ok`：位移落在行距 ±2% 内，得到候选 events_per_row。
+    `short`：位移明显不足一行，继续试 n+1。
+    `over`：位移超过一行（例如 0.6 行直接跳成 1.3 行），该间隔无合格整数协议，
+    不选择"第一个越过一行"的 n，也不插值或舍入。
+    """
+    if row_pitch_px <= 0:
+        raise PositionError(f"行距必须为正：{row_pitch_px}")
+    ratio = float(displacement_px) / float(row_pitch_px)
+    if ratio > 1.0 + CALIBRATION_TOLERANCE:
+        return CAL_OVER
+    if ratio < 1.0 - CALIBRATION_TOLERANCE:
+        return CAL_SHORT
+    return CAL_OK
 
 
 @dataclass(frozen=True)
-class SliderMapping:
-    """本任务实测的滑块—位移关系。只在当前 TaskJob 有效，不跨任务沿用。"""
+class AnchorObservation:
+    """一次正常短距移动的可见锚点位移证据（spec §5.2 第 206 行）。
 
-    px_per_row: float
-    error_px: float = 0.5
+    锚点是移动前已选中、全局位置已知的格子。移动前后都从已有截图读它的屏幕
+    行，差值即实际位移；请求行数只作对照，不能冒充实际位移，也不能按滚轮次数
+    直接累加全局行号而忽略实际截停。
+    """
 
-    def row_offset_interval(self, saved_px: float, current_px: float) -> tuple[float, float]:
-        """已知保存滑块与当前滑块读数时，可能的全局行偏移区间（含量化误差）。"""
-        if abs(self.px_per_row) < 1e-6:
-            raise PositionError("滑块—行关系不可用（斜率为零）")
-        center = (float(current_px) - float(saved_px)) / self.px_per_row
-        half = abs(self.error_px / self.px_per_row)
-        return center - half, center + half
+    anchor_index: int
+    screen_row0_before: int
+    screen_row0_after: int
+    requested_rows: int
+
+    @property
+    def advanced_rows(self) -> int:
+        """向下实际前进的行数：锚点屏幕行向前移动了多少行。"""
+        return self.screen_row0_before - self.screen_row0_after
+
+    @property
+    def stopped(self) -> bool:
+        """有请求却完全没动，视为被端点截停。"""
+        return self.requested_rows > 0 and self.advanced_rows <= 0
+
+    @property
+    def shortfall(self) -> bool:
+        """实际位移小于请求：被底部（或顶部）截停。"""
+        return self.requested_rows > 0 and self.advanced_rows < self.requested_rows
 
 
-def target_offset_unique(low: float, high: float, target_rows: float) -> bool:
-    """区间必须包含目标且排除相邻整行，才允许 position_valid（spec §5.4）。"""
-    if not (low <= target_rows <= high):
+def bottom_evidence(
+    observations: Sequence[AnchorObservation], *, tail_slots_confirmed: bool
+) -> bool:
+    """是否具备可靠的到底依据（spec §5.4 恢复放行条件）。
+
+    必须有端点行为证据：正常短距前进时观察到小于请求的锚点位移或停止移动；
+    并且末尾占位已确认（末行不足 9 件且剩余位置连续为空，或列表已结束）。
+    相位相同本身不能证明到底，滑块也不能替代上述依据。
+    """
+    if not tail_slots_confirmed:
         return False
-    return not (low <= target_rows - 1 <= high) and not (low <= target_rows + 1 <= high)
+    return any(observation.shortfall or observation.stopped for observation in observations)
 
 
 @dataclass
@@ -376,7 +430,6 @@ class ResumePoint:
     viewport_top_row0: int
     row_phase_px: float
     next_index: int
-    slider: tuple[int, int] | None = None
     at_top: bool = False
     at_bottom: bool = False
 
@@ -405,8 +458,7 @@ class TraversalState:
     active_index: int | None = None
     resume_point: ResumePoint | None = None
     navigation_profile: Mapping[str, Any] | None = None
-    slider_mapping: SliderMapping | None = None
-    task_restore_limit_rows: int = 0
+    restore_request_limit_rows: int = 0
     work_batch_id: int = 0
     work_batch_count: int = 0
     scroll_operation: ScrollOperation | None = None
@@ -460,7 +512,13 @@ class TraversalState:
         at_top: bool | None = None,
         at_bottom: bool | None = None,
     ) -> None:
-        """提交已确认的实际视口。未知时不得调用，也不得伪填 0。"""
+        """提交已确认的实际视口。未知时不得调用，也不得伪填 0。
+
+        position_valid=true 表示按 spec §5.4 的执行与画面检查接受当前位置，允许
+        继续映射格位；不是从画面唯一识别了物品身份或绝对行号。短距移动有可见
+        锚点实际位移证据，长距恢复依赖协议重复性；若图标和等级重复，漏走整整
+        一行仍可能相位相同，单张目标图无法保证发现。
+        """
         pitch = row_pitch_px if row_pitch_px is not None else self.row_pitch_px
         if top_row0 < 0:
             raise PositionError(f"顶部行不能为负：{top_row0}")
@@ -487,16 +545,30 @@ class TraversalState:
             raise PositionError("视口位置未知，无法计算像素偏移")
         return self.viewport_top_row0 * self.row_pitch_px + self.row_phase_px
 
-    def in_restore_limit(self) -> bool:
-        """保存视口的恢复请求是否在本任务已获准的滚动能力内。"""
+    def restore_request_rows(self) -> int:
+        """恢复保存视口需要向下请求的行数（spec §5.3）。
+
+        底部保存点且相位非零时按
+        `ceil(top + phase/pitch)` 请求，让滚动自然截停到原底部；不是只对相位
+        取整。请求量只用于发送，最终仍提交保存的实际偏移。
+        """
         if self.resume_point is None:
-            return False
-        needed = restore_request_rows(
+            raise PositionError("没有恢复点，不能计算请求行数")
+        return restore_request_rows(
             self.resume_point.viewport_top_row0,
             self.resume_point.row_phase_px,
-            self.row_pitch_px or 1.0,
+            self.row_pitch_px or 0.0,
         )
-        return needed <= self.task_restore_limit_rows
+
+    def within_restore_limit(self) -> bool:
+        """恢复请求是否不超过本任务内部上界 H（spec §4.2、§5.1）。
+
+        H 只是内部请求上界，不代表已独立测量了 H 行，也不要求开局先滚 H 行。
+        超出说明状态或批次逻辑错误，发送前 failed，不临时扩大上界。
+        """
+        if self.resume_point is None:
+            return False
+        return self.restore_request_rows() <= self.restore_request_limit_rows
 
     # --- 工作批次（spec §6.4）---
 
@@ -517,7 +589,7 @@ class TraversalState:
 
     # --- 强化与恢复点（spec §6.3）---
 
-    def begin_upgrade(self, active_index: int, *, slider: tuple[int, int] | None = None) -> ResumePoint:
+    def begin_upgrade(self, active_index: int) -> ResumePoint:
         """进入强化前保存恢复点；连续升阶重复调用只保留第一次的视口。"""
         if self.resume_point is None:
             if self.viewport_top_row0 is None or self.row_phase_px is None:
@@ -526,7 +598,6 @@ class TraversalState:
                 viewport_top_row0=self.viewport_top_row0,
                 row_phase_px=self.row_phase_px,
                 next_index=active_index + 1,
-                slider=slider,
                 at_top=self.at_top,
                 at_bottom=self.at_bottom,
             )
