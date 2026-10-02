@@ -1,0 +1,56 @@
+# [测试] 「升级素材不足」场景专用配置。跟 example*.yaml 无关，不改用那两份。
+#
+# 用法：
+#   python -m zzz_ddtool run --config data/test-material-short.yaml --material-slot 3
+#
+# --material-slot 3 = 升级时点第 3 个材料槽（只加一份素材），而不是「阶段添加」
+#   （一键补满本档）。一份素材吃不满一整档 → 升级后等级到不了下一档 →
+#   命中 _upgrade_loop 的期望等级校验（runner.py:1327-1348），
+#   抛 RunnerError("升级素材不足…")。这就是要复现的现场。
+#
+# 为什么这份配置「宽进」（任何非满级 S 盘都判 UPGRADE）：
+#   * 不写 accepted 字段。runner.py:334 是
+#       accepted_ids = None if job.accepted is None else set(job.accepted)
+#     不写 → None → 走分数判定；写成 [] → 空集合 → 全部判 pattern_not_picked
+#     （这正是上一轮那块 12 级盘判 MARK_DISCARD 的原因）。
+#   * 不写 stage_require。config.Preset.require_for 查不到档位就返回 None，
+#     门槛不拦。
+#   * weights 覆盖全部 13 个副属性名 → 不会产生「废词条」，也就不会触发
+#     decide 的 junk_bonus_hidden 弃置分支。
+#   三条合起来：非满级 S 盘 → UPGRADE，一定进强化页。
+
+name: 材料不足测试-宽进
+min_useful_types: 0
+ocr_retry: 3
+
+run:
+  max_discs: 20
+
+filters:
+  require_s_rank: true
+  skip_locked: true
+  skip_equipped: true
+  skip_discarded: true
+
+# 仓库存量盘按 1 号位筛（1 号位主词条固定生命值，筛选不用选主词条）。
+game_filter:
+  slot: 1
+  slots: [1]
+  sets: []
+  mainstats: []
+
+# 13 个副属性全部有价 → 无废词条。
+weights:
+  生命值: 1.0
+  生命值%: 1.0
+  攻击力: 1.0
+  攻击力%: 1.0
+  防御力: 1.0
+  防御力%: 1.0
+  异常精通: 1.0
+  穿透值: 1.0
+  异常掌控: 1.0
+  冲击力: 1.0
+  暴击率: 1.0
+  暴击伤害: 1.0
+  能量自动回复: 1.0
