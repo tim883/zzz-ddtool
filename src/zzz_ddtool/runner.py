@@ -1,33 +1,65 @@
 """自动化主循环：按任务链导航、筛选、OCR、决策、点击。
 
-所有真实交互都通过 nav / gamefilter / wininput / ocr 走，本层只负责编排。
+所有真实交互都通过 nav / navigation / gamefilter / wininput / ocr 走，本层只负责编排。
+位置模型见 traversal.py（纯计算），滚轮协议与短距标定见 navigation.py。
+
+全局位置依据（spec v0.8 §4/§5）：
+- 行号由几何反推（原点 + 行距 + 相位），不用 OCR 聚类序号；
+- 视口来自置顶原点、实测滚轮协议与累计行数；
+- 遍历、到顶/到底、结束判断与恢复放行全程不读滑块。
 """
 
 from __future__ import annotations
 
+import re
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool.capture import grab_game_image
+from zzz_ddtool.capture import find_game_hwnd, grab_game_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
-from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_STEP, LABEL_SCAN_AREA, scale_point
+from zzz_ddtool.layout import LABEL_SCAN_AREA
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
-from zzz_ddtool.nav import NavError, goto_warehouse
+from zzz_ddtool.nav import NavError, goto_warehouse, reset_to_top
+from zzz_ddtool.navigation import (
+    NavProfile,
+    calibrate,
+    load_profile,
+    measure_layout,
+    probe_environment,
+    save_profile,
+    scroll_rows,
+    settle_and_read_anchor,
+    anchor_screen_rows,
+)
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
-from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
+from zzz_ddtool.traversal import (
+    AnchorObservation,
+    CellStatus,
+    GridCell,
+    GridMetrics,
+    PositionError,
+    TraversalState,
+    check_forward_move,
+    check_layout_reference,
+    make_filter_signature,
+    map_labels,
+    max_restore_rows,
+    split_stable_cells,
+)
+from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once
 
 # 单个盘子连续升阶上限（0→15 最多 5 阶，留余量防 OCR 读级错误导致死循环）
 _MAX_STAGE_UPGRADES = 6
+# 正常前进每次请求的行数上界（spec §5.1：只允许 1 或 2 行，维持 H）
+_FORWARD_ROWS = 2
 
 
 class RunnerError(RuntimeError):
@@ -58,6 +90,14 @@ class Runner:
         self.outcome = "idle"
         self.end_reason = ""
         self._detail_disc = None
+        # 本任务绑定实例与实测布局
+        self._hwnd: int | None = None
+        self._pid: int | None = None
+        self._state: TraversalState | None = None
+        self._profile: NavProfile | None = None
+        self._origin_center_y: float = 0.0
+        self._row_pitch: float = 175.0
+        self._selected_cell: GridCell | None = None
 
     @property
     def processed_disc_count(self) -> int:
@@ -81,11 +121,18 @@ class Runner:
         line = " ".join(x for x in (stamp, cell, phase, message) if x)
         self._status_lines.append(line)
         del self._status_lines[:-8]
-        payload = {"time": stamp, "phase": phase, "cell": cell, "message": message,
-                   "processed": self._processed, "max_discs": self.preset.max_discs}
+        payload = {
+            "time": stamp,
+            "phase": phase,
+            "cell": cell,
+            "message": message,
+            "processed": self._processed,
+            "max_discs": self.preset.max_discs,
+        }
+        if self._state is not None:
+            payload.update(self._state.status_payload())
         if self.on_status is not None:
             self.on_status(dict(payload))
-        """把运行状态写到 log/run-status.json，随时可查看工具正在干什么。"""
         try:
             import json
 
@@ -93,13 +140,41 @@ class Runner:
 
             status_file().parent.mkdir(parents=True, exist_ok=True)
             temp = status_file().with_suffix(".tmp")
-            temp.write_text(
-                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-            )
+            temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             temp.replace(status_file())
         except Exception:
             self.log.exception("运行状态写入失败")
         self.log.info("状态 %s：%s %s", phase, cell, message)
+
+    # ---------------------------------------------------------------- 实例绑定
+
+    def _bind_instance(self) -> int:
+        """任务开始时选定并绑定唯一游戏实例（spec §5.1 第 1 条）。
+
+        本任务的截图、输入、DPI 与 exe 身份都绑定同一 hwnd/PID，不因另一个
+        窗口变大而重新选择。
+        """
+        hwnd = find_game_hwnd()
+        self._hwnd = int(hwnd)
+        self._pid = window_pid(self._hwnd)
+        self.log.info("bound game instance hwnd=%s pid=%s", self._hwnd, self._pid)
+        return self._hwnd
+
+    def _grab(self, allow_esc: bool = True):
+        image, method, hwnd = grab_game_image(self._hwnd)
+        from zzz_ddtool.screen import classify_image
+
+        page = classify_image(image)
+        if page == "unknown" and allow_esc:
+            # 可能筛选面板开着盖住认页图标：Esc 一下再认。
+            # 注意：点格子后的详情页也返回 unknown，调用方须用 allow_esc=False。
+            press_key(hwnd, VK_ESCAPE)
+            time.sleep(0.5)
+            image, method, hwnd = grab_game_image(self._hwnd)
+            page = classify_image(image)
+        return image, page, method, hwnd
+
+    # ---------------------------------------------------------------- 任务与预设
 
     def _default_job(self) -> TaskJob:
         return TaskJob(
@@ -133,13 +208,20 @@ class Runner:
 
     def run(self) -> list[RunResult]:
         """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。"""
+        if not self._valid_max_pages():
+            self.outcome = "failed"
+            self.end_reason = f"max_pages 非法：{self.preset.max_pages!r}，未发送任何游戏输入"
+            self.log.error(self.end_reason)
+            return []
         self.results = []
         self._processed = 0
         self._status_lines = []
+        self._state = None
         self.outcome = "running"
         self.end_reason = ""
         jobs = self._jobs()
         import logging
+
         from zzz_ddtool.overlay import OverlayLogHandler
 
         overlay_handler = OverlayLogHandler()
@@ -175,8 +257,15 @@ class Runner:
         self.log.info("run %s processed=%d", self.outcome, self._processed)
         return list(self.results)
 
+    def _valid_max_pages(self) -> bool:
+        value = self.preset.max_pages
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    # ---------------------------------------------------------------- 主任务
+
     def _run_job(self, job: TaskJob) -> None:
         self.log.info("job start slot=%d sets=%s mains=%s", job.slot, job.sets, job.mainstats)
+        hwnd = self._bind_instance()
         try:
             goto_warehouse()
             self.trace.ok("drive_disc", "navigate", "已到驱动盘仓库")
@@ -184,7 +273,7 @@ class Runner:
             self.trace.fail("unknown", "navigate", str(exc))
             raise RunnerError(f"导航失败：{exc}") from exc
 
-        image, page, method, hwnd = self._grab()
+        image, page, method, _hwnd = self._grab()
         apply_game_filter(
             hwnd,
             image.width(),
@@ -204,312 +293,449 @@ class Runner:
 
         sub_preset = self._sub_preset(job)
         accepted_ids = None if job.accepted is None else set(job.accepted)
-        w, h = image.width(), image.height()
-        gx, gy = scale_point(640, 540, w, h)
 
-        # 滚回列表顶部：滚一轮扫一次，某轮滚动后扫描结果不再变化 = 到顶
-        # （真顶再往上滚页面纹丝不动，这是"到顶"的唯一铁证），保证从第一行开始处理。
-        prev_sig: tuple | None = None
-        for _top_round in range(6):
-            top_cells = self._visible_cells(w, h)
-            sig = getattr(self, "_grid_signature", tuple(sorted(top_cells)))
-            if sig == prev_sig:
-                self.log.info("scroll top confirmed after %d rounds", _top_round)
-                break
-            prev_sig = sig
-            wheel_client(hwnd, gx, gy, 8)  # 正数向上滚
-            time.sleep(0.35)
+        # 每任务新建状态：不继承上一任务进度（spec §4.3、§6.1）
+        state = TraversalState(
+            job_id=job.job_id,
+            filter_signature=make_filter_signature(
+                slot=job.slot, sets=job.sets, mainstats=job.mainstats
+            ),
+        )
+        state.restore_request_limit_rows = max_restore_rows(self.preset.max_pages)
+        self._state = state
 
-        prev_signature: tuple | None = None
-        rescan = False  # True=点格子异常后已恢复，需重扫当前页（不翻页）
+        profile = self._prepare_navigation(hwnd, state)
+        state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=False)
+        state.start_first_batch()
+        self._set_status("batch", "首批网格起点")
+
+        up_counts: dict[int, int] = {}
         resume_after_selection = False
-        up_counts: dict[tuple[int, int], int] = {}  # 每格升阶次数（跨重扫累计，防死循环）
-        page_idx = 0
-        while page_idx < self.preset.max_pages:
+
+        while True:
             self._checkpoint()
             if self._processed >= self.preset.max_discs:
                 break
-            if rescan:
-                rescan = False
-                prev_signature = None  # 允许同一页重扫
-            cells = self._visible_cells(
-                w,
-                h,
-                skip_tagged=self.preset.skip_discarded,
-                skip_max_level=self.preset.skip_max_level,
-            )
-            signature = getattr(self, "_grid_signature", tuple(sorted(cells)))
-            if signature == prev_signature:
-                self.log.info("page %d unchanged after scroll, job done", page_idx)
+            if state.work_batch_count > self.preset.max_pages:
+                self.log.info(
+                    "work_batch_count=%d 达到 max_pages=%d，收工", state.work_batch_count, self.preset.max_pages
+                )
                 break
-            prev_signature = signature
-            if resume_after_selection:
-                selected = getattr(self, "_selected_grid_cell", None)
-                if selected is None:
-                    self.trace.fail("drive_disc", "scan", "重扫未找到唯一选中框，停止以免跳盘", image=self._scan_image)
-                    raise RunnerError("重扫未找到唯一选中框，停止任务链")
-                cells = [cell for cell in cells if cell[:2] > selected]
-                self.log.info("rescan resumes after current selection r%dc%d", *selected)
-            cells = self._stable_grid_cells(cells)
-            self.log.info("page %d: %d cells to process", page_idx, len(cells))
-            self.trace.ok(
-                "drive_disc", "scan", f"第 {page_idx + 1} 页扫到 {len(cells)} 个盘", image=self._scan_image
+
+            cells, problems, skips = self._scan_cells_with_retry(state)
+            ready, deferred = split_stable_cells(
+                cells, at_top=state.at_top, at_bottom=state.at_bottom
             )
-            self._set_status("scanning", f"page {page_idx}: {len(cells)} cells")
-            maxed = False
-            total_cells = len(cells)
-            last_processed_cell = None
-            for cell_no, (row, col, cx, cy, _lv) in enumerate(cells, start=1):
+            for cell in deferred:
+                state.block(cell.global_index, CellStatus.DEFERRED)
+            for index, reason in skips.items():
+                state.set_status(index, CellStatus.SKIPPED)
+                self.log.info("cell %d 扫描跳过：%s（仍占全局格位）", index, reason)
+            state.commit_prefix()
+
+            pending: list[GridCell] = []
+            expected = state.next_index
+            for cell in sorted(ready, key=lambda c: c.global_index):
+                if cell.global_index < expected:
+                    continue
+                if cell.global_index != expected:
+                    break  # 前方有未解决格位（屏障），不能越过
+                pending.append(cell)
+                expected += 1
+
+            if resume_after_selection:
+                resume_after_selection = False
+                selected = self._selected_cell
+                if selected is None:
+                    self.trace.fail(
+                        "drive_disc", "scan", "重扫未找到唯一选中框，停止以免跳盘", image=self._scan_image
+                    )
+                    raise RunnerError("重扫未找到唯一选中框，停止任务链")
+                pending = [c for c in pending if c.global_index > selected.global_index]
+
+            self.log.info(
+                "batch %d: %d pending, %d skipped, %d deferred",
+                state.work_batch_count,
+                len(pending),
+                len(skips),
+                len(deferred),
+            )
+            self.trace.ok(
+                "drive_disc",
+                "scan",
+                f"第 {state.work_batch_count} 批：待处理 {len(pending)}，跳过 {len(skips)}",
+                image=self._scan_image,
+            )
+            self._set_status("scanning", f"batch {state.work_batch_count}: {len(pending)} cells")
+
+            if not pending:
+                if state.at_bottom:
+                    self.log.info("已到底且无待处理格位，本任务结束")
+                    break
+                before_top = state.viewport_top_row0
+                if not self._advance(hwnd, state, cells, rows=_FORWARD_ROWS):
+                    self.log.info("无法继续前进，本任务结束")
+                    break
+                if state.viewport_top_row0 == before_top and not state.at_bottom:
+                    self.log.warning("前进未改变视口且未到底，停止以避免空转")
+                    break
+                continue
+
+            broke = False
+            for cell in pending:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
-                    maxed = True
                     break
-                cell_tag = f"r{row}c{col}"
-                # 队列位置 + 网格位置都要有：前者知道进度，后者知道点哪
-                where = f"第 {cell_no} 个/共 {total_cells} 个 · 第{row + 1}行第{col + 1}列"
-                self.trace.new_disc()  # 盘号决定这批图最后留不留
-                click_client(hwnd, cx, cy)
-                time.sleep(0.5)
-                detail_image, page, *_ = self._grab(allow_esc=False)
-                if page in {"menu", "storage", "overworld"}:
-                    # 点飞了（如误触弹层）：Esc 退出尝试回驱动盘页；
-                    # 回得来就重扫当前页继续，回不来才中断。
-                    self.log.warning("cell %s detail click left drive_disc (page=%s), try recover", cell_tag, page)
-                    self.trace.warn(
-                        page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回",
-                        image=detail_image,
-                    )
-                    press_key(hwnd, VK_ESCAPE)
-                    time.sleep(0.6)
-                    back_image, page2, *_ = self._grab(allow_esc=False)
-                    if page2 == "drive_disc":
-                        self.log.info("recovered to drive_disc, rescan page")
-                        self.trace.note("已退回驱动盘仓库，重扫本页")
-                        rescan = True
-                        resume_after_selection = False
-                        break
-                    self.log.error("recover failed (page=%s), stop job", page2)
-                    self.trace.fail(
-                        page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工", image=back_image
-                    )
-                    raise RunnerError(f"退回失败：{page2}，停止任务链")
-                self.trace.ok("detail", "click_cell", where, image=detail_image)
-                # 点格子后仓库右侧面板直接显示详情；放大详情页使用另一组识别区域。
-                disc = self._parse_disc(detail_image)
-                if disc is None:
-                    self.trace.fail("detail", "parse", f"{where} 没读出盘面，停止任务链", image=detail_image)
-                    raise RunnerError(f"{cell_tag} 盘面识别失败")
-                self._processed += 1
-                last_processed_cell = (row, col)
-                self._detail_disc = disc
-                self.trace.ok(
-                    "detail",
-                    "parse",
-                    f"{where} 等级{disc.level} 副词条{len(disc.substats)}条"
-                    + ("（已锁定）" if disc.locked else "")
-                    + ("（已弃置）" if disc.discarded else ""),
-                    image=detail_image,
+                result = self._process_cell(
+                    hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
                 )
-                decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
-                key = (cx, cy)
-                if decision.action == Action.STOP:
-                    self._record(job, disc, decision)
-                    self.log.warning("cell %s decision STOP (%s), stop chain", cell_tag, decision.reason)
-                    self.trace.fail("detail", "decide", f"判断不了：{decision.reason}，停止任务链", image=detail_image)
-                    raise RunnerError(f"{cell_tag} 判断不确定：{decision.reason}，停止任务链")
-                self.trace.ok(
-                    "detail",
-                    "decide",
-                    f"{trace_action(decision.action.value)}：{decision.reason}",
-                )
-                if decision.action == Action.UPGRADE:
-                    if up_counts.get(key, 0) >= _MAX_STAGE_UPGRADES:
-                        self.log.warning(
-                            "cell %s upgrades capped at %d, skip action", cell_tag, _MAX_STAGE_UPGRADES
-                        )
-                        self.trace.warn(
-                            "detail",
-                            "upgrade",
-                            f"{where} 已升 {up_counts.get(key, 0)} 次，到上限不再升",
-                        )
-                    else:
-                        if disc.discarded:
-                            # 先摘掉旧弃置标签再强化，保证终态统一（R 是开关，按 discarded 条件化）
-                            press_key_once(hwnd, VK_R)
-                            time.sleep(0.5)
-                            self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
-                            self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
-                        # 进强化页，在强化页循环判断+升级（升完留原地，不每次 Esc 回网格）
-                        if self._enter_upgrade_page(hwnd):
-                            self._upgrade_loop(
-                                hwnd, job, key, cell_tag, sub_preset, accepted_ids, up_counts
-                            )
-                        else:
-                            raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
-                        # 注意：_enter_upgrade_page 失败时内部已 _esc_back_to_grid，
-                        # 这里不再重复 Esc（重复 Esc 会把仓库页退到功能页）
-                    # 升级/弃置完已回网格：等级排序可能变 + 已弃置的要跳过，重扫当前页
-                    rescan = True
-                    resume_after_selection = False  # 强化会改变排序，使用新列表重新筛选
+                if result in ("rescan", "upgrade"):
+                    broke = True
+                    # 强化改变排序：本批坐标作废，重扫后从原焦点之后继续（阶段4接恢复）
+                    resume_after_selection = result == "upgrade"
                     break
-                elif decision.action == Action.MARK_DISCARD and disc.discarded:
-                    # 已带标重判仍判弃置：空操作，不扣 max_discs 额度
-                    self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
-                    self.trace.note(f"{where} 已经打过弃置标记，不动")
-                elif decision.action == Action.SKIP and disc.discarded:
-                    # 跳过弃置标记盘：不点击不按键不扣额度
-                    self.log.info("cell %s has discard tag, skip (no count)", cell_tag)
-                    self.trace.note(f"{where} 有弃置标记，跳过")
-                else:
-                    self._record(job, disc, decision)
-                    self._act(hwnd, decision.action, disc)
-                    self.log.info(
-                        "cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level
-                    )
-                    self.trace.ok(
-                        "detail",
-                        decision.action.value,
-                        f"{where} 已{trace_action(decision.action.value)}",
-                    )
-                    self._set_status("action", decision.action.value, cell_tag)
-                time.sleep(0.3)
-                # 复用已截取的详情图，仅比较滚动条，无额外截图或 OCR。
-                # 第 2/3 行正常点击继续使用队列；实际滚动才重扫、校正游标。
-                from zzz_ddtool.equipped import grid_did_scroll
-
-                if self._scan_image is not None and grid_did_scroll(self._scan_image, detail_image):
-                    self.log.info("grid auto-scrolled after %s, refresh pending coordinates", cell_tag)
-                    resume_after_selection = True
-                    rescan = True
-                    break
-            if rescan:
+                state.set_status(cell.global_index, CellStatus.DONE)
+                state.commit_prefix()
+                self._set_status("progress", f"next_index={state.next_index}", self._cell_tag(cell))
+            if broke:
+                state.invalidate_position()
                 continue
-            if maxed or self._processed >= self.preset.max_discs:
-                # max_discs 截停：留在当前页，绝不翻页——
-                # 翻页尾巴的 Esc 按在网格上会把仓库退到功能页（19:13 轮实锤）
-                self.log.info("max_discs hit, stop without page flip")
+            if self._processed >= self.preset.max_discs:
                 break
-            if getattr(self, "_grid_at_bottom", False):
-                self.log.info("last page processed, job done")
+            if state.at_bottom:
                 break
-            self._checkpoint()
-            # 仓库右侧详情没有弹层，直接在网格滚动，不按 Esc 离开仓库。
-            # 小步滚动保留选中盘作为重叠游标，将待处理的底行移进中间区域。
-            cursor = last_processed_cell or (getattr(self, "_selected_grid_cell", None) if resume_after_selection else None)
-            rows = getattr(self, "_grid_rows", ())
-            resume_after_selection = cursor is not None and (not rows or cursor[0] > min(rows))
-            wheel_client(hwnd, gx, gy, -1)
-            time.sleep(0.8)
-            page_idx += 1
+            before_top = state.viewport_top_row0
+            if not self._advance(hwnd, state, cells, rows=_FORWARD_ROWS):
+                break
+            if state.viewport_top_row0 == before_top and not state.at_bottom:
+                self.log.warning("前进未改变视口且未到底，停止以避免空转")
+                break
 
-    def _stable_grid_cells(self, cells):
-        """只点击中间行；到顶/到底时补齐不会触发自动滚动的边界行。"""
-        rows = getattr(self, "_grid_rows", ())
-        if not rows:
-            return cells
-        first, last = min(rows), max(rows)
-        at_top = self._grid_at_top
-        at_bottom = self._grid_at_bottom
-        stable = [cell for cell in cells if (cell[0] != first or at_top) and (cell[0] != last or at_bottom)]
-        if len(stable) != len(cells):
-            self.log.info("defer %d edge cells until scrolled into stable rows", len(cells) - len(stable))
-        return stable
+    # ---------------------------------------------------------------- 导航准备
 
-    def _visible_cells(
-        self,
-        width: int,
-        height: int,
-        *,
-        skip_tagged: bool = False,
-        skip_max_level: bool = True,
-    ) -> list[tuple[int, int, int, int, int]]:
-        """OCR 当前页「等级」标签定位格子，返回 (row, col, cx, cy, level)，行优先去重。
+    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile:
+        """置顶 → 复核原点布局 → 复用或标定协议 → 再次置顶（spec §5.1）。
 
-        点的是图标中心（标签上方 GRID_LABEL_DY），已装备（头像）跳过；
-        skip_tagged=True 时弃置标记格在扫描阶段直接剔除（连点都不点）。
+        标定/检查结束必须再次置顶，才获取正式首批网格。
         """
+        env = probe_environment(hwnd)
+        reset_to_top()
+        image, _method, _hwnd = grab_game_image(hwnd)
+        origin, pitch = measure_layout(image)
+        reason = check_layout_reference(origin, pitch, image.width(), image.height())
+        if reason:
+            self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)
+            raise RunnerError(f"网格布局不受支持：{reason}，停止任务链")
+        self._origin_center_y = float(origin)
+        self._row_pitch = float(pitch)
+
+        profile = load_profile(env)
+        if profile is None:
+            if env.window_dpi is None:
+                raise RunnerError("无法读取游戏窗口 DPI，未开始滚动标定")
+            try:
+                profile = calibrate(hwnd, env=env)
+            except Exception as exc:
+                raise RunnerError(f"滚轮标定失败：{exc}，停止任务链") from exc
+            if env.persistable:
+                try:
+                    save_profile(profile)
+                except OSError as exc:
+                    self.log.warning("导航缓存写入失败（%s），仅本轮使用", exc)
+        # 每任务以本轮实测布局为准（缓存不决定原点，spec §5.1 第 168 行）
+        profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
+        self._profile = profile
+        state.navigation_profile = profile.as_dict()
+        reset_to_top()
+        self.trace.ok(
+            "drive_disc",
+            "calibrate",
+            f"原点 {self._origin_center_y:.1f} 行距 {self._row_pitch:.1f} "
+            f"协议 {profile.events_per_row}事件/行@{profile.event_interval_ms}ms",
+        )
+        return profile
+
+    # ---------------------------------------------------------------- 扫描
+
+    def _cell_tag(self, cell: GridCell) -> str:
+        row, col = cell.display()
+        return f"R{row}C{col}"
+
+    def _metrics(self, state: TraversalState, image) -> GridMetrics:
+        return GridMetrics.from_client(
+            image.width(),
+            image.height(),
+            origin_center_y=self._origin_center_y,
+            row_pitch_px=self._row_pitch,
+        )
+
+    def _scan_cells(self, state: TraversalState):
+        """扫描当前视口 → (全部原始格位, 问题, 扫描跳过表)。
+
+        行号由几何反推，不用 OCR 聚类序号；未映射/重复归列进 problems，调用方
+        当作进度屏障重读（spec §5.5），不当空位。满级/装备/弃置格仍占全局格位，
+        只记入 skips，不删号。
+        """
+        from zzz_ddtool.equipped import (
+            tile_has_discard_badge,
+            tile_has_portrait,
+            tile_is_selected,
+        )
+        from zzz_ddtool.ocr import read_rect
+
         image, page, _method, hwnd = self._grab(allow_esc=False)
         if page != "drive_disc":
             self.trace.fail(page, "scan", "当前不是驱动盘仓库，停止扫描", image=image)
             raise RunnerError(f"扫描前页面错误：{page}，停止任务链")
-        self._scan_image = image  # 整页长什么样，交给 trace 存（这一页的唯一现场）
-        ox, oy = scale_point(*GRID_ORIGIN, width, height)
-        sx, sy = scale_point(*GRID_STEP, width, height)
-        from zzz_ddtool.equipped import grid_scroll_limits, grid_scroll_position, tile_has_discard_badge, tile_has_portrait, tile_is_selected
-        from zzz_ddtool.layout import GRID_LABEL_DY
-        from zzz_ddtool.ocr import read_rect
+        self._scan_image = image
 
-        # 行聚类：按标签 y 坐标聚成行，不依赖固定行数——列表滚动停在半行
-        # 位置时，固定映射会把首行算到界外、末行超出上限，造成永远丢一行。
-        import re
-
-        labels: list[tuple[int, int, int]] = []
+        width, height = image.width(), image.height()
+        metrics = self._metrics(state, image)
+        labels: list[tuple[float, float, int]] = []
         for line in read_rect(image, LABEL_SCAN_AREA):
             text = line.text.replace(" ", "")
             if not text.startswith("等级"):
                 continue
-            m = re.search(r"等级(\d+)", text)
-            level = int(m.group(1)) if m else -1
-            labels.append(((line.left + line.right) // 2, (line.top + line.bottom) // 2, level))
-        labels.sort(key=lambda p: p[1])
-        rows: list[list[tuple[int, int, int]]] = []
-        for lx, ly, lv in labels:
-            if rows and abs(ly - rows[-1][-1][1]) <= 60:
-                rows[-1].append((lx, ly, lv))
-            else:
-                rows.append([(lx, ly, lv)])
-        cells: dict[tuple[int, int], tuple[int, int, int, int]] = {}
-        selected_cells = []
-        raw_cells = []
-        label_dy = scale_point(0, GRID_LABEL_DY, width, height)[1]
-        min_cy = scale_point(0, 97, width, height)[1]
-        max_cy = scale_point(0, 983, width, height)[1]
-        for r_idx, cluster in enumerate(rows):
-            tile_cy = cluster[0][1] - label_dy
-            # 行被窗口边缘切掉的（格子露出不到一半）不点
-            if not (min_cy <= tile_cy <= max_cy):
-                self.log.info("row y=%d half-cut at window edge, skip", tile_cy)
-                continue
-            for lx, _ly, lv in sorted(cluster):
-                col = round((lx - ox) / sx)
-                if not (0 <= col < GRID_COLS):
-                    continue
-                cx = ox + col * sx
-                raw_cells.append((r_idx, col, cx, tile_cy, lv))
-                design_cx = round(cx * 1920 / width)
-                design_cy = round(tile_cy * 1080 / height)
-                if tile_is_selected(image, design_cx, design_cy):
-                    selected_cells.append((r_idx, col))
-                if skip_max_level and lv >= 15:
-                    self.log.info("cell r%dc%d level %d max, skip at scan", r_idx, col, lv)
-                    continue
-                if self.preset.skip_equipped and tile_has_portrait(image, cx - 56, tile_cy - 68, cx + 56, tile_cy + 68):
-                    self.log.info("cell r%dc%d equipped, skip", r_idx, col)
-                    continue
-                if skip_tagged and tile_has_discard_badge(image, cx, tile_cy):
-                    self.log.info("cell r%dc%d discard-tagged, skip at scan", r_idx, col)
-                    continue
-                cells[(r_idx, col)] = (r_idx, col, cx, tile_cy, lv)
-        self._selected_grid_cell = selected_cells[0] if len(selected_cells) == 1 else None
-        self._grid_rows = tuple(sorted({cell[0] for cell in raw_cells}))
-        self._grid_at_top, self._grid_at_bottom = grid_scroll_limits(image)
-        # 标签全相同时也要凭滚动条区分页面；不把选中框/弃置变化算作翻页。
-        self._grid_signature = (tuple(raw_cells), grid_scroll_position(image))
-        # 强制行优先（第1行从左到右，再第2行…），保证处理顺序确定、不跳格
-        return [cells[key] for key in sorted(cells)]
+            match = re.search(r"等级(\d+)", text)
+            level = int(match.group(1)) if match else -1
+            labels.append(
+                (
+                    float((line.left + line.right) // 2),
+                    float((line.top + line.bottom) // 2),
+                    level,
+                )
+            )
 
-    def _grab(self, allow_esc: bool = True):
-        image, method, hwnd = grab_game_image()
-        from zzz_ddtool.screen import classify_image
-        page = classify_image(image)
-        if page == "unknown" and allow_esc:
-            # 可能筛选面板开着盖住认页图标：Esc 一下再认。
-            # 注意：点格子后的详情页也返回 unknown，调用方须用 allow_esc=False。
+        cells, problems = map_labels(
+            metrics,
+            labels,
+            viewport_top_row0=state.viewport_top_row0 or 0,
+            row_phase_px=state.row_phase_px or 0.0,
+        )
+
+        selected: list[GridCell] = []
+        skips: dict[int, str] = {}
+        for cell in cells:
+            design_cx = round(cell.center_x * 1920 / width)
+            design_cy = round(cell.center_y * 1080 / height)
+            if tile_is_selected(image, design_cx, design_cy):
+                selected.append(cell)
+                continue
+            if self.preset.skip_max_level and cell.level >= MAX_LEVEL:
+                skips[cell.global_index] = f"等级 {cell.level} 已满"
+                continue
+            if self.preset.skip_equipped and tile_has_portrait(
+                image,
+                cell.center_x - 56,
+                cell.center_y - 68,
+                cell.center_x + 56,
+                cell.center_y + 68,
+            ):
+                skips[cell.global_index] = "已装备"
+                continue
+            if self.preset.skip_discarded and tile_has_discard_badge(
+                image, cell.center_x, cell.center_y
+            ):
+                skips[cell.global_index] = "已打弃置标记"
+                continue
+        self._selected_cell = selected[0] if len(selected) == 1 else None
+        return cells, problems, skips
+
+    def _scan_cells_with_retry(self, state: TraversalState):
+        """漏格/漏行重读：最多 max(1,ocr_retry) 张（含首次），仍不完整 failed。"""
+        attempts = max(1, self.preset.ocr_retry)
+        cells, problems, skips = self._scan_cells(state)
+        for _ in range(1, attempts):
+            if not problems:
+                break
+            self.log.warning("网格映射不完整（%s），重读第 %d 次", problems[0], _ + 1)
+            time.sleep(0.15)
+            cells, problems, skips = self._scan_cells(state)
+        if problems:
+            self.trace.fail(
+                "drive_disc",
+                "scan",
+                f"网格映射不完整，重读耗尽：{problems[0]}",
+                image=self._scan_image,
+            )
+            raise RunnerError(f"网格映射不完整：{problems[0]}，停止任务链")
+        return cells, problems, skips
+
+    # ---------------------------------------------------------------- 格位处理
+
+    def _process_cell(
+        self,
+        hwnd: int,
+        job: TaskJob,
+        state: TraversalState,
+        cell: GridCell,
+        sub_preset: Preset,
+        accepted_ids,
+        up_counts: dict,
+    ) -> str:
+        """处理一个格位。返回 done / rescan。"""
+        row, col = cell.display()
+        cell_tag = self._cell_tag(cell)
+        where = f"全局第{row}行第{col}列（序号 {cell.global_index}）"
+        self.trace.new_disc()
+        click_client(hwnd, cell.center_x, cell.center_y)
+        time.sleep(0.5)
+        detail_image, page, *_ = self._grab(allow_esc=False)
+        if page in {"menu", "storage", "overworld"}:
+            self.log.warning("cell %s 点开了 %s，先按 Esc 退回", cell_tag, page)
+            self.trace.warn(
+                page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回", image=detail_image
+            )
             press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.5)
-            image, method, hwnd = grab_game_image()
-            page = classify_image(image)
-        return image, page, method, hwnd
+            time.sleep(0.6)
+            back_image, page2, *_ = self._grab(allow_esc=False)
+            if page2 == "drive_disc":
+                self.log.info("recovered to drive_disc, rescan batch")
+                self.trace.note("已退回驱动盘仓库，重扫本批")
+                return "rescan"
+            self.log.error("recover failed (page=%s), stop job", page2)
+            self.trace.fail(page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工", image=back_image)
+            raise RunnerError(f"退回失败：{page2}，停止任务链")
+
+        self.trace.ok("detail", "click_cell", where, image=detail_image)
+        disc = self._parse_disc(detail_image)
+        if disc is None:
+            self.trace.fail("detail", "parse", f"{where} 没读出盘面，停止任务链", image=detail_image)
+            raise RunnerError(f"{cell_tag} 盘面识别失败")
+        self._processed += 1
+        self._detail_disc = disc
+        self.trace.ok(
+            "detail",
+            "parse",
+            f"{where} 等级{disc.level} 副词条{len(disc.substats)}条"
+            + ("（已锁定）" if disc.locked else "")
+            + ("（已弃置）" if disc.discarded else ""),
+            image=detail_image,
+        )
+
+        decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
+        if decision.action == Action.STOP:
+            self._record(job, disc, decision)
+            self.log.warning("cell %s decision STOP (%s), stop chain", cell_tag, decision.reason)
+            self.trace.fail("detail", "decide", f"判断不了：{decision.reason}，停止任务链", image=detail_image)
+            raise RunnerError(f"{cell_tag} 判断不确定：{decision.reason}，停止任务链")
+        self.trace.ok(
+            "detail", "decide", f"{trace_action(decision.action.value)}：{decision.reason}"
+        )
+
+        if decision.action == Action.UPGRADE:
+            if up_counts.get(cell.global_index, 0) >= _MAX_STAGE_UPGRADES:
+                self.log.warning("cell %s upgrades capped, skip action", cell_tag)
+                self.trace.warn(
+                    "detail",
+                    "upgrade",
+                    f"{where} 已升 {up_counts.get(cell.global_index, 0)} 次，到上限不再升",
+                )
+            else:
+                if disc.discarded:
+                    press_key_once(hwnd, VK_R)
+                    time.sleep(0.5)
+                    self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
+                    self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
+                if self._enter_upgrade_page(hwnd):
+                    self._upgrade_loop(
+                        hwnd, job, cell.global_index, cell_tag, sub_preset, accepted_ids, up_counts
+                    )
+                else:
+                    raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
+            # 强化会改变排序：本批作废，重扫（坐标与数组全部重建）
+            return "upgrade"
+        if decision.action == Action.MARK_DISCARD and disc.discarded:
+            self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
+            self.trace.note(f"{where} 已经打过弃置标记，不动")
+        elif decision.action == Action.SKIP and disc.discarded:
+            self.log.info("cell %s has discard tag, skip (no count)", cell_tag)
+            self.trace.note(f"{where} 有弃置标记，跳过")
+        else:
+            self._record(job, disc, decision)
+            self._act(hwnd, decision.action, disc)
+            self.log.info("cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level)
+            self.trace.ok("detail", decision.action.value, f"{where} 已{trace_action(decision.action.value)}")
+            self._set_status("action", decision.action.value, cell_tag)
+        time.sleep(0.3)
+        return "done"
+
+    # ---------------------------------------------------------------- 正常前进
+
+    @staticmethod
+    def _pick_anchor(cells: list[GridCell]) -> GridCell | None:
+        """选一个全局位置已知、位于中间行的格位作导航锚点（spec §5.2）。"""
+        mids = [c for c in cells if c.screen_row0 in (1, 2)]
+        if not mids:
+            return None
+        mids.sort(key=lambda c: (abs(c.screen_row0 - 2), c.screen_col0))
+        return mids[0]
+
+    def _advance(self, hwnd: int, state: TraversalState, cells: list[GridCell], *, rows: int) -> bool:
+        """正常短距前进（spec §5.2）：选中锚点 → 按协议发送 → 用锚点位移确认。
+
+        请求量与已发送量分开；实际位移由锚点截图确认，不按滚轮次数直接累加。
+        返回是否成功前进（被端点完全截停时也返回 True 并把 at_bottom 置位）。
+        """
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("没有可用的滚轮协议，无法前进")
+        anchor = self._pick_anchor(cells)
+        if anchor is None:
+            self.log.warning("没有可用的导航锚点格位，停止前进")
+            return False
+
+        origin, pitch = self._origin_center_y, self._row_pitch
+        click_client(hwnd, anchor.center_x, anchor.center_y)
+        time.sleep(0.4)
+        image, _method, _hwnd = grab_game_image(hwnd)
+        before = anchor_screen_rows(
+            image, col0=anchor.screen_col0, origin_center_y=origin, row_pitch_px=pitch
+        )
+        if before != [anchor.screen_row0]:
+            self.log.warning("锚点未唯一选中（读到 %s），停止前进", before)
+            return False
+
+        send = scroll_rows(
+            hwnd, rows, profile, before_event=lambda _index: self._checkpoint()
+        )
+        state.begin_scroll(rows, send.total_events)
+        for _ in range(send.sent_events):
+            state.mark_event_sent()
+        state.confirm_scroll()
+
+        after, _settle_ms, _image = settle_and_read_anchor(
+            hwnd,
+            col0=anchor.screen_col0,
+            origin_center_y=origin,
+            row_pitch_px=pitch,
+            top_row0=state.viewport_top_row0 or 0,
+            phase_px=state.row_phase_px or 0.0,
+        )
+        observation = AnchorObservation(
+            anchor_index=anchor.global_index,
+            screen_row0_before=before[0],
+            screen_row0_after=(after[0] if after else before[0]),
+            requested_rows=rows,
+        )
+        advanced = max(0, observation.advanced_rows)
+        previous_top = state.viewport_top_row0 or 0
+        new_top = previous_top + advanced
+        try:
+            check_forward_move(state.work_batch_count + 1, previous_top, new_top, rows)
+        except PositionError as exc:
+            raise RunnerError(f"正常前进校验失败：{exc}，停止任务链") from exc
+
+        state.advance_batch()
+        at_bottom = observation.shortfall or observation.stopped
+        state.confirm_viewport(new_top, state.row_phase_px or 0.0, at_top=False, at_bottom=at_bottom)
+        state.clear_scroll()
+        self._set_status("scroll", f"+{advanced} 行", "")
+        if at_bottom:
+            self.log.info("滚动被端点截停（请求 %d 实际 %d），标记到底", rows, advanced)
+        return advanced > 0 or at_bottom
+
+    # ---------------------------------------------------------------- 详情与强化
 
     def _parse_disc(self, image: QImage) -> Disc | None:
         return self._read_disc_with_retry(image, parse_disc, "detail")
@@ -540,7 +766,7 @@ class Runner:
     UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
 
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
-        # UPGRADE 在 _run_job 里内联处理（需要 rescan/计数联动），这里只管其余动作。
+        # UPGRADE 在 _process_cell 里内联处理（需要 rescan/计数联动），这里只管其余动作。
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
         # R 是开关：按之前必须看 disc.discarded，否则打标签会变成摘标签（反之亦然）。
         if action == Action.MARK_DISCARD:
@@ -705,7 +931,7 @@ class Runner:
         self,
         hwnd: int,
         job: TaskJob,
-        key: tuple[int, int],
+        global_index: int,
         cell_tag: str,
         sub_preset: Preset,
         accepted_ids,
@@ -723,15 +949,20 @@ class Runner:
             image, *_ = self._grab(allow_esc=False)
             disc = self._read_disc_with_retry(image, parse_disc_upgrade_page, "upgrade")
             if self._detail_disc is not None:
-                disc = replace(disc, rarity=self._detail_disc.rarity, locked=self._detail_disc.locked,
-                               equipped=self._detail_disc.equipped, discarded=False)
+                disc = replace(
+                    disc,
+                    rarity=self._detail_disc.rarity,
+                    locked=self._detail_disc.locked,
+                    equipped=self._detail_disc.equipped,
+                    discarded=False,
+                )
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
             if decision.action == Action.STOP:
                 self._record(job, disc, decision)
                 self.log.warning("cell %s 强化页判断不确定 (%s)，停止任务链", cell_tag, decision.reason)
                 self.trace.fail("upgrade", "decide", f"判断不了：{decision.reason}，停止任务链", image=image)
                 raise RunnerError(f"{cell_tag} 判断不确定：{decision.reason}，停止任务链")
-            elif decision.action == Action.UPGRADE:
+            if decision.action == Action.UPGRADE:
                 if upgraded >= _MAX_STAGE_UPGRADES or disc.level >= MAX_LEVEL:
                     self.log.info(
                         "cell %s 升级停止（level %d / 升了 %d 次），回网格", cell_tag, disc.level, upgraded
@@ -747,24 +978,23 @@ class Runner:
                 if not self._upgrade_once(hwnd):
                     raise RunnerError(f"{cell_tag} 强化按钮识别失败，停止任务链")
                 upgraded += 1
-                up_counts[key] = up_counts.get(key, 0) + 1
+                up_counts[global_index] = up_counts.get(global_index, 0) + 1
                 self._record(job, disc, decision)
                 self.log.info("cell %s UPGRADE done, level %d -> 强化页重判", cell_tag, disc.level)
                 self._set_status("upgraded", f"level {disc.level}", cell_tag)
                 continue  # 留强化页再判断
-            elif decision.action == Action.MARK_DISCARD:
+            if decision.action == Action.MARK_DISCARD:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)
                 self.trace.ok("upgrade", "decide", f"判为弃置：{decision.reason}")
                 self._record(job, disc, decision)
                 self._discard_from_upgrade(hwnd)
                 return
-            else:
-                # SKIP：不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
-                self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
-                self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
-                self._record(job, disc, decision)
-                self._esc_back_to_grid(hwnd)
-                return
+            # SKIP：不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
+            self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
+            self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
+            self._record(job, disc, decision)
+            self._esc_back_to_grid(hwnd)
+            return
 
     def _record(self, job: TaskJob, disc: Disc, decision: Decision) -> None:
         self.results.append(
@@ -776,4 +1006,3 @@ class Runner:
                 level=disc.level,
             )
         )
-

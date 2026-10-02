@@ -10,7 +10,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
-from zzz_ddtool.equipped import tile_has_portrait
+from zzz_ddtool.equipped import tile_has_portrait, tile_is_selected
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture(scope="module")
@@ -43,3 +45,13 @@ def test_user_equipped_tile_if_present(qapp: QApplication) -> None:
     image = QImage(str(sample))
     assert not image.isNull()
     assert tile_has_portrait(image, 0, 0, image.width(), image.height()) is True
+
+
+@pytest.mark.parametrize("width,height", [(1920, 1080), (1280, 720)])
+def test_tile_is_selected_on_real_fixture(qapp: QApplication, width, height) -> None:
+    """实拍夹具：选中框在黄↔黄绿闪现动画下也要识别，且不误判邻格与未选中图。"""
+    before = QImage(str(FIXTURES / "grid-before-autoscroll.png")).scaled(width, height)
+    after = QImage(str(FIXTURES / "grid-after-autoscroll.png")).scaled(width, height)
+    assert tile_is_selected(after, 166, 616)
+    assert not tile_is_selected(after, 301, 616)
+    assert not tile_is_selected(before, 166, 616)
