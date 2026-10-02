@@ -298,7 +298,7 @@ def _cmd_decide(args: argparse.Namespace) -> int:
 
 def _cmd_preview(args: argparse.Namespace) -> int:
     preset = load_preset(args.config)
-    cards = enumerate_all(preset.weights, hide_junk_bonus=not args.show_junk_bonus)
+    cards = enumerate_all(preset.effective_weights(), hide_junk_bonus=not args.show_junk_bonus)
     dest = args.out or _default_preview_path()
     write_cards_html(
         cards,

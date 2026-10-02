@@ -12,10 +12,38 @@ from zzz_ddtool.gui import MainWindow, WeightEditor
 from zzz_ddtool.models import Action, Disc, Substat
 
 
+def wait_until(qapp, predicate, timeout=10):
+    import time
+    from PySide6.QtTest import QTest
+
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        qapp.processEvents()
+        QTest.qWait(5)
+    assert predicate(), "Timed out waiting for the GUI worker"
+
+
+def refresh_cards(window, qapp):
+    window.rebuild_cards()
+    wait_until(qapp, lambda: window._preview_thread is None and not window._preview_timer.isActive())
+    assert not window._preview_dirty, window.status.text()
+
+
 @pytest.fixture(scope="module")
 def qapp() -> QApplication:
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def isolated_archives(tmp_path, monkeypatch):
+    from zzz_ddtool import paths
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
+    monkeypatch.setattr(paths, "user_data_root", lambda: tmp_path / "application-root")
+    monkeypatch.setattr(paths, "legacy_plan_dirs", lambda: (tmp_path / "legacy" / "data",))
+    monkeypatch.setattr(paths, "legacy_archives_file", lambda: tmp_path / "legacy" / "archives.json")
 
 
 def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
@@ -25,7 +53,7 @@ def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
     # 右侧是选中任务的镜像：先建一个任务、编上词条，才有卡片可看
     window._add_job()
     window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
-    window.rebuild_cards()
+    refresh_cards(window, qapp)
     visible = sum(1 for section in window.sections.values() for card in section.cards if not card.isHidden())
     assert len(list(window.sections.values())[0].cards) > 0
     assert visible > 0
@@ -54,7 +82,7 @@ def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     window.weight_editor.set_weights({"暴击率": 1.0})
     preset = window.collect_preset()
     assert preset.weights == {"暴击率": 1.0}
-    assert preset.accepted is not None
+    assert preset.accepted is None  # Default selection does not need a generated whitelist.
     assert decide_sample(preset) in {Action.UPGRADE, Action.MARK_DISCARD, Action.SKIP, Action.STOP}
     window.close()
 
@@ -105,8 +133,8 @@ def test_mainstat_excluded_from_substat_cards(qapp: QApplication, tmp_path) -> N
     window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.2})
     window.filter_main_boxes["暴击伤害"].setChecked(True)
     qapp.processEvents()
-    window.rebuild_cards()
-    assert "暴击伤害" not in window.weight_editor.weights()
+    refresh_cards(window, qapp)
+    assert window.weight_editor.weights()["暴击伤害"] == 1.2
     assert "暴击率" in window.weight_editor.weights()
     names = {
         slot.name
@@ -132,7 +160,7 @@ def test_weight_edit_only_fires_on_commit(qapp: QApplication, tmp_path) -> None:
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
     window.weight_editor.set_weights({"暴击率": 1.0})
-    window.rebuild_cards()
+    refresh_cards(window, qapp)
 
     fires: list[int] = []
     window.weight_editor.changed.connect(lambda: fires.append(1))
@@ -155,6 +183,11 @@ def test_weight_edit_only_fires_on_commit(qapp: QApplication, tmp_path) -> None:
     fires.clear()
     spin.stepUp()  # 点上下箭头是「调一次」，必须即时生效
     assert len(fires) == 1
+    fires.clear()
+    combo = window.weight_editor._rows[0][0]
+    combo.lineEdit().editingFinished.emit()
+    combo.activated.emit(combo.currentIndex())
+    assert not fires, "内容未变化的提交不能取消正在进行的组合计算"
     window.close()
 
 
@@ -379,6 +412,8 @@ def test_task_buttons_and_close_share_controller(qapp, tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "Runner", FakeRunner)
     window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1})
     window.show()
     window.start_btn.click()
     assert entered.wait(3)
@@ -602,7 +637,7 @@ def test_weight_edit_reuses_cards_and_stays_truthful(qapp: QApplication, tmp_pat
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
     window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
-    window.rebuild_cards()
+    refresh_cards(window, qapp)
     assert any(section.cards for section in window.sections.values())
 
     rebuilt = _spy_set_cards(monkeypatch, window)
@@ -610,8 +645,8 @@ def test_weight_edit_reuses_cards_and_stays_truthful(qapp: QApplication, tmp_pat
     # 把「攻击力%」的单价抬到 1.5，跨过 暴击率/暴击伤害 的排序位置
     spin = next(s for combo, s, _ in window.weight_editor._rows if combo.currentText() == "攻击力%")
     spin.setValue(1.5)
-    window._rebuild_timer.stop()  # 不等防抖，直接跑
-    window.rebuild_cards()
+
+    refresh_cards(window, qapp)
 
     assert rebuilt == []  # 一张卡都没重建，走的是复用
     reused = _card_fingerprint(window)
@@ -619,7 +654,7 @@ def test_weight_edit_reuses_cards_and_stays_truthful(qapp: QApplication, tmp_pat
     # 清空所有卡片再全量重建一次，两条路径的结果必须逐张一致
     for section in window.sections.values():
         section.set_cards([], lambda _pattern_id: False)
-    window.rebuild_cards()
+    refresh_cards(window, qapp)
     assert _card_fingerprint(window) == reused
     window.close()
 
@@ -629,7 +664,7 @@ def test_card_count_change_falls_back_to_rebuild(qapp: QApplication, tmp_path, m
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
     window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
-    window.rebuild_cards()
+    refresh_cards(window, qapp)
     before = sum(len(section.cards) for section in window.sections.values())
     assert before > 0
 
@@ -637,11 +672,532 @@ def test_card_count_change_falls_back_to_rebuild(qapp: QApplication, tmp_path, m
 
     spin = next(s for combo, s, _ in window.weight_editor._rows if combo.currentText() == "攻击力%")
     spin.setValue(0.0)  # 置零 = 这个位置的词条不再算「有用词条」
-    window._rebuild_timer.stop()
-    window.rebuild_cards()
+
+    refresh_cards(window, qapp)
 
     after = sum(len(section.cards) for section in window.sections.values())
     assert after < before
     assert rebuilt, "张数变了还走复用，卡片会和图案对不上"
     _card_fingerprint(window)
+    window.close()
+
+
+def test_below_threshold_cards_really_stay_hidden(qapp: QApplication, tmp_path) -> None:
+    """低于门槛的卡不会创建控件，计数与分页均来自过滤后的模型。"""
+    from PySide6.QtCore import Qt
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"攻击力%": 1.0, "暴击率": 1.0, "暴击伤害": 1.0})
+    section = window.sections[("three", 12)]
+    section.require.setValue(5.0)
+    refresh_cards(window, qapp)
+
+    need = section.require.value()
+    assert section.cards
+    assert any(p.score + 1e-9 < need for p in section.patterns)
+    assert all(c.pattern.score + 1e-9 >= need for c in section.cards)
+    explicit = Qt.WidgetAttribute.WA_WState_ExplicitShowHide
+    assert all(not c.isHidden() and c.testAttribute(explicit) for c in section.cards)
+    shown = sum(p.score + 1e-9 >= need for p in section.patterns)
+    assert section.count_label.text() == f"{shown} / {len(section.patterns)} 张"
+    window.close()
+
+
+def test_edits_and_switches_do_not_generate_cards(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import gui
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Editing should not enumerate combinations")
+
+    monkeypatch.setattr(gui, "enumerate_patterns", unexpected)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.add_combo.setCurrentText("暴击率")
+    window.weight_editor._add_from_combo()
+    window.weight_editor._rows[0][1].setValue(1.5)
+    window.max_discs.setValue(7)
+    first_id = window._editing_job_id
+    window._add_job()
+    assert window._jobs[0].weights == {"暴击率": 1.5}
+    assert window._jobs[0].max_discs == 7
+    window.max_discs.setValue(12)
+    window.chain_list.setCurrentRow(0)
+    assert window._editing_job_id == first_id
+    assert window.max_discs.value() == 7
+    assert window._jobs[1].max_discs == 12
+    assert window._preview_thread is None
+    assert not any(s.cards for s in window.sections.values())
+    window.save_current()
+    from zzz_ddtool.config import load_preset
+
+    assert [job.max_discs for job in load_preset(window._path).task_chain] == [7, 12]
+    window.close()
+
+
+def test_pagination_preserves_all_pages_and_bulk_selection(qapp, tmp_path):
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1, "攻击力%": 1, "穿透值": 0.5})
+    refresh_cards(window, qapp)
+    section = window.sections[("four", 15)]
+    assert len(section.patterns) > section.PAGE_SIZE
+    assert len(section.cards) == section.PAGE_SIZE
+    first = section.cards[0].pattern.pattern_id
+    section.cards[0].checkbox.setChecked(False)
+    section.next_btn.click()
+    second = section.cards[0].pattern.pattern_id
+    assert second != first
+    section.cards[0].checkbox.setChecked(False)
+    section.previous_btn.click()
+    assert not section.cards[0].checkbox.isChecked()
+    accepted = window.collect_preset().task_chain[0].accepted
+    assert first not in accepted and second not in accepted
+    assert set(section._ids) - {first, second} <= set(accepted)
+    section.check_visible(False)
+    assert not section.visible_accepted()
+    section.next_btn.click()
+    assert all(not c.checkbox.isChecked() for c in section.cards)
+    section.check_visible(True)
+    assert set(section.visible_accepted()) == set(section._ids)
+    window.close()
+
+
+def test_unrendered_edits_and_thresholds_are_saved_correctly(qapp, tmp_path):
+    from zzz_ddtool.patterns import Pattern, Slot, canonicalize
+    from zzz_ddtool.origin import Origin
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    weights = {"暴击率": 1, "暴击伤害": 0.8}
+    window.weight_editor.set_weights(weights)
+    refresh_cards(window, qapp)
+    window.sections[("four", 0)].check_visible(True)
+    spin = next(s for c, s, _ in window.weight_editor._rows if c.currentText() == "暴击伤害")
+    spin.setValue(1.5)
+    assert window._preview_dirty
+    preset = window.collect_preset()
+    expected = Pattern(Origin.FOUR, 0, canonicalize([
+        Slot("暴击率"), Slot("暴击伤害"), Slot("废词条"), Slot("废词条"),
+    ], preset.weights), 0).pattern_id
+    assert expected in preset.accepted
+    window.sections[("four", 0)].require.setValue(3)
+    assert expected not in window.collect_preset().accepted
+    window.save_current()
+    assert window.save_label.objectName() == "saveState"
+    window.max_discs.setValue(8)
+    assert window.save_label.objectName() == "saveStateIdle"
+    window.close()
+
+
+def test_preview_worker_keeps_gui_responsive_and_discards_stale_result(qapp, tmp_path, monkeypatch):
+    import threading
+    from PySide6.QtCore import QTimer
+    from PySide6.QtTest import QTest
+    from zzz_ddtool import gui
+
+    entered = threading.Event()
+    release = threading.Event()
+    original = gui.enumerate_patterns
+    main_id = threading.get_ident()
+
+    def slow(weights, **kwargs):
+        assert threading.get_ident() != main_id
+        entered.set()
+        assert release.wait(3)
+        return original(weights, **kwargs)
+
+    monkeypatch.setattr(gui, "enumerate_patterns", slow)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1})
+    ticks = []
+    timer = QTimer()
+    timer.setInterval(10)
+    timer.timeout.connect(lambda: ticks.append(1))
+    timer.start()
+    try:
+        window.rebuild_cards()
+        assert entered.wait(1)
+        QTest.qWait(100)
+        assert len(ticks) >= 3
+        # 切换任务让旧结果作废，旧任务的结果不能出现在新任务里。
+        window._add_job()
+        release.set()
+        wait_until(qapp, lambda: window._preview_thread is None)
+        assert not any(s.patterns for s in window.sections.values())
+        assert window.weight_editor.weights() == {}
+    finally:
+        release.set()
+        timer.stop()
+        window.close()
+        wait_until(qapp, lambda: window._preview_thread is None)
+
+
+def test_refresh_requests_coalesce_and_close_waits_for_worker(qapp, tmp_path, monkeypatch):
+    import threading
+    from zzz_ddtool import gui
+
+    entered, release = threading.Event(), threading.Event()
+    original = gui.enumerate_patterns
+
+    def slow(weights, **kwargs):
+        entered.set()
+        release.wait(3)
+        return original(weights, **kwargs)
+
+    monkeypatch.setattr(gui, "enumerate_patterns", slow)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1})
+    try:
+        window.rebuild_cards()
+        assert entered.wait(1)
+        worker = window._preview_thread
+        window.weight_editor._rows[0][1].setValue(2)
+        window.rebuild_cards()
+        window.weight_editor._rows[0][1].setValue(3)
+        window.rebuild_cards()
+        assert window._preview_thread is worker
+        release.set()
+        wait_until(qapp, lambda: window._preview_thread is None and not window._preview_timer.isActive())
+        assert not window._preview_dirty
+        assert max(p.score for s in window.sections.values() for p in s.patterns) == 18
+        entered.clear()
+        release.clear()
+        window.rebuild_cards()
+        assert entered.wait(1)
+        window.close()
+        assert window._closing
+        assert window._preview_thread is not None
+    finally:
+        release.set()
+        window.close()
+        wait_until(qapp, lambda: window._preview_thread is None)
+
+
+def test_utility_runs_off_thread_and_reports_failure(qapp, tmp_path):
+    import threading
+    from PySide6.QtTest import QTest
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    main_id = threading.get_ident()
+
+    def operation():
+        calls.append(threading.get_ident())
+        entered.set()
+        release.wait(3)
+        raise RuntimeError("test failure")
+
+    try:
+        window._start_utility(operation, lambda _result: pytest.fail("Unexpected success"), "working")
+        assert entered.wait(1)
+        QTest.qWait(20)
+        assert calls[0] != main_id
+        assert not window.start_btn.isEnabled()
+        release.set()
+        wait_until(qapp, lambda: window._utility_thread is None)
+        assert window.start_btn.isEnabled()
+        assert "test failure" in window.status.text()
+    finally:
+        release.set()
+        window.close()
+        wait_until(qapp, lambda: window._utility_thread is None)
+
+
+def test_saving_migrates_all_legacy_task_limits(qapp, tmp_path):
+    from zzz_ddtool.config import preset_from_dict, load_preset
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({
+        "run": {"max_discs": 29},
+        "task_chain": [{"slot": 1}, {"slot": 4}, {"slot": 6}],
+    }))
+    window.max_discs.setValue(5)
+    window.save_current()
+    assert [job.max_discs for job in load_preset(window._path).task_chain] == [5, 29, 29]
+    window.close()
+
+
+@pytest.mark.parametrize("slot, mainstat, sibling", [
+    (1, "生命值", "生命值%"),
+    (2, "攻击力", "攻击力%"),
+    (3, "防御力", "防御力%"),
+    (4, "攻击力%", "攻击力"),
+    (5, "生命值%", "生命值"),
+    (6, "防御力%", "防御力"),
+])
+def test_mainstat_has_priority_over_weights_everywhere(qapp, tmp_path, slot, mainstat, sibling):
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window._on_slot_clicked(slot)
+    if slot >= 4:
+        box = window.filter_main_boxes[mainstat]
+        assert box.parent() is window._mainstat_pages[slot]
+        box.setChecked(True)
+    assert mainstat in window._blocked_substats()
+    window.weight_editor.set_weights({
+        mainstat: 20, sibling: 1, "暴击率": 1,
+    })
+    window._selection_seed = (f"four:0:{mainstat}|{sibling}|暴击率|废词条",)
+    refresh_cards(window, qapp)
+    names = {slot.name for s in window.sections.values() for p in s.patterns for slot in p.slots}
+    assert mainstat not in names
+    assert sibling in names
+    preset = window.collect_preset()
+    assert preset.weights[mainstat] == 20
+    assert preset.task_chain[0].weights[mainstat] == 20
+    assert mainstat not in preset.effective_weights()
+    assert preset.accepted == ()
+    for combo, _rolls in window.trial.rows:
+        assert mainstat not in [combo.itemText(i) for i in range(combo.count())]
+    window.close()
+
+
+@pytest.mark.parametrize("slot", [4, 5, 6])
+def test_mainstats_are_exclusive_and_prices_survive_switches(qapp, tmp_path, slot):
+    from zzz_ddtool.config import load_preset
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window._on_slot_clicked(slot)
+    prices = {"生命值%": 2, "攻击力%": 3, "防御力%": 4}
+    window.weight_editor.set_weights(prices)
+    window.filter_main_boxes["生命值%"].click()
+    window.filter_main_boxes["攻击力%"].click()
+    assert window._selected_mains() == ["攻击力%"]
+    assert window.weight_editor.weights() == prices
+    window._add_job()
+    window.chain_list.setCurrentRow(0)
+    assert window._selected_mains() == ["攻击力%"]
+    assert window.weight_editor.weights() == prices
+    window._main_any_by_slot[slot].click()
+    assert window._selected_mains() == []
+    assert window._effective_weights() == prices
+    window.save_current()
+    job = load_preset(window._path).task_chain[0]
+    assert job.weights == prices and job.mainstats == ()
+    window.close()
+
+
+def test_loading_legacy_multi_mainstats_normalizes_unvisited_tasks(qapp, tmp_path):
+    from zzz_ddtool.config import preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({"task_chain": [
+        {"slot": 4, "mainstats": ["暴击伤害", "暴击率"]},
+        {"slot": 5, "mainstats": ["攻击力%", "生命值%"]},
+    ]}))
+    assert [job.mainstats for job in window.collect_preset().task_chain] == [("暴击伤害",), ("攻击力%",)]
+    window.close()
+
+
+def test_archive_empty_name_prompts_and_crud_keeps_raw_prices(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+    from zzz_ddtool import paths
+
+    archive_file = tmp_path / "user" / "archives.json"
+    monkeypatch.setattr(paths, "archives_file", lambda: archive_file)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args: ("通用配价", True))
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 2, "暴击伤害": 3})
+    window.filter_main_boxes["暴击伤害"].click()
+    window.sections[("three", 0)].require.setValue(2)
+    assert not window.archive_apply_btn.isEnabled()
+    window.archive_save_btn.click()
+    assert archive_file.exists()
+    assert window._load_archives()["通用配价"]["weights"]["暴击伤害"] == 3
+    assert window.archive_apply_btn.isEnabled()
+    window.weight_editor.set_weights({"攻击力%": 1})
+    window.sections[("three", 0)].require.setValue(9)
+    window._selection_seed = ()
+    window.archive_apply_btn.click()
+    assert window.weight_editor.weights() == {"暴击率": 2, "暴击伤害": 3}
+    assert window.sections[("three", 0)].require.value() == 2
+    assert window.collect_preset().accepted is None
+    assert window._preview_dirty
+    window.weight_editor.set_weights({"暴击率": 4})
+    window.archive_save_btn.click()
+    assert window._load_archives()["通用配价"]["weights"] == {"暴击率": 4}
+    window.archive_delete_btn.click()
+    assert window._load_archives() == {}
+    assert not window.archive_apply_btn.isEnabled()
+    window.close()
+
+
+def test_archive_failure_does_not_destroy_existing_file(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import paths
+
+    archive_file = tmp_path / "archives.json"
+    monkeypatch.setattr(paths, "archives_file", lambda: archive_file)
+    archive_file.write_text("{broken", encoding="utf-8")
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.archive_combo.setCurrentText("new")
+    window._save_archive()
+    assert archive_file.read_text(encoding="utf-8") == "{broken"
+    assert "失败" in window.archive_status.text()
+    archive_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(window, "_write_archives", lambda _data: (_ for _ in ()).throw(OSError("disk full")))
+    window._save_archive()
+    assert "disk full" in window.archive_status.text()
+    window.close()
+
+
+def test_archive_migration_survives_exe_changes_and_keeps_legacy_file(qapp, tmp_path, monkeypatch):
+    import json
+    from zzz_ddtool import paths
+
+    legacy = tmp_path / "old-version" / "user" / "archives.json"
+    legacy.parent.mkdir(parents=True)
+    initial = {"original": {"weights": {"暴击率": 2}, "stage_require": {"three": {"0": 2}}}}
+    original_text = json.dumps(initial)
+    legacy.write_text(original_text, encoding="utf-8")
+    monkeypatch.setattr(paths, "legacy_archives_file", lambda: legacy)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    target = paths.archives_file()
+    assert target.exists() and window._load_archives() == initial
+    assert legacy.read_text(encoding="utf-8") == original_text
+    window._write_archives({"new": {"weights": {"暴击率": 3}}})
+    monkeypatch.setattr(paths, "base_dir", lambda: tmp_path / "new-version")
+    monkeypatch.setattr(paths, "legacy_archives_file", lambda: tmp_path / "new-version" / "user" / "archives.json")
+    assert paths.archives_file() == target
+    assert window._load_archives() == {"new": {"weights": {"暴击率": 3}}}
+    window._write_archives({})
+    monkeypatch.setattr(paths, "legacy_archives_file", lambda: legacy)
+    assert window._load_archives() == {}  # 删除完后不能从旧文件重新恢复。
+    window.close()
+
+
+def test_applying_archive_without_task_creates_a_task(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import paths
+
+    monkeypatch.setattr(paths, "archives_file", lambda: tmp_path / "archives.json")
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._write_archives({"saved": {"weights": {"暴击率": 2}}})
+    window._refresh_archive_combo("saved")
+    window.archive_apply_btn.click()
+    assert len(window._jobs) == 1
+    assert window.collect_preset().task_chain[0].weights == {"暴击率": 2}
+    window.close()
+
+
+def test_start_rejects_tasks_without_effective_prices(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text: errors.append(text))
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._on_start_clicked()
+    assert "添加" in errors[-1]
+    window._add_job()
+    window._on_slot_clicked(1)
+    window.weight_editor.set_weights({"生命值": 2})
+    window._on_start_clicked()
+    assert "正权重" in errors[-1]
+    assert window._run_thread is None
+    window.close()
+
+
+def test_counts_and_bulk_selection_share_the_active_origin(qapp, tmp_path):
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1})
+    refresh_cards(window, qapp)
+    for index, origin in enumerate(("three", "four")):
+        window.tabs.setCurrentIndex(index)
+        window.sections[(origin, 0)].require.setValue(2)
+        sections = window._current_sections()
+        visible = sum(len(section._visible_indices) for section in sections)
+        total = sum(len(section.patterns) for section in sections)
+        assert total > visible > 0
+        window._check_visible(False)
+        assert f"组合共 {total} 种，符合门槛 {visible}，已勾选 0" in window.status.text()
+        assert all(not section.visible_accepted() for section in sections)
+        window._check_visible(True)
+        assert f"已勾选 {visible}" in window.status.text()
+        assert sum(len(section.visible_accepted()) for section in sections) == visible
+    window.close()
+
+
+def test_save_without_preview_keeps_all_tasks_and_manual_choices(qapp, tmp_path):
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.runner import Runner
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 20})
+    window.filter_main_boxes["暴击伤害"].click()
+    refresh_cards(window, qapp)
+    section = window.sections[("four", 0)]
+    pid = next(pid for pid in section.visible_accepted() if "暴击率" in pid)
+    next(card for card in section.cards if card.pattern.pattern_id == pid).checkbox.click()
+    window._add_job()
+    window._on_slot_clicked(6)
+    window.weight_editor.set_weights({"攻击力%": 3})
+    window.max_discs.setValue(15)
+    assert window._preview_dirty
+    window.save_current()
+    saved = load_preset(window._path)
+    first, second = saved.task_chain
+    assert first.weights == {"暴击率": 1, "暴击伤害": 20}
+    assert pid not in first.accepted and len(first.accepted) > 0
+    assert second.weights == {"攻击力%": 3} and second.accepted is None
+    assert second.max_discs == 15
+    runner = Runner(saved)
+    assert runner._jobs() == saved.task_chain
+    assert runner._sub_preset(first).effective_weights() == {"暴击率": 1}
+    disc = Disc(level=0, substats=tuple(Substat(name) for name in ("暴击率", "生命值", "攻击力", "防御力")))
+    from zzz_ddtool.decide import decide
+
+    decision = decide(disc, runner._sub_preset(first), first.accepted)
+    assert decision.pattern_id == pid and decision.action is Action.MARK_DISCARD
+    disc2 = Disc(level=0, substats=tuple(Substat(name) for name in ("攻击力%", "生命值", "攻击力", "防御力")))
+    assert decide(disc2, runner._sub_preset(second), second.accepted).action is Action.UPGRADE
+    window._apply_preset(saved)
+    refresh_cards(window, qapp)
+    assert pid not in window.sections[("four", 0)].visible_accepted()
+    window.close()
+
+
+def test_shared_mainstat_controls_follow_the_active_slot(qapp, tmp_path):
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    first = window._editing_job_id
+    window.filter_main_boxes["攻击力%"].setChecked(True)
+    assert window._selected_mains() == ["攻击力%"]
+    window._add_job()
+    window._on_slot_clicked(5)
+    assert not window.filter_main_boxes["攻击力%"].isChecked()
+    window.filter_main_boxes["生命值%"].setChecked(True)
+    window.chain_list.setCurrentRow(0)
+    assert window._editing_job_id == first
+    assert window.filter_main_boxes["攻击力%"].isChecked()
+    assert not window.filter_main_boxes["生命值%"].isChecked()
+    assert window._blocked_substats() == {"攻击力%"}
+    assert window._jobs[1].mainstats == ("生命值%",)
+    window.close()
+
+
+def test_gui_disables_legacy_useful_quota_for_all_tasks(qapp, tmp_path):
+    from PySide6.QtWidgets import QLabel
+    from zzz_ddtool.config import preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({
+        "min_useful_types": 4,
+        "slot_plans": {5: {"min_useful_types": 3}},
+        "task_chain": [
+            {"slot": 4, "weights": {"暴击率": 1}, "min_useful_types": 4},
+            {"slot": 5, "weights": {"暴击率": 1}, "min_useful_types": 3},
+        ],
+    }))
+    preset = window.collect_preset()
+    assert preset.min_useful_types == 0
+    assert all(job.min_useful_types == 0 for job in preset.task_chain)
+    assert all(plan["min_useful_types"] == 0 for plan in preset.slot_plans.values())
+    assert not hasattr(window, "min_useful")
+    assert "最少有效种类" not in [label.text() for label in window.findChildren(QLabel)]
     window.close()

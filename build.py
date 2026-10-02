@@ -1,4 +1,4 @@
-"""打包脚本：PyInstaller onedir + 复制 data/ 到 exe 同级 + 写 version.txt。
+"""打包脚本：PyInstaller onedir + 复制运行资源（不含任务 YAML）+ 写 version.txt。
 
 用法（家用 / 工作两机跑同一套）::
 
@@ -30,6 +30,14 @@ DEFAULT_OUTDIR = ROOT / "dist"
 def _read_version() -> str:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return str(data["project"]["version"])
+
+
+def copy_runtime_data(source: Path, target: Path) -> None:
+    """YAML files are saved task plans, not release resources."""
+    def ignore_plans(directory: str, names: list[str]) -> list[str]:
+        return [name for name in names if Path(name).suffix.lower() in {".yaml", ".yml"}]
+
+    shutil.copytree(source, target, ignore=ignore_plans, dirs_exist_ok=True)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -75,8 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         check=True,
     )
 
-    # 复制 data/ 到 exe 同级（数据独立更新，改套装名/词条名不用重打 exe）
-    shutil.copytree(ROOT / "data", pkg_dir / "data", dirs_exist_ok=True)
+    # 只复制运行资源；任务存档留在公共根目录的 user/plan。
+    copy_runtime_data(ROOT / "data", pkg_dir / "data")
 
     # 写 version.txt（exe 同级，程序启动读它取本地版本号）
     (pkg_dir / "version.txt").write_text(version + "\n", encoding="utf-8")

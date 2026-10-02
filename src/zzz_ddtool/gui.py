@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 import sys
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QInputDialog,
     QStackedWidget,
     QHBoxLayout,
     QLabel,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -52,9 +53,11 @@ from PySide6.QtWidgets import (
 from zzz_ddtool.chain import TaskJob, job_from_dict, new_job_id
 from zzz_ddtool.config import Preset, load_preset, preset_from_dict, save_preset
 from zzz_ddtool.gamedata import (
+    FIXED_MAINSTATS,
     SETS,
     SLOTS,
     SUBSTAT_NAMES,
+    blocked_substats,
     empty_slot_plan,
     selectable_mainstats,
 )
@@ -62,7 +65,10 @@ from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
-from zzz_ddtool.patterns import CHECKPOINTS, EMPTY, JUNK, Pattern, enumerate_all
+from zzz_ddtool.patterns import (
+    CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize,
+    enumerate_patterns, first_filter, score_slots, useful_ordered,
+)
 
 # 词条下拉的顺序偏好：常用的排前面（双爆最常用）。
 #
@@ -294,17 +300,26 @@ def last_config_path() -> Path | None:
     if not value:
         return None
     path = Path(value)
-    return path if path.exists() else None
+    from zzz_ddtool.userdata import persistent_config_path
+
+    persistent = persistent_config_path(path)
+    if persistent.exists():
+        if persistent != path:
+            remember_config_path(persistent)
+        return persistent
+    return None
 
 
 def default_config_path() -> Path:
-    """启动时打开哪份 yaml：优先用上次打开的，否则用自带的 example.yaml。"""
+    """打开公共存档目录中的上次配置，默认档也是普通可编辑存档。"""
+    from zzz_ddtool.paths import plans_dir
+    from zzz_ddtool.userdata import migrate_plans
+
+    migrate_plans()
     remembered = last_config_path()
     if remembered is not None:
         return remembered
-    from zzz_ddtool.paths import data_dir
-
-    return data_dir() / "example.yaml"
+    return plans_dir() / "example.yaml"
 
 
 class FlowLayout(QLayout):
@@ -489,6 +504,7 @@ class PatternCard(QFrame):
 class StageSection(QWidget):
     require_changed = Signal()
     selection_changed = Signal()
+    PAGE_SIZE = 24
 
     def __init__(
         self,
@@ -501,11 +517,17 @@ class StageSection(QWidget):
         self.origin = origin
         self.checkpoint = checkpoint
         self.cards: list[PatternCard] = []
+        self.patterns: list[Pattern] = []
+        self._ids: list[str] = []
+        self._checked: set[str] = set()
+        self._visible_indices: list[int] = []
+        self._page = 0
 
         self.require = QDoubleSpinBox()
         self.require.setDecimals(1)
         self.require.setRange(0.0, 30.0)
         self.require.setSingleStep(0.1)
+        self.require.setKeyboardTracking(False)
         self.require.setFixedWidth(72)
         self.require.setFixedHeight(24)
         self.require.setValue(0.0 if require is None else require)
@@ -538,88 +560,119 @@ class StageSection(QWidget):
         layout.setContentsMargins(0, 4, 0, 14)
         layout.addWidget(bar)
         layout.addWidget(self.flow_host)
+        paging = QHBoxLayout()
+        self.previous_btn = QPushButton()
+        self.previous_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.previous_btn.setToolTip("上一页")
+        self.next_btn = QPushButton()
+        self.next_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.next_btn.setToolTip("下一页")
+        self.page_label = QLabel()
+        self.previous_btn.clicked.connect(lambda: self._change_page(-1))
+        self.next_btn.clicked.connect(lambda: self._change_page(1))
+        paging.addStretch()
+        paging.addWidget(self.previous_btn)
+        paging.addWidget(self.page_label)
+        paging.addWidget(self.next_btn)
+        layout.addLayout(paging)
+        self.apply_filter()
 
     def set_cards(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
+        self._set_patterns(patterns, is_checked)
+        self.apply_filter()
+
+    def _set_patterns(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
+        self.patterns = patterns
+        self._ids = [pattern.pattern_id for pattern in patterns]
+        self._checked = {pid for pid in self._ids if is_checked(pid)}
+        self._page = 0
+
+    def _clear_cards(self) -> None:
         while self.flow.count():
-            item = self.flow.takeAt(0)
-            if item is None:
-                break
-            widget = item.widget()
+            item = self.flow.takeAt(self.flow.count() - 1)
+            widget = item.widget() if item is not None else None
             if widget is not None:
-                # takeAt 只是把它移出布局，控件还是 flow_host 的子控件、还会被画在
-                # 原来的位置上。必须再摘掉父级，否则重建期间旧卡和新卡叠着显示。
+                widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
         self.cards = []
-        for pattern in patterns:
-            card = PatternCard(pattern, checked=bool(is_checked(pattern.pattern_id)))
-            card.toggled.connect(self.selection_changed.emit)
-            self.flow.addWidget(card)
-            self.cards.append(card)
-        self.apply_filter()
+
+    def _render_page(self) -> None:
+        start = self._page * self.PAGE_SIZE
+        indices = self._visible_indices[start:start + self.PAGE_SIZE]
+        if len(indices) != len(self.cards):
+            self._clear_cards()
+            for index in indices:
+                card = PatternCard(self.patterns[index], checked=self._ids[index] in self._checked)
+                card.toggled.connect(lambda c=card: self._on_card_toggled(c))
+                self.flow.addWidget(card)
+                self.cards.append(card)
+        else:
+            for card, index in zip(self.cards, indices):
+                card.set_pattern(self.patterns[index])
+                card.set_checked_silent(self._ids[index] in self._checked)
+        for card in self.cards:
+            card.setVisible(True)
+        pages = max(1, (len(self._visible_indices) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page_label.setText(f"{self._page + 1} / {pages}")
+        self.previous_btn.setEnabled(self._page > 0)
+        self.next_btn.setEnabled(self._page + 1 < pages)
+        self.flow_host.updateGeometry()
+        self.updateGeometry()
+
+    def _change_page(self, delta: int) -> None:
+        pages = max(1, (len(self._visible_indices) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self._page = min(pages - 1, max(0, self._page + delta))
+        self._render_page()
+
+    def _on_card_toggled(self, card: PatternCard) -> None:
+        pid = card.pattern.pattern_id
+        if card.checkbox.isChecked():
+            self._checked.add(pid)
+        else:
+            self._checked.discard(pid)
+        self.selection_changed.emit()
 
     def can_reuse(self, patterns: list[Pattern]) -> bool:
-        """能否原地复用现有卡片。
-
-        判据只看**张数**，不逐位比 pattern_id。原因：改词条单价时穷举的是同一个
-        组合空间，每个阶段的张数一张不差（实测 4 词条场景 837 张、12 个阶段的分
-        布完全不变），变的只是分值，以及「分值降序」带来的排列顺序。
-
-        原先这里逐位比 pattern_id，顺序一动就判定「不匹配」，于是每改一下单价都
-        要销毁重建整屏——摘除旧卡 1.3s + 构造新卡 1.2s，这就是卡顿的来源。
-        """
-        if len(patterns) != len(self.cards):
-            return False
-        # 行数必须对得上，否则 set_pattern 没法逐行改（正常情况下恒为 4，兜底而已）
-        return all(len(card.pattern.slots) == len(pattern.slots) for card, pattern in zip(self.cards, patterns))
+        return len(patterns) == len(self.patterns)
 
     def reuse_cards(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
-        """复用既有卡片：就地改写分值/行文字/勾选态，不摘除也不重建。"""
-        for card, pattern in zip(self.cards, patterns):
-            card.set_pattern(pattern)
-            # 勾选态绝大多数时候没变，先在本地比一次再调用；set_checked_silent 内部
-            # 虽然也会提前返回，但八百多次跨 Qt 边界的方法调用本身就要一百多毫秒。
-            wanted = bool(is_checked(pattern.pattern_id))
-            if card.checkbox.isChecked() != wanted:
-                card.set_checked_silent(wanted)
+        self._set_patterns(patterns, is_checked)
         self.apply_filter()
 
     def apply_filter(self) -> None:
         need = self.require.value()
-        shown = 0
-        for card in self.cards:
-            visible = card.pattern.score + 1e-9 >= need
-            # 同值再调 setVisible 会白走一遍 show()/hide() 的内部流程，复用路径上
-            # 绝大多数卡片的可见性根本没变，先比一下省掉。
-            if card.isHidden() == visible:
-                card.setVisible(visible)
-            if not card.isHidden():
-                shown += 1
-        self.count_label.setText(f"{shown} / {len(self.cards)} 张")
-        self.flow_host.updateGeometry()
-        self.updateGeometry()
+        self._visible_indices = [
+            i for i, pattern in enumerate(self.patterns) if pattern.score + 1e-9 >= need
+        ]
+        self._page = 0
+        self.count_label.setText(f"{len(self._visible_indices)} / {len(self.patterns)} 张")
+        self._render_page()
 
     def check_visible(self, on: bool) -> None:
+        ids = {self._ids[i] for i in self._visible_indices}
+        if on:
+            self._checked.update(ids)
+        else:
+            self._checked.difference_update(ids)
         for card in self.cards:
-            if not card.isHidden():
-                card.checkbox.setChecked(on)
+            card.set_checked_silent(on)
+        self.selection_changed.emit()
 
     def visible_accepted(self) -> list[str]:
-        return [card.pattern.pattern_id for card in self.cards if card.accepted]
+        return [self._ids[i] for i in self._visible_indices if self._ids[i] in self._checked]
 
     def _on_require(self, _value: float) -> None:
         self.apply_filter()
         self.require_changed.emit()
-        self.selection_changed.emit()
-
 
 class WeightEditor(QWidget):
     changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._blocked: set[str] = set()
         self._rows: list[tuple[QComboBox, QDoubleSpinBox, QWidget]] = []
+        self._last_weights: dict[str, float] = {}
         self._box = QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._rows_box = QVBoxLayout()
@@ -635,56 +688,35 @@ class WeightEditor(QWidget):
         add_row.addWidget(add_btn)
         self._box.addLayout(add_row)
 
-    def set_blocked(self, names: set[str]) -> None:
-        self._blocked = set(names)
-        self._refresh_add_combo()
-        dropped = False
-        for combo, _spin, row in list(self._rows):
-            if combo.currentText().strip() in self._blocked:
-                self._remove_row(row)
-                dropped = True
-        if dropped:
-            self.changed.emit()
-
     def set_weights(self, weights: dict[str, float]) -> None:
+        previous_block = self.blockSignals(True)
         while self._rows:
             self._remove_row(self._rows[0][2])
         for name, value in weights.items():
-            # 主属性（被 blocked）本来就不该当副词条；非副词条的名字则是配置里的脏数据
-            # （历史配置出现过「穿透率」），放进来下拉框会多出游戏里选不中的词条。
-            if name in self._blocked or name not in SUBSTAT_NAMES:
+            if name not in SUBSTAT_NAMES:
                 continue
             self._add_row(name, value)
+        self._last_weights = self.weights()
+        self.blockSignals(previous_block)
+
+    def _notify_changed(self) -> None:
+        current = self.weights()
+        if current != self._last_weights:
+            self._last_weights = current
+            self.changed.emit()
 
     def weights(self) -> dict[str, float]:
         out: dict[str, float] = {}
         for combo, spin, _row in self._rows:
             name = combo.currentText().strip()
-            if not name or name in self._blocked:
+            if name not in SUBSTAT_NAMES:
                 continue
             out[name] = float(spin.value())
         return out
 
     def _choices(self) -> list[str]:
-        """下拉候选：只给真正的副词条，减去当前被 blocked 的主属性。
-
-        这里原先有一句「current 不在候选里就插到最前面」的兜底，本意是别让已选中的值
-        消失；实际效果是**把配置里的脏名字（如「穿透率」）原样塞回下拉框**，于是下拉框
-        多出游戏里选不中的词条。现在不注入了：set_weights 已挡掉非法名，用户自己敲进来
-        的名字由 editable 下拉框自己显示。
-        """
-        return [name for name in KNOWN_SUBSTATS if name not in self._blocked]
-
-    def _refresh_add_combo(self) -> None:
-        current = self.add_combo.currentText()
-        self.add_combo.blockSignals(True)
-        self.add_combo.clear()
-        self.add_combo.addItems(self._choices())
-        # 只回填合法名。add_combo 是可编辑的，用户敲过的脏名字（如「穿透率」）不该
-        # 在这里被留下——那等于把刚挡掉的脏名又塞回候选。
-        if current in SUBSTAT_NAMES and current not in self._blocked:
-            self.add_combo.setCurrentText(current)
-        self.add_combo.blockSignals(False)
+        """单价表保留全部合法副词条，主属性排除只发生在计算侧。"""
+        return list(KNOWN_SUBSTATS)
 
     def _add_from_combo(self) -> None:
         name = self.add_combo.currentText().strip()
@@ -694,11 +726,10 @@ class WeightEditor(QWidget):
             not name
             or name not in SUBSTAT_NAMES
             or name in self.weights()
-            or name in self._blocked
         ):
             return
         self._add_row(name, 1.0)
-        self.changed.emit()
+        self._notify_changed()
 
     def _add_row(self, name: str, value: float) -> None:
         row = QWidget()
@@ -724,9 +755,9 @@ class WeightEditor(QWidget):
         remove.clicked.connect(lambda: self._delete(row))
         # 词条名同理：这是个可编辑下拉框，正在输入名字时不必每敲一个字就重算。
         # 从下拉列表里选中（activated）和输入完按回车/失焦（editingFinished）都要认。
-        combo.activated.connect(lambda *_: self.changed.emit())
-        combo.lineEdit().editingFinished.connect(lambda: self.changed.emit())
-        spin.valueChanged.connect(lambda *_: self.changed.emit())
+        combo.activated.connect(lambda *_: self._notify_changed())
+        combo.lineEdit().editingFinished.connect(self._notify_changed)
+        spin.valueChanged.connect(lambda *_: self._notify_changed())
         combo.setFixedWidth(150)
         layout.addWidget(combo)
         layout.addWidget(spin)
@@ -737,7 +768,7 @@ class WeightEditor(QWidget):
 
     def _delete(self, row: QWidget) -> None:
         self._remove_row(row)
-        self.changed.emit()
+        self._notify_changed()
 
     def _remove_row(self, row: QWidget) -> None:
         """摘掉一行，并立刻把它从界面上拿下来。
@@ -938,13 +969,18 @@ class MainWindow(QMainWindow):
         self.resize(1320, 820)
         self._path = Path(config_path) if config_path else default_config_path()
         self._loading = False
-        self._rebuilding = False
-        self._rebuild_pending = False
-        self._busy_cursor = False
-        self._rebuild_timer = QTimer(self)
-        self._rebuild_timer.setSingleShot(True)
-        self._rebuild_timer.setInterval(250)
-        self._rebuild_timer.timeout.connect(self.rebuild_cards)
+        self._preview_dirty = True
+        self._selection_seed: tuple[str, ...] | None = None
+        self._preview_generation = 0
+        self._preview_thread = None
+        self._preview_request = None
+        self._preview_install = []
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._install_preview_section)
+        self._closing = False
+        self._exit_after_close: int | None = None
+        self._utility_thread = None
         self.sections: dict[tuple[str, int], StageSection] = {}
         self._active_slot = 4
         self._slot_plans: dict[int, dict] = {slot: empty_slot_plan(slot) for slot in SLOTS}
@@ -998,6 +1034,9 @@ class MainWindow(QMainWindow):
         self._log_tail = None
         self._refresh_run_status()
         self._load_path(self._path)
+        for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
+            box.toggled.connect(self._mark_unsaved)
+        self.max_discs.valueChanged.connect(self._mark_unsaved)
 
     def _build_header(self) -> QHBoxLayout:
         titles = QVBoxLayout()
@@ -1006,6 +1045,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("bannerTitle")
         hint = QLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就新建任务，不必凑齐 6 个。")
         hint.setObjectName("hint")
+        hint.setWordWrap(True)
         self.path_label = QLabel()
         self.path_label.setObjectName("hint")
         # 保存状态常驻标签：固定在标题行右端，不占用文件名位置。
@@ -1082,11 +1122,14 @@ class MainWindow(QMainWindow):
         self.archive_combo = QComboBox()
         self.archive_combo.setEditable(True)
         self.archive_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        apply_btn = QPushButton("套用")
+        self.archive_combo.lineEdit().setPlaceholderText("选择或输入存档名称")
+        self._archive_names: set[str] = set()
+        self.archive_combo.currentTextChanged.connect(self._update_archive_buttons)
+        self.archive_apply_btn = apply_btn = QPushButton("套用")
         apply_btn.clicked.connect(self._apply_archive)
-        save_btn = QPushButton("存入当前")
+        self.archive_save_btn = save_btn = QPushButton("保存存档")
         save_btn.clicked.connect(self._save_archive)
-        del_btn = QPushButton("删除")
+        self.archive_delete_btn = del_btn = QPushButton("删除")
         del_btn.clicked.connect(self._delete_archive)
         arow1 = QHBoxLayout()
         arow1.addWidget(self.archive_combo, 1)
@@ -1097,9 +1140,13 @@ class MainWindow(QMainWindow):
         arow2.addStretch()
         archive_layout.addLayout(arow1)
         archive_layout.addLayout(arow2)
+        self.archive_status = QLabel()
+        self.archive_status.setWordWrap(True)
+        self.archive_status.setObjectName("hint")
+        archive_layout.addWidget(self.archive_status)
         layout.addWidget(archive_box)
 
-        flags_box = QGroupBox("硬过滤")
+        flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
         self.require_s = QCheckBox("只要 S 级")
         self.skip_locked = QCheckBox("跳过锁定")
@@ -1108,13 +1155,9 @@ class MainWindow(QMainWindow):
         for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
             box.setChecked(True)
             flags.addWidget(box)
-        useful_row = QHBoxLayout()
-        useful_row.addWidget(QLabel("最少有效种类"))
-        self.min_useful = QSpinBox()
-        self.min_useful.setRange(0, 4)
-        useful_row.addWidget(self.min_useful)
-        useful_row.addStretch()
-        flags.addLayout(useful_row)
+        layout.addWidget(flags_box)
+        task_box = QGroupBox("当前任务限制")
+        task_limits = QVBoxLayout(task_box)
         limit_row = QHBoxLayout()
         limit_row.addWidget(QLabel("本次最多处理"))
         self.max_discs = QSpinBox()
@@ -1123,8 +1166,8 @@ class MainWindow(QMainWindow):
         limit_row.addWidget(self.max_discs)
         limit_row.addWidget(QLabel("个盘子"))
         limit_row.addStretch()
-        flags.addLayout(limit_row)
-        layout.addWidget(flags_box)
+        task_limits.addLayout(limit_row)
+        layout.addWidget(task_box)
 
         self._filter_sets: list[str] = []
         self._filter_dialog = QDialog(self)
@@ -1151,13 +1194,16 @@ class MainWindow(QMainWindow):
         self.filter_slots[4].setChecked(True)
         self.slot_group.idClicked.connect(self._on_slot_clicked)
         slots_row.addStretch()
-        self._all_main_boxes: dict[str, QCheckBox] = {}
-        self.filter_main_boxes: dict[str, QCheckBox] = {}
+        self._main_boxes_by_slot: dict[int, dict[str, QRadioButton]] = {}
+        self.filter_main_boxes: dict[str, QRadioButton] = {}
+        self._main_groups: dict[int, QButtonGroup] = {}
+        self._main_any_by_slot: dict[int, QRadioButton] = {}
         self.main_host = QStackedWidget()
         self.main_host.setObjectName("mainHost")
         self.main_host.setFixedHeight(80)
         self._mainstat_pages: dict[int, QWidget] = {}
         for slot, names in _MAINSTAT_PAGES.items():
+            boxes: dict[str, QRadioButton] = {}
             page = QWidget()
             page.setFixedHeight(80)
             grid = QGridLayout(page)
@@ -1166,12 +1212,22 @@ class MainWindow(QMainWindow):
             grid.setColumnStretch(0, 1)
             grid.setColumnStretch(1, 1)
             grid.setColumnStretch(2, 1)
-            for idx, name in enumerate(names):
-                box = QCheckBox(name)
+            group = QButtonGroup(page)
+            self._main_groups[slot] = group
+            any_main = QRadioButton("不限")
+            group.addButton(any_main)
+            any_main.setChecked(True)
+            any_main.toggled.connect(self._on_filter_changed)
+            self._main_any_by_slot[slot] = any_main
+            grid.addWidget(any_main, 0, 0)
+            for idx, name in enumerate(names, start=1):
+                box = QRadioButton(name)
+                group.addButton(box)
                 box.toggled.connect(self._on_filter_changed)
-                self._all_main_boxes[name] = box
+                boxes[name] = box
                 grid.addWidget(box, idx // _MAINSTAT_COLS, idx % _MAINSTAT_COLS)
             self._mainstat_pages[slot] = page
+            self._main_boxes_by_slot[slot] = boxes
             self.main_host.addWidget(page)
         empty_page = QWidget()
         empty_page.setFixedHeight(80)
@@ -1343,6 +1399,7 @@ class MainWindow(QMainWindow):
         if name == job.name:
             return
         job.name = name
+        self._mark_unsaved()
         self._refresh_chain_list(job.job_id)
 
     def _commit_editor(self) -> None:
@@ -1374,12 +1431,12 @@ class MainWindow(QMainWindow):
         """
         self.weight_editor.set_weights({})
         self._apply_stage_require({})
-        self.min_useful.setValue(0)
+        self.max_discs.setValue(100)
+        self._selection_seed = None
         self._filter_sets = []
         self._update_set_summary()
         self._refresh_main_boxes(set())
         self._sync_job_name_edit()
-        self._rebuild_timer.stop()
         self.rebuild_cards(None)
 
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
@@ -1396,6 +1453,7 @@ class MainWindow(QMainWindow):
             },
             accepted=snap.get("accepted"),
             min_useful_types=int(snap.get("min_useful_types") or 0),
+            max_discs=int(snap["max_discs"]),
         )
 
     def _load_job(self, job: TaskJob) -> None:
@@ -1415,13 +1473,15 @@ class MainWindow(QMainWindow):
             },
             "accepted": job.accepted,
             "mainstats": tuple(job.mainstats),
-            "min_useful_types": job.min_useful_types,
+            "min_useful_types": 0,
+            "max_discs": job.max_discs if job.max_discs is not None else self._legacy_max_discs,
         }
         self._slot_plans[job.slot] = plan
         self._apply_slot_widgets(plan)
         self._loading = False
         self._sync_job_name_edit()
-        self.rebuild_cards(job.accepted)
+        self._selection_seed = job.accepted
+        self._reset_preview()
 
     def _on_chain_row(self, row: int) -> None:
         if self._loading or row < 0 or row >= len(self._jobs):
@@ -1446,8 +1506,10 @@ class MainWindow(QMainWindow):
         右侧是左侧选中任务的镜像，所以新建之后右侧必须是空的——不能把上一个
         任务的内容顺过来当新任务，那是假信息。之后在右侧编，离开时自动写回它。
         """
-        job = TaskJob(slot=self._active_slot, name=self._unique_job_name("任务"))
+        self._commit_editor()
+        job = TaskJob(slot=self._active_slot, name=self._unique_job_name("任务"), max_discs=100)
         self._jobs.append(job)
+        self._mark_unsaved()
         self._editing_job_id = job.job_id
         self._refresh_chain_list(job.job_id)
         self._clear_editor()
@@ -1478,6 +1540,7 @@ class MainWindow(QMainWindow):
         copied.name = self._unique_job_name(_base_job_name(job.name))
         row = self._jobs.index(job)
         self._jobs.insert(row + 1, copied)
+        self._mark_unsaved()
         self._load_job(copied)
         self._refresh_chain_list(copied.job_id)
 
@@ -1486,6 +1549,7 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self._jobs):
             return
         removed = self._jobs.pop(row)
+        self._mark_unsaved()
         if self._editing_job_id == removed.job_id:
             self._editing_job_id = None
             # 删掉正在编的那个，顺手选中原位置的邻居；一个都不剩就保持未选中
@@ -1504,6 +1568,7 @@ class MainWindow(QMainWindow):
         if row < 0 or target < 0 or target >= len(self._jobs):
             return
         self._jobs[row], self._jobs[target] = self._jobs[target], self._jobs[row]
+        self._mark_unsaved()
         self._refresh_chain_list(self._jobs[target].job_id)
 
     def _build_right(self) -> QWidget:
@@ -1515,6 +1580,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.three_host["scroll"], "初始 3 词")
         self.tabs.addTab(self.four_host["scroll"], "初始 4 词")
         self.tabs.addTab(self.trial, "试判")
+        self.tabs.currentChanged.connect(lambda _index: self._update_status())
         return self.tabs
 
     def _selected_slots(self) -> list[int]:
@@ -1522,6 +1588,13 @@ class MainWindow(QMainWindow):
 
     def _selected_mains(self) -> list[str]:
         return [name for name, box in self.filter_main_boxes.items() if box.isChecked()]
+
+    def _blocked_substats(self) -> set[str]:
+        return blocked_substats(self._active_slot, self._selected_mains())
+
+    def _effective_weights(self) -> dict[str, float]:
+        blocked = self._blocked_substats()
+        return {name: value for name, value in self.weight_editor.weights().items() if name not in blocked}
 
     def _update_set_summary(self) -> None:
         if not self._filter_sets:
@@ -1561,102 +1634,153 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._filter_sets = dialog.selected()
+        self._mark_unsaved()
         self._update_set_summary()
 
     def _refresh_main_boxes(self, keep: set[str] | None = None) -> None:
         keep = set(keep if keep is not None else self._selected_mains())
         available = set(selectable_mainstats(self._selected_slots()))
         active_slot = self._active_slot if self._active_slot in self._mainstat_pages else None
-        for name, box in self._all_main_boxes.items():
-            is_available = name in available
-            box.blockSignals(True)
-            box.setChecked(is_available and name in keep)
-            box.setVisible(is_available)
-            box.blockSignals(False)
+        for slot, boxes in self._main_boxes_by_slot.items():
+            group = self._main_groups[slot]
+            group.setExclusive(False)
+            choice = next((name for name in boxes if slot == self._active_slot and name in keep), None)
+            for name, box in boxes.items():
+                box.blockSignals(True)
+                box.setChecked(name == choice)
+                box.blockSignals(False)
+            any_main = self._main_any_by_slot[slot]
+            any_main.blockSignals(True)
+            any_main.setChecked(choice is None)
+            any_main.blockSignals(False)
+            group.setExclusive(True)
         if active_slot is not None:
             self.main_host.setCurrentWidget(self._mainstat_pages[active_slot])
         else:
             self.main_host.setCurrentIndex(self.main_host.count() - 1)
-        self.filter_main_boxes = {
-            name: box for name, box in self._all_main_boxes.items() if name in available
-        }
+        self.filter_main_boxes = self._main_boxes_by_slot.get(self._active_slot, {})
         if available:
             self.main_hint.setText(f"{self._active_slot} 号位可选主词条。已选主词条不会出现在右侧副词条里。")
         else:
-            fixed = {1: "生命值", 2: "攻击力", 3: "防御力"}
             self.main_hint.setText(
-                f"{self._active_slot} 号位主词条固定是{fixed[self._active_slot]}，不用选。右侧只编这个部位的副词条。"
+                f"{self._active_slot} 号位主词条固定是{FIXED_MAINSTATS[self._active_slot]}，不用选。右侧只编这个部位的副词条。"
             )
 
     def _load_archives(self) -> dict:
         import json
 
-        from zzz_ddtool.paths import archives_file
+        from zzz_ddtool.paths import archives_file, legacy_archives_file
 
         f = archives_file()
-        if not f.exists():
+        migrate = not f.exists()
+        source = legacy_archives_file() if migrate else f
+        if not source.exists():
             return {}
-        try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        data = json.loads(source.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict) or any(not isinstance(item, dict) for item in data.values()):
+            raise ValueError("存档文件格式不正确")
+        if migrate:
+            self._write_archives(data)
+        return data
 
     def _write_archives(self, data: dict) -> None:
         import json
 
         from zzz_ddtool.paths import archives_file
 
-        archives_file().parent.mkdir(parents=True, exist_ok=True)
-        archives_file().write_text(
+        target = archives_file()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        temporary.replace(target)
+
+    def _update_archive_buttons(self, _text: str = "") -> None:
+        exists = self.archive_combo.currentText().strip() in self._archive_names
+        self.archive_apply_btn.setEnabled(exists)
+        self.archive_delete_btn.setEnabled(exists)
+
+    def _archive_error(self, exc: Exception) -> None:
+        from zzz_ddtool.paths import archives_file
+
+        self.archive_status.setText(f"存档失败：{exc}")
+        self.archive_status.setToolTip(str(archives_file()))
 
     def _refresh_archive_combo(self, select: str | None = None) -> None:
-        names = sorted(self._load_archives())
+        try:
+            names = sorted(self._load_archives())
+        except (OSError, ValueError) as exc:
+            self._archive_error(exc)
+            names = []
+        self._archive_names = set(names)
         self.archive_combo.blockSignals(True)
         self.archive_combo.clear()
         self.archive_combo.addItems(names)
         if select:
             self.archive_combo.setCurrentText(select)
         self.archive_combo.blockSignals(False)
+        self._update_archive_buttons()
 
     def _save_archive(self) -> None:
         name = self.archive_combo.currentText().strip()
         if not name:
-            self.path_label.setText("存档：先在框里输入存档名再点「存入当前」。")
-            return
+            name, confirmed = QInputDialog.getText(self, "保存存档", "存档名称")
+            name = name.strip()
+            if not confirmed or not name:
+                return
         snap = self._snapshot_slot()
-        data = self._load_archives()
-        data[name] = {
-            "weights": dict(snap.get("weights") or {}),
-            "stage_require": {
-                origin: dict(table)
-                for origin, table in (snap.get("stage_require") or {}).items()
-            },
-        }
-        self._write_archives(data)
+        try:
+            data = self._load_archives()
+            data[name] = {
+                "weights": dict(snap.get("weights") or {}),
+                "stage_require": {
+                    origin: dict(table)
+                    for origin, table in (snap.get("stage_require") or {}).items()
+                },
+            }
+            self._write_archives(data)
+        except (OSError, ValueError) as exc:
+            self._archive_error(exc)
+            return
         self._refresh_archive_combo(name)
-        self.path_label.setText(f"存档：已保存「{name}」。")
+        self.archive_status.setText(f"已保存「{name}」。")
 
     def _apply_archive(self) -> None:
         name = self.archive_combo.currentText().strip()
-        data = self._load_archives().get(name)
-        if not data:
-            self.path_label.setText(f"存档：没有叫「{name}」的存档。")
+        try:
+            data = self._load_archives().get(name)
+            if data is None:
+                raise ValueError(f"没有叫「{name}」的存档")
+            weights = {key: float(value) for key, value in dict(data.get("weights") or {}).items()}
+            stage_require = {
+                str(origin): {int(level): float(value) for level, value in dict(table).items()}
+                for origin, table in dict(data.get("stage_require") or {}).items()
+            }
+        except (OSError, ValueError, TypeError) as exc:
+            self._archive_error(exc)
             return
-        self.weight_editor.set_weights(dict(data.get("weights") or {}))
-        self._apply_stage_require(data.get("stage_require") or {})
+        if self._editing_job() is None:
+            self._add_job()
+        self.weight_editor.set_weights(weights)
+        self._apply_stage_require(stage_require)
+        self._selection_seed = None
         self._schedule_rebuild()
-        self.path_label.setText(f"存档：已套用「{name}」到 {self._active_slot} 号位。")
+        self.archive_status.setText(f"已套用「{name}」到当前任务。")
 
     def _delete_archive(self) -> None:
         name = self.archive_combo.currentText().strip()
-        data = self._load_archives()
-        if name in data:
+        try:
+            data = self._load_archives()
+            if name not in data:
+                raise ValueError(f"没有叫「{name}」的存档")
             del data[name]
             self._write_archives(data)
+        except (OSError, ValueError) as exc:
+            self._archive_error(exc)
+            return
         self._refresh_archive_combo()
-        self.path_label.setText(f"存档：已删除「{name}」。")
+        self.archive_status.setText(f"已删除「{name}」。")
 
     def _snapshot_slot(self) -> dict:
         stage_require = {"three": {}, "four": {}}
@@ -1665,10 +1789,11 @@ class MainWindow(QMainWindow):
         return {
             "weights": self.weight_editor.weights(),
             "stage_require": stage_require,
-            "accepted": tuple(self._accepted_ids()),
+            "accepted": self._rebased_selection(filtered=True),
             "mainstats": tuple(self._selected_mains()),
             "sets": tuple(self._filter_sets),
-            "min_useful_types": int(self.min_useful.value()),
+            "min_useful_types": 0,
+            "max_discs": int(self.max_discs.value()),
         }
 
     def _apply_stage_require(self, table: dict) -> None:
@@ -1681,9 +1806,8 @@ class MainWindow(QMainWindow):
                 section.require.blockSignals(False)
 
     def _apply_slot_widgets(self, plan: dict) -> None:
-        self.min_useful.setValue(int(plan.get("min_useful_types") or 0))
+        self.max_discs.setValue(int(plan.get("max_discs") or 100))
         self._refresh_main_boxes(set(plan.get("mainstats") or ()))
-        self.weight_editor.set_blocked(set(self._selected_mains()))
         self.weight_editor.set_weights(dict(plan.get("weights") or {}))
         self._apply_stage_require(plan.get("stage_require") or {})
 
@@ -1724,7 +1848,6 @@ class MainWindow(QMainWindow):
     def _on_filter_changed(self) -> None:
         if self._loading:
             return
-        self.weight_editor.set_blocked(set(self._selected_mains()))
         self._update_filter_summary()
         self._schedule_rebuild()
 
@@ -1734,8 +1857,8 @@ class MainWindow(QMainWindow):
         box.setContentsMargins(12, 8, 12, 8)
         for checkpoint in CHECKPOINTS:
             section = StageSection(origin, checkpoint, None)
-            section.require_changed.connect(self._update_status)
-            section.selection_changed.connect(self._update_status)
+            section.require_changed.connect(self._on_require_changed)
+            section.selection_changed.connect(self._on_selection_changed)
             self.sections[(origin.value, checkpoint)] = section
             box.addWidget(section)
         box.addStretch()
@@ -1748,8 +1871,10 @@ class MainWindow(QMainWindow):
     def _build_bottom(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("footer")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(10, 8, 10, 8)
+        footer = QVBoxLayout(bar)
+        footer.setContentsMargins(10, 8, 10, 8)
+        row = QHBoxLayout()
+        footer.addLayout(row)
         all_on = QPushButton("全选当前可见")
         all_off = QPushButton("取消当前可见")
         all_on.clicked.connect(lambda: self._check_visible(True))
@@ -1761,9 +1886,14 @@ class MainWindow(QMainWindow):
         self.start_btn.clicked.connect(self._on_start_clicked)
         self.status = QLabel()
         self.status.setObjectName("status")
+        self.refresh_cards_btn = QPushButton("生成组合")
+        self.refresh_cards_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_cards_btn.clicked.connect(lambda: self.rebuild_cards())
+        self._task_controls.append(self.refresh_cards_btn)
         row.addWidget(all_on)
         row.addWidget(all_off)
-        row.addWidget(self.status, 1)
+        row.addWidget(self.refresh_cards_btn)
+        row.addStretch()
         row.addWidget(self.start_btn)
         self.pause_btn = QPushButton("暂停 / F9")
         self.stop_btn = QPushButton("停止 / F10")
@@ -1775,7 +1905,9 @@ class MainWindow(QMainWindow):
         row.addWidget(self.stop_btn)
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
-        row.addWidget(self.run_status_label, 1)
+        self.status.setWordWrap(True)
+        footer.addWidget(self.status)
+        footer.addWidget(self.run_status_label)
         self._run_timer = QTimer(self)
         self._run_timer.setInterval(1000)
         self._run_timer.timeout.connect(self._refresh_run_status)
@@ -1786,13 +1918,21 @@ class MainWindow(QMainWindow):
 
     def _on_start_clicked(self) -> None:
         """用当前 UI 配置在子线程启动 Runner；运行期间禁用按钮，结束自动恢复。"""
-        if self._run_thread is not None:
+        if self._run_thread is not None or self._utility_thread is not None:
             return
         try:
             preset = self.collect_preset()
         except Exception as exc:  # 配置缺失 / 构建失败
             QMessageBox.warning(self, "无法启动", f"配置构建失败：{exc}")
             return
+        if not preset.task_chain:
+            QMessageBox.warning(self, "无法启动", "请先添加并配置任务。")
+            return
+        for index, job in enumerate(preset.task_chain, start=1):
+            blocked = blocked_substats(job.slot, job.mainstats)
+            if not any(value > 0 and name in SUBSTAT_NAMES and name not in blocked for name, value in job.weights.items()):
+                QMessageBox.warning(self, "无法启动", f"第 {index} 个任务「{job.name}」没有可用的正权重副词条。")
+                return
         try:
             save_preset(self._path, preset)
         except Exception as exc:  # 落盘失败
@@ -1863,6 +2003,8 @@ class MainWindow(QMainWindow):
         self.run_status_label.setText(
             f"运行状态：{data.get('phase', '—')}  格子:{data.get('cell') or '—'}  "
             f"进度:{data.get('processed', 0)}/{data.get('max_discs', 0)}\n"
+            + (f"当前任务:{data['job_processed']}/{data.get('job_max_discs', 0)}  " if 'job_processed' in data else "")
+            +
             f"{where}{view}{restore}\n"
             f"{data.get('message', '')}"
         )
@@ -1883,43 +2025,36 @@ class MainWindow(QMainWindow):
         self.status.setText("日志设置已保存")
 
     def check_update(self) -> None:
-        """检查更新：读 Gitee 发行版，对比本地版本号，用户确认后下载更新。
+        from zzz_ddtool.updater import check_for_update
 
-        - 有程序包：下载后在重启时替换（退出 + 替身 bat）。
-        - 只有数据包：下载覆盖 data/，立即生效、不退出。
-        """
-        from zzz_ddtool.updater import apply_data_update, apply_program_update, check_for_update
+        self._start_utility(check_for_update, self._handle_update_status, "正在检查更新…")
 
-        st = check_for_update()
+    def _handle_update_status(self, st) -> None:  # noqa: ANN001
+        from zzz_ddtool.updater import apply_data_update, apply_program_update
+
         if st.error:
             QMessageBox.information(self, "检查更新", st.error)
             return
         if not st.available:
             QMessageBox.information(self, "检查更新", f"已是最新版本 {st.current_version}")
             return
-
         detail = f"发现新版本 {st.latest_version}（当前 {st.current_version}）\n\n{st.body}".rstrip()
         yes = QMessageBox.StandardButton.Yes
         no = QMessageBox.StandardButton.No
-
         if st.program_url:
             ask = f"{detail}\n\n将下载完整程序包，程序会退出、重启后完成更新。现在更新？"
-            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) != yes:
-                return
-            try:
-                apply_program_update(st.program_url)
-            except Exception as exc:  # 网络 / 解压失败
-                QMessageBox.warning(self, "检查更新", f"更新失败：{exc}")
+            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) == yes:
+                self._start_utility(
+                    lambda: apply_program_update(st.program_url), lambda _result: None, "正在下载程序更新…"
+                )
         elif st.data_url:
             ask = f"{detail}\n\n将下载数据包（套装名/词条名/图片），立即生效、无需重启。现在更新？"
-            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) != yes:
-                return
-            try:
-                apply_data_update(st.data_url)
-            except Exception as exc:
-                QMessageBox.warning(self, "检查更新", f"更新失败：{exc}")
-                return
-            QMessageBox.information(self, "检查更新", "数据已更新，立即生效。")
+            if QMessageBox.question(self, "检查更新", ask, yes | no, yes) == yes:
+                self._start_utility(
+                    lambda: apply_data_update(st.data_url),
+                    lambda _result: QMessageBox.information(self, "检查更新", "数据已更新，立即生效。"),
+                    "正在下载数据更新…",
+                )
         else:
             QMessageBox.information(self, "检查更新", f"{detail}\n\n该版本未附带可下载的更新包。")
 
@@ -1974,6 +2109,9 @@ class MainWindow(QMainWindow):
         bar.setValue(bar.maximum() if follow else position)
 
     def _load_path(self, path: Path) -> None:
+        from zzz_ddtool.userdata import persistent_config_path
+
+        path = persistent_config_path(path)
         if path.exists():
             preset = load_preset(path)
         else:
@@ -1998,16 +2136,23 @@ class MainWindow(QMainWindow):
         self.skip_equipped.setChecked(preset.skip_equipped)
         self.skip_discarded.setChecked(preset.skip_discarded)
         self.max_discs.setValue(preset.max_discs)
+        self._legacy_max_discs = preset.max_discs
         self._jobs = [
             copied
             for job in preset.task_chain
             for copied in [job_from_dict(job.to_dict())]
             if copied is not None
         ]
+        for job in self._jobs:
+            job.min_useful_types = 0
+            job.mainstats = tuple(name for name in job.mainstats if name in _MAINSTAT_PAGES.get(job.slot, ()))[:1]
+            if job.max_discs is None:
+                job.max_discs = preset.max_discs
         self._editing_job_id = self._jobs[0].job_id if self._jobs else None
         self._slot_plans = {slot: empty_slot_plan(slot) for slot in SLOTS}
         for slot, plan in (preset.slot_plans or {}).items():
             self._slot_plans[int(slot)] = dict(plan)
+            self._slot_plans[int(slot)]["min_useful_types"] = 0
         if self._jobs:
             first = self._jobs[0]
             self._active_slot = first.slot
@@ -2020,7 +2165,8 @@ class MainWindow(QMainWindow):
                 "accepted": first.accepted,
                 "mainstats": tuple(first.mainstats),
                 "sets": tuple(first.sets),
-                "min_useful_types": first.min_useful_types,
+                "min_useful_types": 0,
+                "max_discs": first.max_discs if first.max_discs is not None else preset.max_discs,
             }
             self._slot_plans[first.slot] = plan
             accepted = first.accepted
@@ -2043,111 +2189,168 @@ class MainWindow(QMainWindow):
         self.path_label.setToolTip(str(self._path))
         self._loading = False
         if self._jobs:
-            self.rebuild_cards(accepted)
+            self._selection_seed = accepted
+            self._reset_preview()
         else:
             self._clear_editor()
 
     def _schedule_rebuild(self) -> None:
-        if self._loading or self._rebuilding:
+        if self._loading:
             return
-        self._rebuild_timer.start()
-
-    # 组合卡片超过这个数量才提示「正在生成…」，小批量重建是毫秒级，
-    # 弹提示反而是一闪而过，比不提示更烦。
-    _BUSY_CARD_THRESHOLD = 120
-
-    def _begin_busy(self, text: str) -> None:
-        """在建卡前把提示先画出来。
-
-        建卡是同步的，会把事件循环堵死——所以提示必须在堵死**之前**排一次绘制，
-        否则它和卡片一起在最后才出现，等于没提示。这是这里唯一有意义的一步。
-        """
-        self.status.setText(text)
-        if not self._busy_cursor:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self._busy_cursor = True
-        # 排一次绘制把上面的文案真正刷到屏上；之后主线程再堵，用户也能看见这句话。
-        QApplication.processEvents()
-
-    def _end_busy(self) -> None:
-        if self._busy_cursor:
-            QApplication.restoreOverrideCursor()
-            self._busy_cursor = False
-
-    def rebuild_cards(self, accepted: tuple[str, ...] | None = None) -> None:
-        if self._rebuilding:
-            # processEvents（_begin_busy 里那一下）可能把已到期的重建定时器放出来，
-            # 造成重入。记下来，等这一轮跑完再补一次，避免嵌套重建。
-            self._rebuild_pending = True
-            return
-        self._rebuilding = True
-        try:
-            self._rebuild_cards_inner(accepted)
-        finally:
-            self._rebuilding = False
-            self._end_busy()
-            if self._rebuild_pending:
-                self._rebuild_pending = False
-                self._schedule_rebuild()
-
-    def _rebuild_cards_inner(self, accepted: tuple[str, ...] | None = None) -> None:
-        blocked = set(self._selected_mains())
-        weights = {name: value for name, value in self.weight_editor.weights().items() if name not in blocked}
-        if not weights:
-            # 一个词条都没有就没有组合可言。注意 enumerate_all 在权重为空时仍会产出
-            # 「全废词条」的图案，照着建就会在右侧摆出几张看似真实的卡片——那是假信息。
-            # 直接清空。新建任务后右侧必须是真的空，就是靠这里。
-            for section in self.sections.values():
-                section.set_cards([], lambda _pattern_id: False)
-            self.trial.set_name_choices(blocked)
-            self._update_status()
-            return
-        patterns = enumerate_all(weights, hide_junk_bonus=True)
-        grouped: dict[tuple[str, int], list[Pattern]] = defaultdict(list)
-        for pattern in patterns:
-            grouped[(pattern.origin.value, pattern.checkpoint)].append(pattern)
-        is_checked = self._card_check_policy(accepted)
-        # 先分拣：能原地复用的走复用，真需要建卡的才进 todo。
-        # 只有真建卡的数量够大才值得提示——复用是几十毫秒，提示一闪而过反而更烦。
-        todo: dict[tuple[str, int], list[Pattern]] = {}
-        for key, section in self.sections.items():
-            wanted = grouped.get(key, [])
-            if not section.can_reuse(wanted):
-                todo[key] = wanted
-        pending_cards = sum(len(wanted) for wanted in todo.values())
-        if pending_cards >= self._BUSY_CARD_THRESHOLD:
-            self._begin_busy(f"正在生成组合…  共 {pending_cards} 张，请稍候")
-        for key, section in self.sections.items():
-            wanted = grouped.get(key, [])
-            if key in todo:
-                section.set_cards(wanted, is_checked)
-            else:
-                section.reuse_cards(wanted, is_checked)
-        self.trial.set_name_choices(blocked)
+        self._invalidate_preview()
+        self._mark_unsaved()
+        self.trial.set_name_choices(self._blocked_substats())
         self._update_status()
 
-    def _card_check_policy(self, accepted: tuple[str, ...] | None):
-        previous_checked = set(self._accepted_ids())
-        previous_all = {
-            card.pattern.pattern_id for section in self.sections.values() for card in section.cards
-        }
+    def _reset_preview(self) -> None:
+        self._invalidate_preview()
+        for section in self.sections.values():
+            section.set_cards([], lambda _pid: False)
+        self.trial.set_name_choices(self._blocked_substats())
+        self._update_status()
+
+    def _invalidate_preview(self) -> None:
+        self._preview_generation += 1
+        self._preview_dirty = True
+        self._preview_timer.stop()
+        self._preview_install = []
+        self._preview_request = None
+        if self._preview_thread is not None:
+            self._preview_thread.requestInterruption()
+        for section in self.sections.values():
+            section.flow_host.hide()
+            section.previous_btn.setEnabled(False)
+            section.next_btn.setEnabled(False)
+        self.refresh_cards_btn.setText("生成组合")
+
+    def rebuild_cards(self, accepted: tuple[str, ...] | None = None) -> None:
+        if self._closing:
+            return
         if accepted is not None:
-            keep = set(accepted)
-            known = keep
-            new_default = False
-        elif previous_all:
-            keep = previous_checked
-            known = previous_all
-            new_default = True
+            self._selection_seed = accepted
+        self._invalidate_preview()
+        blocked = self._blocked_substats()
+        weights = self._effective_weights()
+        self.trial.set_name_choices(blocked)
+        if not useful_ordered(weights):
+            for section in self.sections.values():
+                section.set_cards([], lambda _pid: False)
+                section.flow_host.show()
+            self._preview_dirty = False
+            self._update_status()
+            return
+        request = (self._preview_generation, weights, self._card_check_policy())
+        if self._preview_thread is not None:
+            self._preview_request = request
         else:
-            return lambda _pattern_id: True
+            self._start_preview(request)
 
-        def is_checked(pattern_id: str) -> bool:
-            if pattern_id in known:
-                return pattern_id in keep
-            return new_default
+    def _start_preview(self, request: tuple) -> None:
+        generation, weights, policy = request
+        self._preview_policy = policy
+        worker = _PatternThread(generation, weights, self)
+        self._preview_thread = worker
+        worker.result.connect(self._on_preview_result)
+        worker.failed.connect(self._on_preview_failed)
+        worker.finished.connect(self._on_preview_finished)
+        self.status.setText("正在后台计算组合…")
+        self.refresh_cards_btn.setText("重新生成")
+        worker.start()
 
-        return is_checked
+    def _on_preview_result(self, generation: int, grouped: dict) -> None:
+        if self._closing or generation != self._preview_generation:
+            return
+        self._preview_install = list(grouped.items())
+        self.status.setText("正在显示组合…")
+        self._preview_timer.start(1)
+
+    def _install_preview_section(self) -> None:
+        if self._closing or not self._preview_install:
+            return
+        key, patterns = self._preview_install.pop(0)
+        section = self.sections[key]
+        if section.can_reuse(patterns):
+            section.reuse_cards(patterns, self._preview_policy)
+        else:
+            section.set_cards(patterns, self._preview_policy)
+        if self._preview_install:
+            # 每次只安装一个分区，事件循环可以处理输入、绘制及关闭请求。
+            self._preview_timer.start(1)
+            return
+        self._preview_dirty = False
+        for section in self.sections.values():
+            section.flow_host.show()
+        self.refresh_cards_btn.setText("刷新组合")
+        self._update_status()
+
+    def _on_preview_failed(self, generation: int, message: str) -> None:
+        if generation == self._preview_generation and not self._closing:
+            self.status.setText(f"组合生成失败：{message}")
+            self.refresh_cards_btn.setText("重试生成")
+
+    def _on_preview_finished(self) -> None:
+        worker = self._preview_thread
+        self._preview_thread = None
+        worker.deleteLater()
+        if self._closing:
+            self.close()
+        elif self._preview_request is not None:
+            request = self._preview_request
+            self._preview_request = None
+            self._start_preview(request)
+
+    def _rebased_selection(self, filtered: bool = False) -> tuple[str, ...] | None:
+        weights = self._effective_weights()
+        blocked = self._blocked_substats()
+        useful = set(useful_ordered(weights))
+        if self._selection_seed is None:
+            return None
+        if not useful:
+            return ()
+        out = set()
+        for pid in self._selection_seed:
+            try:
+                origin, checkpoint, body = pid.split(":", 2)
+                slots = []
+                for token in body.split("|"):
+                    name, plus, bonus = token.rpartition("+")
+                    if not plus:
+                        name, bonus = token, "0"
+                    slots.append(Slot(name if name in useful or name == EMPTY else JUNK, int(bonus)))
+                canonical = canonicalize(slots, weights)
+                pattern = Pattern(Origin(origin), int(checkpoint), canonical, score_slots(canonical, weights))
+            except ValueError:
+                continue
+            if any(token.split("+", 1)[0] in blocked for token in body.split("|")):
+                continue
+            if filtered:
+                section = self.sections.get((pattern.origin.value, pattern.checkpoint))
+                if section is None or pattern.score + 1e-9 < section.require.value():
+                    continue
+                if not first_filter([pattern]):
+                    continue
+            out.add(pattern.pattern_id)
+        return tuple(sorted(out))
+
+    def _card_check_policy(self):
+        accepted = self._rebased_selection()
+        if accepted is None:
+            return lambda _pid: True
+        keep = frozenset(accepted)
+        return lambda pid: pid in keep
+
+    def _on_selection_changed(self) -> None:
+        if self._preview_dirty:
+            return
+        self._selection_seed = tuple(
+            pid for section in self.sections.values() for pid in section._ids if pid in section._checked
+        )
+        self._mark_unsaved()
+        self._update_status()
+
+    def _on_require_changed(self) -> None:
+        self._mark_unsaved()
+        self._update_status()
 
     def collect_preset(self) -> Preset:
         # 落盘 / 试判 / 开始任务都走这里，是「离开编辑器」的汇总口：先把当前编辑内容
@@ -2187,7 +2390,7 @@ class MainWindow(QMainWindow):
                     "skip_equipped": self.skip_equipped.isChecked(),
                     "skip_discarded": self.skip_discarded.isChecked(),
                 },
-                "accepted": list(current.get("accepted") or ()),
+                **({"accepted": list(current["accepted"])} if current.get("accepted") is not None else {}),
             }
         )
 
@@ -2198,20 +2401,29 @@ class MainWindow(QMainWindow):
         return ids
 
     def _check_visible(self, on: bool) -> None:
-        current = self.tabs.currentIndex()
-        origin = Origin.THREE if current == 0 else Origin.FOUR if current == 1 else None
-        for section in self.sections.values():
-            if origin is None or section.origin is origin:
-                section.check_visible(on)
+        if self._preview_dirty:
+            return
+        for section in self._current_sections():
+            section.check_visible(on)
         self._update_status()
 
+    def _current_sections(self) -> list[StageSection]:
+        index = self.tabs.currentIndex()
+        origin = Origin.THREE if index == 0 else Origin.FOUR if index == 1 else None
+        return [section for section in self.sections.values() if origin is None or section.origin is origin]
+
     def _update_status(self) -> None:
-        visible = sum(1 for section in self.sections.values() for card in section.cards if not card.isHidden())
-        total = sum(len(section.cards) for section in self.sections.values())
-        picked = len(self._accepted_ids())
+        if self._preview_dirty:
+            self.status.setText("组合待生成")
+            return
+        sections = self._current_sections()
+        visible = sum(len(section._visible_indices) for section in sections)
+        total = sum(len(section.patterns) for section in sections)
+        picked = sum(len(section.visible_accepted()) for section in sections)
+        scope = self.tabs.tabText(self.tabs.currentIndex()) if self.tabs.currentIndex() < 2 else "全部组合"
         self.status.setText(
             f"任务链 {len(self._jobs)} 节 · 正在编 {self._active_slot} 号 · "
-            f"组合库共 {total} 种，当前筛选可见 {visible}，已勾选 {picked}"
+            f"{scope}：组合共 {total} 种，符合门槛 {visible}，已勾选 {picked}"
         )
 
     def _toggle_on_top(self, on: bool) -> None:
@@ -2222,36 +2434,67 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
         self.show()
 
-    def capture_game(self) -> None:
-        from zzz_ddtool.capture import CaptureError, capture_game
-
-        try:
-            dest = capture_game()
-        except CaptureError as exc:
-            self.path_label.setText(str(exc))
+    def _start_utility(self, operation, on_success, message: str) -> None:  # noqa: ANN001
+        if self._utility_thread is not None or self._run_thread is not None or self._closing:
             return
-        self.path_label.setText(f"已截取  {dest.name}")
+        self._utility_success = on_success
+        worker = _UtilityThread(operation, self)
+        self._utility_thread = worker
+        worker.finished.connect(self._on_utility_finished)
+        self.start_btn.setEnabled(False)
+        for button in self._task_controls:
+            button.setEnabled(False)
+        self.status.setText(message)
+        worker.start()
+
+    def _on_utility_finished(self) -> None:
+        worker = self._utility_thread
+        self._utility_thread = None
+        worker.deleteLater()
+        self.start_btn.setEnabled(True)
+        for button in self._task_controls:
+            button.setEnabled(True)
+        if worker.exit_code is not None:
+            self._exit_after_close = worker.exit_code
+            self.close()
+        elif self._closing:
+            self.close()
+        elif worker.error is not None:
+            self.status.setText(f"操作失败：{worker.error}")
+        else:
+            self._update_status()
+            self._utility_success(worker.value)
+
+    def _show_capture_result(self, dest: Path, label: str) -> None:
+        self.path_label.setText(f"{label}  {dest.name}")
         self.path_label.setToolTip(str(dest))
+
+    def capture_game(self) -> None:
+        from zzz_ddtool.capture import capture_game
+
+        self._start_utility(
+            capture_game, lambda dest: self._show_capture_result(dest, "已截取"), "正在截取游戏…"
+        )
 
     def goto_warehouse(self) -> None:
-        from zzz_ddtool.nav import NavError, goto_warehouse
+        from zzz_ddtool.nav import goto_warehouse
 
-        try:
-            dest = goto_warehouse()
-        except NavError as exc:
-            self.path_label.setText(str(exc))
-            return
-        self.path_label.setText(f"已进入驱动盘  {dest.name}")
-        self.path_label.setToolTip(str(dest))
+        self._start_utility(
+            goto_warehouse, lambda dest: self._show_capture_result(dest, "已进入驱动盘"),
+            "正在进入驱动盘…",
+        )
 
     def open_preset(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "打开预设", str(self._path.parent), "YAML (*.yaml *.yml)")
+        from zzz_ddtool.paths import plans_dir
+
+        path, _ = QFileDialog.getOpenFileName(self, "打开任务存档", str(plans_dir()), "YAML (*.yaml *.yml)")
         if path:
             self._load_path(Path(path))
             remember_config_path(self._path)
 
     def save_current(self) -> None:
         save_preset(self._path, self.collect_preset())
+        remember_config_path(self._path)
         self._set_saved_state()
 
     def _set_saved_state(self) -> None:
@@ -2267,6 +2510,10 @@ class MainWindow(QMainWindow):
         self.save_label.setText("未保存")
         self.save_label.setToolTip(str(self._path))
 
+    def _mark_unsaved(self) -> None:
+        if not self._loading and self.save_label.objectName() != "saveStateIdle":
+            self._reset_saved_state()
+
     @staticmethod
     def _repolish(widget) -> None:
         style = widget.style()
@@ -2274,10 +2521,13 @@ class MainWindow(QMainWindow):
         style.polish(widget)
 
     def save_as(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "另存预设", str(self._path), "YAML (*.yaml *.yml)")
+        from zzz_ddtool.paths import plans_dir
+        from zzz_ddtool.userdata import persistent_config_path
+
+        path, _ = QFileDialog.getSaveFileName(self, "另存任务存档", str(plans_dir() / self._path.name), "YAML (*.yaml *.yml)")
         if not path:
             return
-        self._path = Path(path)
+        self._path = persistent_config_path(Path(path))
         self.save_current()
         # 另存为换了工作文件，下次启动就打开它
         remember_config_path(self._path)
@@ -2287,7 +2537,8 @@ class MainWindow(QMainWindow):
         if disc is None:
             self.trial.result.setText("至少填一条副词条。")
             return
-        result = decide(disc, self.collect_preset(), self._accepted_ids())
+        preset = self.collect_preset()
+        result = decide(disc, preset, preset.accepted)
         self.trial.result.setText(
             f"{result.action.value}  ·  {result.reason}\n"
             f"权重 {result.score}  ·  有效 {result.useful_types}/{result.max_useful_types}  ·  "
@@ -2295,6 +2546,18 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closing = True
+        self._preview_request = None
+        self._preview_install = []
+        self._preview_timer.stop()
+        if self._preview_thread is not None:
+            self._preview_thread.requestInterruption()
+            event.ignore()
+            return
+        if self._utility_thread is not None:
+            self.status.setText("等待当前操作结束后关闭…")
+            event.ignore()
+            return
         if self._run_thread is not None:
             self._close_after_run = True
             self._stop_run()
@@ -2304,6 +2567,9 @@ class MainWindow(QMainWindow):
 
         overlay_shutdown()
         event.accept()
+        self._run_timer.stop()
+        if self._exit_after_close is not None:
+            QApplication.exit(self._exit_after_close)
 
 
 def apply_light_style(app: QApplication) -> None:
@@ -2322,6 +2588,64 @@ def apply_light_style(app: QApplication) -> None:
     if font.exactMatch():
         app.setFont(font)
     app.setStyleSheet(STYLESHEET)
+
+
+class _UtilityThread(QThread):
+    def __init__(self, operation, parent: QWidget) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        self.operation = operation
+        self.value = None
+        self.error = None
+        self.exit_code = None
+
+    def run(self) -> None:
+        try:
+            self.value = self.operation()
+        except SystemExit as exc:
+            self.exit_code = int(exc.code or 0)
+        except Exception as exc:
+            self.error = str(exc)
+
+
+class _PatternThread(QThread):
+    result = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, generation: int, weights: dict[str, float], parent: QWidget) -> None:
+        super().__init__(parent)
+        self.generation = generation
+        self.weights = dict(weights)
+
+    def run(self) -> None:
+        from time import monotonic, sleep
+
+        next_yield = monotonic() + 0.01
+
+        def cancelled() -> bool:
+            nonlocal next_yield
+            if self.isInterruptionRequested():
+                return True
+            # Python 穷举会争用 GIL，主动让出时间片以保证 Qt 输入及时处理。
+            if monotonic() >= next_yield:
+                sleep(0.001)
+                next_yield = monotonic() + 0.01
+            return self.isInterruptionRequested()
+
+        try:
+            grouped = {}
+            for origin in Origin:
+                for checkpoint in CHECKPOINTS:
+                    if self.isInterruptionRequested():
+                        return
+                    patterns = enumerate_patterns(
+                        self.weights, origin=origin, checkpoint=checkpoint,
+                        cancelled=cancelled,
+                    )
+                    grouped[(origin.value, checkpoint)] = first_filter(patterns)
+            if not self.isInterruptionRequested():
+                self.result.emit(self.generation, grouped)
+        except Exception as exc:
+            self.failed.emit(self.generation, str(exc))
 
 
 class _RunThread(QThread):

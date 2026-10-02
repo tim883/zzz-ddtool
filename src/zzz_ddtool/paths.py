@@ -21,8 +21,26 @@ def data_dir() -> Path:
 
 
 def user_dir() -> Path:
-    """用户数据（存档、预设）。更新永不碰。"""
-    return base_dir() / "user"
+    """根目录下的用户数据，独立于 dist 中的程序版本。"""
+    return user_data_root() / "user"
+
+
+def user_data_root() -> Path:
+    if not _is_frozen():
+        return repo_root()
+    app = base_dir()
+    for parent in (app, *app.parents):
+        if (parent / ".zzz-ddtool-root").is_file():
+            return parent
+    return app
+
+
+def plans_dir() -> Path:
+    return user_dir() / "plan"
+
+
+def legacy_plan_dirs() -> tuple[Path, ...]:
+    return tuple(dict.fromkeys((user_data_root() / "data", base_dir() / "data", user_dir() / "presets", base_dir() / "user" / "presets")))
 
 
 def version_file() -> Path:
@@ -43,8 +61,13 @@ def assets_dir() -> Path:
 
 
 def archives_file() -> Path:
-    """权重+档位要求临时存档（所有槽位方案共用的命名模板）。用户数据，更新永不碰。"""
+    """命名模板存档，保存在公共根目录的 user 中。"""
     return user_dir() / "archives.json"
+
+
+def legacy_archives_file() -> Path:
+    """旧版存档位置，仅用于首次导入，导入后保留原文件。"""
+    return base_dir() / "user" / "archives.json"
 
 
 def last_config_file() -> Path:

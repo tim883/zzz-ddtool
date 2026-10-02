@@ -9,6 +9,7 @@
 
 | 入口 | 内容 |
 |------|------|
+| [任务管理器使用说明](手册/任务管理器使用说明.md) | **客户端使用说明**：从配置任务到保存、执行，以及卡片预览与任务记录的关系 |
 | [doc/README.md](doc/README.md) | **技术手册**：识别标定、截图与坐标、日志与截图（开发/排查先看这里） |
 | [手册/README.md](手册/README.md) | **用户手册**：页面识别、运行限制与筛选 |
 
@@ -48,13 +49,16 @@ uv pip install --python .venv\Scripts\python.exe -r requirements-lock.txt "pytes
 
 ## 命令行
 
+任务存档统一放在根目录的 `user/plan/`，`example` 和其他存档没有区别。
+首次打开客户端会导入旧 `data/` 中的 YAML；后续版本共用这些存档，发布包不再包含 YAML。
+
 ```powershell
 .venv\Scripts\python.exe -m zzz_ddtool capture          # 截一张游戏窗口
 .venv\Scripts\python.exe -m zzz_ddtool goto-warehouse   # 导航到仓库页
 .venv\Scripts\python.exe -m zzz_ddtool snapshot-pages   # 逐个页面存样张
-.venv\Scripts\python.exe -m zzz_ddtool run --config data/example.yaml   # 跑任务链
-.venv\Scripts\python.exe -m zzz_ddtool preview --config data/example.yaml  # 导出组合卡片 HTML
-.venv\Scripts\python.exe -m zzz_ddtool decide --config data/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
+.venv\Scripts\python.exe -m zzz_ddtool run --config user/plan/example.yaml   # 跑任务链
+.venv\Scripts\python.exe -m zzz_ddtool preview --config user/plan/example.yaml  # 导出组合卡片 HTML
+.venv\Scripts\python.exe -m zzz_ddtool decide --config user/plan/example.yaml --subs 暴击率,暴击伤害,生命值,防御力 --level 0
 ```
 
 跑任务时 **F9 暂停 / F10 停止**，检查点在格子级——当前这件处理完才停，不会在弹层中间撂挑子。

@@ -7,9 +7,12 @@ from typing import Any, Mapping
 import yaml
 
 from zzz_ddtool.chain import TaskJob, parse_task_chain
-from zzz_ddtool.gamedata import SLOTS
+from zzz_ddtool.gamedata import SLOTS, blocked_substats
 from zzz_ddtool.models import UPGRADE_STEP
 from zzz_ddtool.origin import Origin
+
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_SAFE_DUMPER = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,11 @@ class Preset:
     max_pages: int = 20
 
     def useful_names(self) -> frozenset[str]:
-        return frozenset(name for name, weight in self.weights.items() if weight > 0)
+        return frozenset(name for name, weight in self.effective_weights().items() if weight > 0)
+
+    def effective_weights(self) -> dict[str, float]:
+        blocked = blocked_substats(self.filter_slot, self.filter_mainstats)
+        return {name: weight for name, weight in self.weights.items() if name not in blocked}
 
     def require_for(self, origin: Origin | str, checkpoint: int) -> float | None:
         key = origin.value if isinstance(origin, Origin) else origin
@@ -54,7 +61,7 @@ def checkpoint_level(level: int) -> int:
 
 
 def load_preset(path: str | Path) -> Preset:
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    data = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=_SAFE_LOADER) or {}
     return preset_from_dict(data)
 
 
@@ -205,7 +212,7 @@ def save_preset(path: str | Path, preset: Preset) -> Path:
     dest = Path(path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(
-        yaml.safe_dump(preset_to_dict(preset), allow_unicode=True, sort_keys=False),
+        yaml.dump(preset_to_dict(preset), Dumper=_SAFE_DUMPER, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
     return dest

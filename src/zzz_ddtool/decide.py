@@ -11,10 +11,11 @@ from zzz_ddtool.score import score_disc
 
 
 def decide(disc: Disc, preset: Preset, accepted_ids: Collection[str] | None = None) -> Decision:
+    weights = preset.effective_weights()
     useful = preset.useful_names()
     useful_now = len(present_useful_types(disc, useful))
     useful_max = max_achievable_useful_types(disc, useful)
-    score = score_disc(disc, preset.weights)
+    score = score_disc(disc, weights)
     checkpoint = checkpoint_level(disc.level)
 
     if preset.skip_locked and disc.locked:
@@ -30,7 +31,7 @@ def decide(disc: Disc, preset: Preset, accepted_ids: Collection[str] | None = No
     if origin is None:
         return _result(Action.STOP, "origin_ambiguous", score, useful_now, useful_max, checkpoint)
 
-    pattern = disc_to_pattern(disc, preset.weights, origin)
+    pattern = disc_to_pattern(disc, weights, origin)
     if pattern is None:
         return _result(Action.STOP, "pattern_unreadable", score, useful_now, useful_max, checkpoint, origin.value)
 

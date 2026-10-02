@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from zzz_ddtool.paths import data_dir
 
@@ -25,11 +25,19 @@ MAINSTAT_NAMES = tuple(_stats["mainstat_names"])
 MAINSTATS = MAINSTAT_NAMES
 
 SLOTS = (1, 2, 3, 4, 5, 6)
+FIXED_MAINSTATS = {1: "生命值", 2: "攻击力", 3: "防御力"}
 
 # 1–3 号位主词条固定，筛选不用选。4–6 和游戏仓库一致。
 SLOT_MAINSTATS: dict[int, tuple[str, ...]] = {
     int(k): tuple(v) for k, v in _stats["slot_mainstats"].items()
 }
+
+
+def blocked_substats(slot: int, mainstats: Iterable[str] = ()) -> set[str]:
+    fixed = FIXED_MAINSTATS.get(slot)
+    if fixed is not None:
+        return {fixed}
+    return set(mainstats) & set(SLOT_MAINSTATS.get(slot, ())) & set(SUBSTAT_NAMES)
 
 
 def default_stage_require(slot: int) -> dict[str, dict[int, float]]:

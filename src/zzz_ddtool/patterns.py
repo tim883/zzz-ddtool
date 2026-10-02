@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations, combinations_with_replacement
 
@@ -113,6 +113,7 @@ def enumerate_patterns(
     *,
     origin: Origin,
     checkpoint: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> list[Pattern]:
     useful = useful_ordered(weights)
     filled = filled_count(origin, checkpoint)
@@ -123,6 +124,8 @@ def enumerate_patterns(
     max_useful = min(len(useful), filled)
     for count in range(0, max_useful + 1):
         for chosen in combinations(useful, count):
+            if cancelled is not None and cancelled():
+                return []
             kinds = list(chosen) + [JUNK] * (filled - count)
             for bonuses in _bonus_assignments(len(kinds), budget, kinds):
                 raw = [Slot(kind, bonus) for kind, bonus in zip(kinds, bonuses, strict=True)]

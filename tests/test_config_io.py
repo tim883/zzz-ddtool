@@ -59,3 +59,24 @@ def test_selectable_mainstats_follow_game_slots() -> None:
     assert "异常掌控" in selectable_mainstats([6])
     assert "暴击伤害" not in selectable_mainstats([5])
     assert "暴击伤害" in selectable_mainstats([])
+
+
+def test_task_limits_roundtrip_and_legacy_fallback(tmp_path: Path) -> None:
+    preset = preset_from_dict({
+        "run": {"max_discs": 29},
+        "task_chain": [
+            {"slot": 1, "max_discs": 5},
+            {"slot": 4, "max_discs": 12},
+            {"slot": 6},
+        ],
+    })
+    path = tmp_path / "chain.yaml"
+    save_preset(path, preset)
+    loaded = load_preset(path)
+    assert [job.max_discs for job in loaded.task_chain] == [5, 12, None]
+    from zzz_ddtool.runner import Runner
+
+    from types import SimpleNamespace
+
+    runner = SimpleNamespace(preset=loaded)
+    assert [Runner._job_limit(runner, job) for job in loaded.task_chain] == [5, 12, 29]
