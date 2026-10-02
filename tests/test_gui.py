@@ -522,6 +522,37 @@ def test_weight_editor_rejects_non_substats(qapp: QApplication) -> None:
     assert set(choices) <= set(SUBSTAT_NAMES)
 
 
+def test_weight_editor_add_button_rejects_non_substat(qapp: QApplication) -> None:
+    """「添加词条」这条路也得挡——下拉框是可编辑的，用户能敲进任意字符串。
+
+    这是脏名字最后一个入口：载入时会被 set_weights 挡，但手敲进去再点添加就绕过了。
+    """
+    editor = WeightEditor()
+    editor.add_combo.setCurrentText("穿透率")
+    editor._add_from_combo()
+
+    assert editor._rows == []  # 一行都没建出来
+    assert editor.weights() == {}
+
+
+def test_trial_name_choices_only_come_from_dictionary(qapp: QApplication) -> None:
+    """「点名」下拉的候选只能来自 data/stats.json，不能被权重表带脏。
+
+    候选必须是**全部 10 个**副词条（没加权的也要能选，它们会算成废词条），
+    而不是「权重表里的那些」。所以这里不接收、也不额外追加权重表的名字。
+    """
+    from zzz_ddtool.gamedata import SUBSTAT_NAMES
+    from zzz_ddtool.gui import TrialPage
+
+    page = TrialPage()
+    page.set_name_choices(set())
+
+    for combo, _rolls in page.rows:
+        items = [combo.itemText(i) for i in range(combo.count())]
+        assert "穿透率" not in items
+        assert {name for name in items if name} == set(SUBSTAT_NAMES)
+
+
 def _card_fingerprint(window: MainWindow) -> dict:
     """把每张卡「显示出来的东西」和它携带的图案逐字核对后快照下来。
 

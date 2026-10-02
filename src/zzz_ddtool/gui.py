@@ -680,13 +680,22 @@ class WeightEditor(QWidget):
         self.add_combo.blockSignals(True)
         self.add_combo.clear()
         self.add_combo.addItems(self._choices())
-        if current not in self._blocked:
+        # 只回填合法名。add_combo 是可编辑的，用户敲过的脏名字（如「穿透率」）不该
+        # 在这里被留下——那等于把刚挡掉的脏名又塞回候选。
+        if current in SUBSTAT_NAMES and current not in self._blocked:
             self.add_combo.setCurrentText(current)
         self.add_combo.blockSignals(False)
 
     def _add_from_combo(self) -> None:
         name = self.add_combo.currentText().strip()
-        if not name or name in self.weights() or name in self._blocked:
+        # 只认真正的副词条。这个下拉框是可编辑的，用户能敲进任意字符串；不挡的话
+        # 敲个「穿透率」点一下「添加词条」就能建出一行，界面上就多出游戏里选不中的词条。
+        if (
+            not name
+            or name not in SUBSTAT_NAMES
+            or name in self.weights()
+            or name in self._blocked
+        ):
             return
         self._add_row(name, 1.0)
         self.changed.emit()
@@ -792,10 +801,17 @@ class TrialPage(QWidget):
         layout.addWidget(self.result)
         layout.addStretch()
 
-    def set_name_choices(self, names: list[str], blocked: set[str] | None = None) -> None:
+    def set_name_choices(self, blocked: set[str] | None = None) -> None:
+        """点名下拉的候选：只给真正的副词条，减去当前被 blocked 的主属性。
+
+        候选**只认** data/stats.json（经 KNOWN_SUBSTATS）。这里原先会把调用方传进来的
+        `names`（权重表里的词条名）中多出来的名字追加进候选，但那个追加是多余的：点名是
+        给「这件盘的副词条」命名，候选必须是**全部 10 个**——没加权的副词条也要能选，
+        它们会算成废词条；而权重表里的名字本来就是这 10 个的子集。于是 `extras` 正常时
+        是空集，唯一的效果是在权重表有脏名时把脏名注入候选。已去掉，参数一并删掉。
+        """
         blocked = set(blocked or ())
         allowed = [name for name in KNOWN_SUBSTATS if name not in blocked]
-        extras = [name for name in names if name and name not in allowed and name not in blocked]
         for combo, _rolls in self.rows:
             current = combo.currentText()
             if current in blocked:
@@ -803,7 +819,7 @@ class TrialPage(QWidget):
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("")
-            combo.addItems(allowed + extras)
+            combo.addItems(allowed)
             combo.setCurrentText(current)
             combo.blockSignals(False)
 
@@ -2083,7 +2099,7 @@ class MainWindow(QMainWindow):
             # 直接清空。新建任务后右侧必须是真的空，就是靠这里。
             for section in self.sections.values():
                 section.set_cards([], lambda _pattern_id: False)
-            self.trial.set_name_choices([], blocked)
+            self.trial.set_name_choices(blocked)
             self._update_status()
             return
         patterns = enumerate_all(weights, hide_junk_bonus=True)
@@ -2107,7 +2123,7 @@ class MainWindow(QMainWindow):
                 section.set_cards(wanted, is_checked)
             else:
                 section.reuse_cards(wanted, is_checked)
-        self.trial.set_name_choices(list(weights), blocked)
+        self.trial.set_name_choices(blocked)
         self._update_status()
 
     def _card_check_policy(self, accepted: tuple[str, ...] | None):
