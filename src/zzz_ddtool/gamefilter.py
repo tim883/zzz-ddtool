@@ -159,7 +159,7 @@ def _toggle_below(lines, title_y: int):
     return best[1] if best else None
 
 
-def _open_mainstat_section(hwnd: int, width: int, height: int) -> None:
+def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
     """把筛选面板滚到「主属性词条」区，并确保该区已展开。
 
     真机标定（2026-10-02，log/captures/probe-filter-open.png）：
@@ -167,6 +167,10 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> None:
     该区默认**收起**，只有一条「点击展开」，点开后才是
     「生命值 / 攻击力百分比 / …」这些复选框。
     此前直接点名，OCR 永远找不到主属性名，滚 8 轮后中断——B5 的根因。
+
+    **返回**「已确认展开」那一帧的 OCR 文本行。紧接着调用的 `_pick_mainstats` 就在同一
+    状态下点名，直接把这一帧交给它，省掉一次全屏 OCR（实测 1.3~1.5s，且中间无点击、
+    帧不会变）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     for _round in range(_MAX_PANEL_SCROLLS + 1):
@@ -180,7 +184,7 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> None:
         if toggle is None:
             raise FilterClickError("主属性词条区没找到「点击展开 / 点击收起」开关，中断。")
         if "收起" in toggle.text.replace(" ", ""):
-            return
+            return lines
         click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
         time.sleep(0.7)
         after = _text_lines()
@@ -188,7 +192,7 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> None:
         after_toggle = _toggle_below(after, after_y) if after_y is not None else None
         if after_toggle is not None and "收起" in after_toggle.text.replace(" ", ""):
             log.info("已点开主属性词条区")
-            return
+            return after
         raise FilterClickError("点了主属性「点击展开」但该区没有展开，中断。")
     raise FilterClickError(
         "滚动面板 %d 轮后仍未看到「主属性词条」区，中断。" % _MAX_PANEL_SCROLLS
@@ -231,17 +235,23 @@ def _best_match(lines, name: str, top: int, bottom: int):
     return best
 
 
-def _pick_mainstats(hwnd: int, names: Sequence[str], *, width: int, height: int) -> None:
+def _pick_mainstats(
+    hwnd: int, names: Sequence[str], *, width: int, height: int, lines: list | None = None
+) -> None:
     """在已展开的主属性词条区里点名勾选。
 
     主属性是复选框，勾上即生效，没有弹层、也没有「确认筛选」；
     逐条精确点名为主，找不齐直接中断，不滚动、不猜。
+
+    `lines` 传入 `_open_mainstat_section` 返回的那一帧即可（两者状态相同、中间无点击），
+    不传则自己抓一帧。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     pending = list(names)
     if not pending:
         return
-    lines = _text_lines()
+    if lines is None:
+        lines = _text_lines()
     title_y = _title_y(lines, MAINSTAT_TITLE)
     if title_y is None:
         raise FilterClickError("主属性词条区不在视口里，无法点名，中断。")
@@ -285,8 +295,9 @@ def apply_sets_mainstats(
         _confirm_popup(hwnd)
         log.info("sets picked: %s", list(sets))
     if mainstats:
-        _open_mainstat_section(hwnd, width, height)
-        _pick_mainstats(hwnd, mainstats, width=width, height=height)
+        # 展开最后一帧直接交给点名用，省一次全屏 OCR（两者之间不点击，帧不变）。
+        lines = _open_mainstat_section(hwnd, width, height)
+        _pick_mainstats(hwnd, mainstats, width=width, height=height, lines=lines)
         log.info("mainstats picked: %s", list(mainstats))
 
 

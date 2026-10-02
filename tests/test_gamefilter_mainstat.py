@@ -223,6 +223,30 @@ def test_apply_sets_mainstats_mainstat_path_has_no_confirm(monkeypatch) -> None:
     assert calls == ["open", "pick"]
 
 
+def test_apply_sets_mainstats_reuses_expand_frame(monkeypatch) -> None:
+    """展开区那一帧直接交给点名复用：整个主属性路径只该抓一帧全屏。
+
+    抓一帧全屏 OCR 实测 1.3~1.5s，多抓一次就是白扔。两函数之间没有任何点击，
+    同一帧状态没变，可以安全复用。这条守住的就是「别再各抓一帧」。
+    """
+    reads: list[int] = []
+    clicks: list[tuple[int, int]] = []
+
+    def counting_text_lines():
+        reads.append(1)
+        return list(PANEL_EXPANDED)
+
+    monkeypatch.setattr(gf, "_text_lines", counting_text_lines)
+    monkeypatch.setattr(gf, "click_client", lambda hwnd, x, y: clicks.append((x, y)))
+    monkeypatch.setattr(gf, "wheel_client", lambda hwnd, x, y: None)
+    monkeypatch.setattr(gf.time, "sleep", lambda seconds: None)
+
+    gf.apply_sets_mainstats(1, 1920, 1080, sets=(), mainstats=["暴击率"])
+
+    assert len(reads) == 1, f"主属性路径抓了 {len(reads)} 帧全屏，应只抓 1 帧"
+    assert clicks == [(1425, 793)]
+
+
 def test_apply_sets_mainstats_set_path_still_confirms(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(gf, "_find_and_click", lambda *a, **kw: calls.append("open-sets") or True)
