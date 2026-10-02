@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
@@ -96,6 +97,7 @@ QMainWindow, QWidget#root, QScrollArea, QScrollArea > QWidget > QWidget {
 }
 QLabel { color: #1a1a1a; }
 QLabel#hint { color: #605e5c; }
+QLabel#savedFlash { color: #107c10; font-weight: 700; }
 QLabel#bannerTitle { font-size: 20px; font-weight: 700; color: #1a1a1a; }
 QLabel#score { color: #0078d7; font-size: 13px; font-weight: 600; }
 QLabel#junk { color: #8a8a8a; }
@@ -727,6 +729,10 @@ class MainWindow(QMainWindow):
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.setInterval(250)
         self._rebuild_timer.timeout.connect(self.rebuild_cards)
+        self._save_flash_timer = QTimer(self)
+        self._save_flash_timer.setSingleShot(True)
+        self._save_flash_timer.setInterval(3000)
+        self._save_flash_timer.timeout.connect(self._restore_path_label)
         self.sections: dict[tuple[str, int], StageSection] = {}
         self._active_slot = 4
         self._slot_plans: dict[int, dict] = {slot: empty_slot_plan(slot) for slot in SLOTS}
@@ -1404,6 +1410,12 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # 配置缺失 / 构建失败
             QMessageBox.warning(self, "无法启动", f"配置构建失败：{exc}")
             return
+        try:
+            save_preset(self._path, preset)
+        except Exception as exc:  # 落盘失败
+            QMessageBox.warning(self, "无法启动", f"开始前自动保存失败：{exc}")
+            return
+        self._flash_saved()
         self.start_btn.setEnabled(False)
         self.start_btn.setText("运行中…")
         self._config_splitter.setEnabled(False)
@@ -1648,6 +1660,9 @@ class MainWindow(QMainWindow):
         self._update_set_summary()
         self._apply_slot_widgets(self._slot_plans[self._active_slot])
         self._refresh_chain_list(self._editing_job_id)
+        self._save_flash_timer.stop()
+        self.path_label.setObjectName("hint")
+        self._repolish_path_label()
         self.path_label.setText(self._path.name)
         self.path_label.setToolTip(str(self._path))
         self._loading = False
@@ -1793,8 +1808,26 @@ class MainWindow(QMainWindow):
 
     def save_current(self) -> None:
         save_preset(self._path, self.collect_preset())
-        self.path_label.setText(f"已保存  {self._path.name}")
+        self._flash_saved()
+
+    def _flash_saved(self) -> None:
+        """保存成功后在该行闪出绿字时间戳，3 秒后自动回到文件名。"""
+        self.path_label.setObjectName("savedFlash")
+        self._repolish_path_label()
+        self.path_label.setText(f"✓ 已保存 · {datetime.now().strftime('%H:%M:%S')}")
         self.path_label.setToolTip(str(self._path))
+        self._save_flash_timer.start()
+
+    def _restore_path_label(self) -> None:
+        self.path_label.setObjectName("hint")
+        self._repolish_path_label()
+        self.path_label.setText(self._path.name)
+        self.path_label.setToolTip(str(self._path))
+
+    def _repolish_path_label(self) -> None:
+        style = self.path_label.style()
+        style.unpolish(self.path_label)
+        style.polish(self.path_label)
 
     def save_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "另存预设", str(self._path), "YAML (*.yaml *.yml)")
