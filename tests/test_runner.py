@@ -19,7 +19,7 @@ from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Action, Disc, Substat
 from zzz_ddtool.navigation import Environment, NavProfile, ScrollSend
 from zzz_ddtool.runner import Runner, RunnerError
-from zzz_ddtool.traversal import CellStatus, GridCell, max_restore_rows
+from zzz_ddtool.traversal import CellStatus, GridCell, TraversalState, max_restore_rows
 
 VIEWPORT_ROWS = 4
 GRID_COLS = 9
@@ -901,3 +901,80 @@ def test_enter_upgrade_failure_cannot_complete(offline_runner, monkeypatch):
     runner.run()
     assert runner.outcome == "failed"
     assert "进入强化页失败" in runner.end_reason
+
+
+# ---------------------------------------------------------------- 测试跳号入口
+
+
+def seed_state(limit_rows=39):
+    state = TraversalState(job_id="j")
+    state.restore_request_limit_rows = limit_rows
+    return state
+
+
+def spy_scroll(monkeypatch, sent):
+    def fake_scroll(hwnd, rows, profile, **kwargs):
+        sent.append(rows)
+        total = rows * profile.events_per_row
+        return ScrollSend(rows, total, total, profile.event_interval_ms)
+
+    monkeypatch.setattr(runner_module, "scroll_rows", fake_scroll)
+
+
+def test_start_index_seeds_prefix_and_lands_on_target_row(offline_runner, monkeypatch):
+    """--start-index 把起点摆到指定序号所在行，前面的格标为已跳过。"""
+    sent: list[int] = []
+    spy_scroll(monkeypatch, sent)
+    runner = Runner(Preset(max_discs=1), hotkeys=False, start_index=99)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    state = seed_state()
+
+    runner._seed_start_index(1, state, runner.start_index)
+
+    assert state.next_index == 99
+    assert state.viewport_top_row0 == 10  # 序号 99 = 全局第 12 行第 1 列 → 视口顶部第 11 行
+    assert state.row_phase_px == 0.0
+    assert state.at_top is False
+    assert state.position_valid is True
+    assert state.status_of(99) is CellStatus.PENDING  # 起点本身不被标跳过
+    # 置顶由 _prepare_navigation 负责，跳号只做「滚到目标行」
+    offline_runner["reset_to_top"].assert_not_called()
+    assert sent == [10]
+
+
+def test_start_index_inside_first_row_needs_no_scroll(offline_runner, monkeypatch):
+    """起点落在第一屏内时不发滚动，视口仍按「已到顶」处理。"""
+    sent: list[int] = []
+    spy_scroll(monkeypatch, sent)
+    runner = Runner(Preset(max_discs=1), hotkeys=False, start_index=5)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    state = seed_state()
+
+    runner._seed_start_index(1, state, 5)
+
+    assert state.next_index == 5
+    assert state.viewport_top_row0 == 0
+    assert state.at_top is True
+    assert sent == []
+
+
+def test_start_index_does_not_touch_earlier_cells(offline_runner, monkeypatch):
+    """跳号启动后首个处理的就是起点本身，序号更小的格位一次都不点。"""
+    runner = Runner(Preset(max_discs=1, accepted=()), hotkeys=False, start_index=99)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=16))
+    grid.offset = 10  # 跳号把视口摆到全局第 11 行
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert grid.visited == [(11, 0)]  # 内部序号 99
+    assert runner.processed_disc_count == 1
+
+
+def test_start_index_defaults_to_zero(offline_runner):
+    assert Runner(Preset(), hotkeys=False).start_index == 0
+    assert Runner(Preset(), hotkeys=False, start_index=-5).start_index == 0

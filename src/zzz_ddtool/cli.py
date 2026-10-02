@@ -48,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run_p = sub.add_parser("run", help="按配置的任务链自动处理驱动盘（强化/弃置）")
     run_p.add_argument("--config", type=Path, required=True, help="YAML preset")
+    run_p.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        metavar="N",
+        help="[测试用] 跳过前 N 个内部序号，直接把视口摆到第 N 个并从这里开始；"
+        "前面的格标为已跳过、不点击不识别不计数。默认 0（不跳过，正常从第一个开始）。",
+    )
 
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
@@ -215,7 +223,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     logging.getLogger("zzz_ddtool").addHandler(handler)
 
     preset = load_preset(args.config)
-    runner = Runner(preset)
+    runner = Runner(preset, start_index=getattr(args, "start_index", 0) or 0)
     try:
         results = runner.run()
     except RunnerError as exc:

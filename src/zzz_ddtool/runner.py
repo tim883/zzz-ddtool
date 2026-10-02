@@ -50,6 +50,7 @@ from zzz_ddtool.traversal import (
     TraversalState,
     check_forward_move,
     check_layout_reference,
+    global_row_col,
     make_filter_signature,
     map_labels,
     max_restore_rows,
@@ -81,8 +82,19 @@ class RunResult:
 class Runner:
     """执行一个 Preset。任务链为空时，用 preset 当前槽位合成一个默认任务。"""
 
-    def __init__(self, preset: Preset, *, hotkeys: bool = True, controller=None, on_status=None) -> None:
+    def __init__(
+        self,
+        preset: Preset,
+        *,
+        hotkeys: bool = True,
+        controller=None,
+        on_status=None,
+        start_index: int = 0,
+    ) -> None:
         self.preset = preset
+        # 测试入口：>0 时跳过前 start_index 个内部序号直接从它开始（见 _seed_start_index）。
+        # 只在 CLI --start-index 显式给出时非零，预设文件不带这个字段。
+        self.start_index = max(0, int(start_index))
         self.log = get_logger("zzz_ddtool.runner")
         self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
         self.results: list[RunResult] = []
@@ -310,7 +322,10 @@ class Runner:
         self._state = state
 
         profile = self._prepare_navigation(hwnd, state)
-        state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=False)
+        if self.start_index > 0:
+            self._seed_start_index(hwnd, state, self.start_index)
+        else:
+            state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=False)
         state.start_first_batch()
         self._set_status("batch", "首批网格起点")
 
@@ -462,6 +477,82 @@ class Runner:
             f"协议 {profile.events_per_row}事件/行@{profile.event_interval_ms}ms",
         )
         return profile
+
+    def _seed_start_index(self, hwnd: int, state: TraversalState, start_index: int) -> None:
+        """[测试入口] 把任务起点直接摆到指定内部序号，不真处理它前面的盘。
+
+        跳过的是「状态」而不是「路径」：spec §8 的深序号验收场景只规定
+        「视口在全局第 11~14 行、处理第 100 件」，没要求先真跑 99 件。所以这里
+        把 [0, start_index) 全部标为 SKIPPED（不点击、不识别、不计数），
+        再按实测滚轮协议把视口滚到该序号所在行，最后按实测布局确认视口。
+
+        生产方式不启用：只由 CLI --start-index 打开，日志与 trace 都显式标注，
+        以免把跳号跑误认成真实跑。
+        """
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("没有可用的滚轮协议，无法跳号启动")
+        if self._row_pitch <= 0:
+            raise RunnerError("行距未知，无法跳号启动")
+
+        row0, col0 = global_row_col(start_index)
+        # 起点放在屏幕第 2 行（与 spec §8 验收场景一致）；起点在第 0 行时贴顶。
+        top_row0 = max(0, row0 - 1)
+
+        for index in range(start_index):
+            state.set_status(index, CellStatus.SKIPPED)
+        advanced = state.commit_prefix()
+        if advanced != start_index:
+            raise RunnerError(f"跳号启动失败：next_index={advanced}，期望 {start_index}")
+
+        if top_row0 > 0:
+            send = scroll_rows(
+                hwnd, top_row0, profile, before_event=lambda _index: self._checkpoint()
+            )
+            if not send.complete:
+                raise RunnerError("跳号启动的批量滚动未完成，停止任务链")
+            self._await_scroll_settle(profile)
+
+        image, _method, _hwnd = grab_game_image(hwnd)
+        origin, pitch = measure_layout(image)
+        reason = check_layout_reference(origin, pitch, image.width(), image.height())
+        if reason:
+            raise RunnerError(f"跳号启动后原点复核不通过：{reason}，停止任务链")
+        self._origin_center_y = float(origin)
+        self._row_pitch = float(pitch)
+        profile = replace(
+            profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y
+        )
+        self._profile = profile
+        state.navigation_profile = profile.as_dict()
+        state.confirm_viewport(
+            top_row0,
+            0.0,
+            row_pitch_px=self._row_pitch,
+            at_top=top_row0 == 0,
+            at_bottom=False,
+        )
+        state.clear_scroll()
+        self.log.warning(
+            "测试入口：跳号启动 next_index=%d（全局第 %d 行第 %d 列），视口顶部全局第 %d 行；"
+            "前 %d 格标记为已跳过（未实际处理）",
+            start_index,
+            row0 + 1,
+            col0 + 1,
+            top_row0 + 1,
+            start_index,
+        )
+        self._set_status(
+            "seed",
+            f"测试跳号启动：next_index={start_index}（全局第 {row0 + 1} 行第 {col0 + 1} 列）",
+        )
+        self.trace.warn(
+            "drive_disc",
+            "seed",
+            f"测试跳号：起点内部序号 {start_index}（全局第 {row0 + 1} 行第 {col0 + 1} 列），"
+            f"视口顶部全局第 {top_row0 + 1} 行，前 {start_index} 格标为已跳过（未实际处理）",
+            image=image,
+        )
 
     # ---------------------------------------------------------------- 扫描
 
