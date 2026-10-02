@@ -1453,9 +1453,22 @@ class MainWindow(QMainWindow):
             self.pause_btn.setEnabled(False)
 
     def _show_run_status(self, data: dict) -> None:
+        row, col = data.get("global_row"), data.get("global_col")
+        where = f"全局{row}行{col}列  " if row else ""
+        viewport = data.get("viewport_top_row")
+        view = f"视口第{viewport}行  " if viewport else ""
+        restore = ""
+        target = data.get("restore_target")
+        if target is not None:
+            restore = f"恢复点第{int(target.get('viewport_top_row0', 0)) + 1}行"
+            attempt = data.get("restore_attempt")
+            if attempt:
+                restore += f"（第 {attempt} 次）"
+            restore += "  "
         self.run_status_label.setText(
             f"运行状态：{data.get('phase', '—')}  格子:{data.get('cell') or '—'}  "
             f"进度:{data.get('processed', 0)}/{data.get('max_discs', 0)}\n"
+            f"{where}{view}{restore}\n"
             f"{data.get('message', '')}"
         )
         self.run_status_label.setWordWrap(True)

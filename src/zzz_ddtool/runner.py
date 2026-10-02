@@ -97,7 +97,8 @@ class Runner:
         self._profile: NavProfile | None = None
         self._origin_center_y: float = 0.0
         self._row_pitch: float = 175.0
-        self._selected_cell: GridCell | None = None
+        # 强化后恢复时的校验扫描结果，直接交给主循环复用（避免重复 OCR 目标列表）
+        self._restored_scan: tuple | None = None
 
     @property
     def processed_disc_count(self) -> int:
@@ -217,6 +218,7 @@ class Runner:
         self._processed = 0
         self._status_lines = []
         self._state = None
+        self._restored_scan = None
         self.outcome = "running"
         self.end_reason = ""
         jobs = self._jobs()
@@ -310,7 +312,6 @@ class Runner:
         self._set_status("batch", "首批网格起点")
 
         up_counts: dict[int, int] = {}
-        resume_after_selection = False
 
         while True:
             self._checkpoint()
@@ -322,7 +323,11 @@ class Runner:
                 )
                 break
 
-            cells, problems, skips = self._scan_cells_with_retry(state)
+            if self._restored_scan is not None:
+                cells, problems, skips = self._restored_scan
+                self._restored_scan = None
+            else:
+                cells, problems, skips = self._scan_cells_with_retry(state)
             ready, deferred = split_stable_cells(
                 cells, at_top=state.at_top, at_bottom=state.at_bottom
             )
@@ -342,16 +347,6 @@ class Runner:
                     break  # 前方有未解决格位（屏障），不能越过
                 pending.append(cell)
                 expected += 1
-
-            if resume_after_selection:
-                resume_after_selection = False
-                selected = self._selected_cell
-                if selected is None:
-                    self.trace.fail(
-                        "drive_disc", "scan", "重扫未找到唯一选中框，停止以免跳盘", image=self._scan_image
-                    )
-                    raise RunnerError("重扫未找到唯一选中框，停止任务链")
-                pending = [c for c in pending if c.global_index > selected.global_index]
 
             self.log.info(
                 "batch %d: %d pending, %d skipped, %d deferred",
@@ -382,6 +377,7 @@ class Runner:
                 continue
 
             broke = False
+            restore_after_upgrade = False
             for cell in pending:
                 self._checkpoint()
                 if self._processed >= self.preset.max_discs:
@@ -391,14 +387,17 @@ class Runner:
                 )
                 if result in ("rescan", "upgrade"):
                     broke = True
-                    # 强化改变排序：本批坐标作废，重扫后从原焦点之后继续（阶段4接恢复）
-                    resume_after_selection = result == "upgrade"
+                    # 强化改变排序：本批坐标作废（spec §6.3.5）。未达处理上限且未停止时，
+                    # 置顶并按保存视口恢复，再从 next_index 重建候选。
+                    restore_after_upgrade = result == "upgrade"
                     break
                 state.set_status(cell.global_index, CellStatus.DONE)
                 state.commit_prefix()
                 self._set_status("progress", f"next_index={state.next_index}", self._cell_tag(cell))
             if broke:
                 state.invalidate_position()
+                if restore_after_upgrade and self._processed < self.preset.max_discs:
+                    self._restore_position(hwnd, state)
                 continue
             if self._processed >= self.preset.max_discs:
                 break
@@ -479,7 +478,6 @@ class Runner:
         from zzz_ddtool.equipped import (
             tile_has_discard_badge,
             tile_has_portrait,
-            tile_is_selected,
         )
         from zzz_ddtool.ocr import read_rect
 
@@ -489,7 +487,6 @@ class Runner:
             raise RunnerError(f"扫描前页面错误：{page}，停止任务链")
         self._scan_image = image
 
-        width, height = image.width(), image.height()
         metrics = self._metrics(state, image)
         labels: list[tuple[float, float, int]] = []
         for line in read_rect(image, LABEL_SCAN_AREA):
@@ -513,14 +510,8 @@ class Runner:
             row_phase_px=state.row_phase_px or 0.0,
         )
 
-        selected: list[GridCell] = []
         skips: dict[int, str] = {}
         for cell in cells:
-            design_cx = round(cell.center_x * 1920 / width)
-            design_cy = round(cell.center_y * 1080 / height)
-            if tile_is_selected(image, design_cx, design_cy):
-                selected.append(cell)
-                continue
             if self.preset.skip_max_level and cell.level >= MAX_LEVEL:
                 skips[cell.global_index] = f"等级 {cell.level} 已满"
                 continue
@@ -538,7 +529,6 @@ class Runner:
             ):
                 skips[cell.global_index] = "已打弃置标记"
                 continue
-        self._selected_cell = selected[0] if len(selected) == 1 else None
         return cells, problems, skips
 
     def _scan_cells_with_retry(self, state: TraversalState):
@@ -631,19 +621,26 @@ class Runner:
                     "upgrade",
                     f"{where} 已升 {up_counts.get(cell.global_index, 0)} 次，到上限不再升",
                 )
+                self._record(job, disc, decision)
+                time.sleep(0.3)
+                return "done"  # 没进强化页，画面未变，坐标仍然有效
+            if disc.discarded:
+                press_key_once(hwnd, VK_R)
+                time.sleep(0.5)
+                self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
+                self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
+            # 进强化页前保存恢复点（spec §6.3.1）；连续升阶途中沿用同一恢复点，
+            # 强化后的焦点不覆盖它。
+            state.begin_upgrade(cell.global_index)
+            if self._enter_upgrade_page(hwnd):
+                self._upgrade_loop(
+                    hwnd, job, cell.global_index, cell_tag, sub_preset, accepted_ids, up_counts
+                )
             else:
-                if disc.discarded:
-                    press_key_once(hwnd, VK_R)
-                    time.sleep(0.5)
-                    self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
-                    self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
-                if self._enter_upgrade_page(hwnd):
-                    self._upgrade_loop(
-                        hwnd, job, cell.global_index, cell_tag, sub_preset, accepted_ids, up_counts
-                    )
-                else:
-                    raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
-            # 强化会改变排序：本批作废，重扫（坐标与数组全部重建）
+                raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
+            # 最终保留/跳过/弃置完成且确认回到仓库后，提交该件进度（spec §6.3.3）。
+            state.finish_upgrade(CellStatus.DONE)
+            self._set_status("upgrade_done", f"next_index={state.next_index}", cell_tag)
             return "upgrade"
         if decision.action == Action.MARK_DISCARD and disc.discarded:
             self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
@@ -734,6 +731,86 @@ class Runner:
         if at_bottom:
             self.log.info("滚动被端点截停（请求 %d 实际 %d），标记到底", rows, advanced)
         return advanced > 0 or at_bottom
+
+    # ---------------------------------------------------------------- 强化后恢复
+
+    def _restore_position(self, hwnd: int, state: TraversalState) -> None:
+        """强化改变排序后，恢复保存的视口（spec §5.3、§6.3.5）。
+
+        「切页置顶 → 按保存视口批量返回」是完整的一次恢复尝试，最多两次；第二次
+        只用于可重试的运行误差（目标网格/相位暂时读不出、位移或端点不一致）。
+        请求超上界、协议缺失、进入流程外错误页直接 failed，不做第二次。每次尝试
+        后做一次目标网格校验扫描，成功即缓存给主循环，恢复流程不重复 OCR。
+        """
+        if state.resume_point is None:
+            raise RunnerError("强化后没有保存的恢复点，停止任务链")
+        if not state.within_restore_limit():
+            raise RunnerError(
+                f"恢复请求 {state.restore_request_rows()} 行超过上界 "
+                f"{state.restore_request_limit_rows}，停止任务链"
+            )
+        saved = state.resume_point
+        state.reset_restore_attempts()
+        last_reason = ""
+        for attempt in (1, 2):
+            state.begin_restore_attempt()
+            self._set_status(
+                "restore",
+                f"第 {attempt} 次恢复：返回全局第 {saved.viewport_top_row0 + 1} 行视口",
+            )
+            self._restore_once(hwnd, state, saved)
+            cells, problems, skips = self._scan_cells(state)
+            if not problems:
+                self._restored_scan = (cells, problems, skips)
+                state.clear_resume()  # 已恢复到保存视口，恢复点可以释放
+                self.trace.ok(
+                    "drive_disc",
+                    "restore",
+                    f"已恢复到全局第 {saved.viewport_top_row0 + 1} 行视口，"
+                    f"next_index={state.next_index}",
+                    image=self._scan_image,
+                )
+                return
+            last_reason = problems[0]
+            self.log.warning("恢复第 %d 次校验不通过：%s", attempt, last_reason)
+            self.trace.warn(
+                "drive_disc", "restore", f"第 {attempt} 次恢复校验不通过：{last_reason}"
+            )
+        # 第二次仍不匹配：不能再重试（spec §5.3）。
+        raise RunnerError(f"恢复保存视口失败（两次尝试）：{last_reason}，停止任务链")
+
+    def _restore_once(self, hwnd: int, state: TraversalState, saved) -> None:
+        """一次完整的「切页置顶 → 按保存视口批量返回」，并提交保存的实际位置。"""
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("没有可用的滚轮协议，无法恢复位置")
+
+        reset_to_top()
+        image, _method, _hwnd = grab_game_image(hwnd)
+        origin, pitch = measure_layout(image)
+        reason = check_layout_reference(origin, pitch, image.width(), image.height())
+        if reason:
+            raise RunnerError(f"恢复前原点复核不通过：{reason}，停止任务链")
+        self._origin_center_y = float(origin)
+        self._row_pitch = float(pitch)
+        profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
+        self._profile = profile
+        state.navigation_profile = profile.as_dict()
+
+        rows = state.restore_request_rows()
+        if rows > 0:
+            send = scroll_rows(hwnd, rows, profile, before_event=lambda _index: self._checkpoint())
+            if not send.complete:
+                raise RunnerError("恢复批量发送未完成，停止任务链")
+        # 提交保存的实际视口，不新建工作批次（spec §5.3、§6.4）。
+        state.confirm_viewport(
+            saved.viewport_top_row0,
+            saved.row_phase_px,
+            row_pitch_px=self._row_pitch,
+            at_top=saved.at_top,
+            at_bottom=saved.at_bottom,
+        )
+        state.clear_scroll()
 
     # ---------------------------------------------------------------- 详情与强化
 

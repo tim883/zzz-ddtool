@@ -271,8 +271,11 @@ def test_single_resume_point_for_multi_stage_upgrade():
     assert state.resume_point.row_phase_px == 50.0  # 不被后续焦点覆盖
 
     assert state.finish_upgrade() == 101
-    assert state.resume_point is None
     assert state.active_index is None
+    # 恢复点保留到定位恢复完成（spec §6.3.3、§6.3.5），恢复后显式释放。
+    assert state.resume_point is not None
+    state.clear_resume()
+    assert state.resume_point is None
 
 
 def test_upgrade_cannot_skip_earlier_unresolved_cell():

@@ -605,11 +605,14 @@ class TraversalState:
         return self.resume_point
 
     def finish_upgrade(self, status: CellStatus = CellStatus.DONE) -> int:
-        """单件最终判断结束并已回到仓库后调用：提交该件进度，释放恢复点。"""
+        """单件最终判断结束并已回到仓库后调用：提交该件进度。
+
+        恢复点保留到这里为止：调用方随后按恢复点定位，成功恢复后再
+        `clear_resume()`（spec §6.3.3、§6.3.5）；不需要恢复时整个状态即丢弃。
+        """
         if self.active_index is not None:
             self.set_status(self.active_index, status)
         self.active_index = None
-        self.resume_point = None
         self.clear_scroll()
         return self.commit_prefix()
 

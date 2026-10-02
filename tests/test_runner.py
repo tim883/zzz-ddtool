@@ -15,9 +15,9 @@ from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Action, Disc, Substat
-from zzz_ddtool.navigation import Environment, NavProfile
+from zzz_ddtool.navigation import Environment, NavProfile, ScrollSend
 from zzz_ddtool.runner import Runner, RunnerError
-from zzz_ddtool.traversal import GridCell
+from zzz_ddtool.traversal import CellStatus, GridCell, max_restore_rows
 
 VIEWPORT_ROWS = 4
 GRID_COLS = 9
@@ -127,10 +127,19 @@ def offline_runner(monkeypatch):
     monkeypatch.setattr(runner_module, "find_game_hwnd", lambda: 1)
     monkeypatch.setattr(runner_module, "window_pid", lambda hwnd: 100)
     monkeypatch.setattr(runner_module, "grab_game_image", lambda hwnd=None: (image, "test", 1))
-    monkeypatch.setattr(runner_module, "reset_to_top", Mock())
     monkeypatch.setattr(runner_module, "measure_layout", lambda img: (267.0, 175.0))
     monkeypatch.setattr(runner_module, "probe_environment", lambda hwnd: fake_env())
     monkeypatch.setattr(runner_module, "load_profile", lambda env: fake_profile())
+    monkeypatch.setattr(
+        runner_module,
+        "scroll_rows",
+        lambda hwnd, rows, profile, **kwargs: ScrollSend(
+            rows,
+            rows * profile.events_per_row,
+            rows * profile.events_per_row,
+            profile.event_interval_ms,
+        ),
+    )
 
     # 默认两行数据：首行可点、末行被延后，模拟真实稳定行策略
     default_cells = ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
@@ -140,7 +149,14 @@ def offline_runner(monkeypatch):
 
     inputs = {
         name: Mock()
-        for name in ("goto_warehouse", "apply_game_filter", "click_client", "press_key", "press_key_once")
+        for name in (
+            "goto_warehouse",
+            "apply_game_filter",
+            "click_client",
+            "press_key",
+            "press_key_once",
+            "reset_to_top",
+        )
     }
     for name, mock in inputs.items():
         monkeypatch.setattr(runner_module, name, mock)
@@ -281,24 +297,189 @@ def test_max_discs_stops_mid_batch_without_scrolling(offline_runner, monkeypatch
 # ---------------------------------------------------------------- 重扫与失败传播
 
 
-def test_rescan_without_unique_selection_stops(offline_runner, monkeypatch):
-    # 升级改变排序必须重扫；重扫读不到唯一选中框时不能猜，直接失败。
-    runner = Runner(Preset(max_discs=5, accepted=None), hotkeys=False)
+# ---------------------------------------------------------------- 强化后恢复
+
+
+def blank_image():
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(0)
+    return image
+
+
+def test_restore_position_returns_to_saved_viewport(offline_runner, monkeypatch):
+    """恢复：置顶一次 → 按保存视口发送协议行数 → 提交保存的实际位置。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.confirm_viewport(10, 50.0, row_pitch_px=175.0, at_top=False, at_bottom=False)
+    state.begin_upgrade(100)
+    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([make_cell(10, 0, 0)], [], {}))
+    sent: list[int] = []
+
+    def fake_scroll(hwnd, rows, profile, **kwargs):
+        sent.append(rows)
+        return ScrollSend(rows, rows, rows, profile.event_interval_ms)
+
+    monkeypatch.setattr(runner_module, "scroll_rows", fake_scroll)
+    runner._restore_position(1, state)
+    assert sent == [11]  # ceil(10 + 50/175)
+    assert (state.viewport_top_row0, state.row_phase_px) == (10, 50.0)
+    assert state.resume_point is None  # 恢复完成即释放
+    assert state.position_valid is True
+    offline_runner["reset_to_top"].assert_called_once()
+    assert runner._restored_scan is not None  # 校验扫描结果留给主循环复用
+
+
+def test_restore_retries_once_when_grid_unreadable(offline_runner, monkeypatch):
+    """第一次恢复后网格读不出 → 允许一次完整重试；第二次成功。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.confirm_viewport(4, 0.0, row_pitch_px=175.0)
+    state.begin_upgrade(36)
+    results = iter(
+        [
+            ([make_cell(4, 0, 0)], ["标签(300,500)无法映射到行列"], {}),
+            ([make_cell(4, 0, 0)], [], {}),
+        ]
+    )
+    monkeypatch.setattr(runner, "_scan_cells", lambda s: next(results))
+    runner._restore_position(1, state)
+    assert state.restore_attempt == 2
+    assert state.restore_retries == 1
+    assert offline_runner["reset_to_top"].call_count == 2
+
+
+def test_restore_twice_unreadable_fails(offline_runner, monkeypatch):
+    """两次完整恢复后网格仍读不出：停止任务链，不再重试。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.confirm_viewport(4, 0.0, row_pitch_px=175.0)
+    state.begin_upgrade(36)
+    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([], ["标签无法映射到行列"], {}))
+    with pytest.raises(RunnerError, match="恢复保存视口失败"):
+        runner._restore_position(1, state)
+    assert state.restore_attempt == 2
+    assert offline_runner["reset_to_top"].call_count == 2
+
+
+def test_restore_over_limit_fails_before_any_input(offline_runner, monkeypatch):
+    """恢复请求超过本任务上界 H：发送任何输入前 failed。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+    state.restore_request_limit_rows = 5
+    state.confirm_viewport(10, 0.0, row_pitch_px=175.0)
+    state.begin_upgrade(90)
+    with pytest.raises(RunnerError, match="超过上界"):
+        runner._restore_position(1, state)
+    offline_runner["reset_to_top"].assert_not_called()
+    assert state.restore_attempt == 0 and state.restore_retries == 0
+
+
+def test_restore_without_protocol_fails(offline_runner, monkeypatch):
+    """没有可用滚轮协议时不允许恢复，直接 failed。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = None
+    state = _state()
+    state.confirm_viewport(0, 0.0, row_pitch_px=175.0)
+    state.begin_upgrade(0)
+    with pytest.raises(RunnerError, match="滚轮协议"):
+        runner._restore_position(1, state)
+
+
+def test_restore_failure_stops_entire_chain(offline_runner, monkeypatch):
+    """首批正常、恢复校验失败：failed 且不进入下一个 TaskJob。"""
+    jobs = (
+        TaskJob(slot=4, weights={"暴击率": 1}, accepted=None),
+        TaskJob(slot=5, weights={"暴击率": 1}, accepted=None),
+    )
+    runner = Runner(Preset(task_chain=jobs, max_discs=5), hotkeys=False)
+    calls = {"n": 0}
 
     def scan(state):
-        runner._selected_cell = None
-        return [make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {}
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {}
+        return [make_cell(0, 0, 0)], ["标签(300,500)无法映射到行列"], {}
 
     monkeypatch.setattr(runner, "_scan_cells", scan)
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
-    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_upgrade_loop", Mock())
     runner.run()
     assert runner.outcome == "failed"
-    assert "重扫未找到唯一选中框" in runner.end_reason
-    assert offline_runner["click_client"].call_count == 1
+    assert "恢复保存视口失败" in runner.end_reason
+    offline_runner["goto_warehouse"].assert_called_once()
+
+
+def test_upgrade_cap_does_not_open_upgrade_page(offline_runner, monkeypatch):
+    """升阶到上限后不再进强化页：画面未变，按 done 继续用本批坐标。"""
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    state = _state()
+    state.confirm_viewport(0, 0.0, row_pitch_px=175.0)
+    monkeypatch.setattr(runner, "_grab", lambda *a, **kw: (blank_image(), "drive_disc", "test", 1))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    enter = Mock()
+    monkeypatch.setattr(runner, "_enter_upgrade_page", enter)
+    job = runner._default_job()
+    result = runner._process_cell(1, job, state, make_cell(0, 0, 0), runner._sub_preset(job), None, {0: 6})
+    assert result == "done"
+    enter.assert_not_called()
+    assert state.resume_point is None
+    offline_runner["press_key"].assert_not_called()
+
+
+def test_upgrade_saves_resume_point_before_entering_page(offline_runner, monkeypatch):
+    """进强化页前必须保存恢复点；强化后提交该件进度并交给恢复流程。"""
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.confirm_viewport(2, 0.0, row_pitch_px=175.0, at_top=False)
+    for index in range(18):
+        state.set_status(index, CellStatus.DONE)
+    state.commit_prefix()
+    runner._profile = fake_profile()
+    monkeypatch.setattr(runner, "_grab", lambda *a, **kw: (blank_image(), "drive_disc", "test", 1))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    seen: dict = {}
+
+    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts):
+        seen["resume"] = state.resume_point
+        seen["active"] = state.active_index
+
+    monkeypatch.setattr(runner, "_upgrade_loop", upgrade_loop)
+    job = runner._default_job()
+    result = runner._process_cell(1, job, state, make_cell(2, 0, 0), runner._sub_preset(job), None, {})
+    assert result == "upgrade"
+    assert seen["resume"] is not None and seen["resume"].viewport_top_row0 == 2
+    assert seen["active"] == 18
+    assert seen["resume"].next_index == 19
+    assert state.next_index == 19  # finish_upgrade 已提交该件
+    assert state.resume_point is not None  # 恢复完成前仍保留
+
+
+def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkeypatch):
+    """第 N 件强化后达 max_discs：直接结束，不为恢复原位置再切页/滚动。"""
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    monkeypatch.setattr(
+        runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
+    )
+    monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_upgrade_loop", Mock())
+    runner.run()
+    assert runner.outcome == "completed"
+    assert runner.processed_disc_count == 1
+    # 仅任务开始时标定前后各置顶一次，恢复不再置顶。
+    assert offline_runner["reset_to_top"].call_count == 2
 
 
 def test_click_leaving_page_recovers_and_rescans(offline_runner, monkeypatch):
