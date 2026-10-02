@@ -12,9 +12,27 @@ UNKNOWN = "unknown"
 # 盘面查看/强化弹窗右上角关闭 X。只有确认弹窗存在，才允许 Esc 回退。
 DISC_MODAL_CLOSE = IconMark("盘面弹窗关闭", "discs/modal-close.png", (1625, 187, 1694, 234), 0.90)
 
+# 详情页点「查看/强化」后的缩放预览层：右上角有「等级xx/15」，但**没有**关闭 X；
+# 再 Esc 一次才回网格。区域只框缩放页的等级文字，详情页侧栏与仓库页都不在此处出词。
+DISC_PREVIEW_LEVEL_AREA = (1140, 175, 1420, 265)
+
 
 def is_disc_modal(image) -> bool:
     return all_marks_hit(image, (DISC_MODAL_CLOSE,))
+
+
+def is_disc_preview(image) -> bool:
+    """缩放预览层（详情页点「查看/强化」后的放大页）。
+
+    这一层没有关闭 X，不能靠模板认；用右上角固定的「等级xx/15」文字判定，
+    使 Esc 回退可以逐层退到网格，而不是当成未知画面卡住。
+    """
+    from zzz_ddtool.ocr import read_rect
+
+    for line in read_rect(image, DISC_PREVIEW_LEVEL_AREA):
+        if line.text.replace(" ", "").startswith("等级"):
+            return True
+    return False
 
 PAGE_MARKS: dict[str, tuple[IconMark, ...]] = {
     OVERWORLD: (

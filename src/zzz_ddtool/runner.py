@@ -859,8 +859,12 @@ class Runner:
             self.log.info("action=STOP")
 
     def _esc_back_to_grid(self, hwnd: int, max_esc: int = 4) -> bool:
-        """先认页再逐次退弹窗；已经在仓库时不按键，失败抛错终止任务链。"""
-        from zzz_ddtool.screen import is_disc_modal
+        """先认页再逐次退弹窗；已经在仓库时不按键，失败抛错终止任务链。
+
+        盘面弹层有三层：缩放预览层（无关闭 X，靠等级文字认）、强化层（有 X）、
+        详情侧栏（本身判为驱动盘仓库）。只有确认这几种层存在才按 Esc。
+        """
+        from zzz_ddtool.screen import is_disc_modal, is_disc_preview
 
         esc_count = unknown_count = 0
         while True:
@@ -873,7 +877,7 @@ class Runner:
                 reason = f"返回驱动盘仓库失败：停在{trace_page(page)}，停止任务链"
                 self.trace.fail(page, "esc", reason, image=image)
                 raise RunnerError(reason)
-            if not is_disc_modal(image):
+            if not (is_disc_modal(image) or is_disc_preview(image)):
                 # 动画中可能暂时认不出，有限重拍；未知画面绝不盲按 Esc。
                 unknown_count += 1
                 if unknown_count >= max(1, self.preset.ocr_retry):

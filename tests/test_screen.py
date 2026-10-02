@@ -11,7 +11,16 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from zzz_ddtool.layout import scale_point
-from zzz_ddtool.screen import DRIVE_DISC, MENU, OVERWORLD, STORAGE, UNKNOWN, classify_image, is_disc_modal
+from zzz_ddtool.screen import (
+    DRIVE_DISC,
+    MENU,
+    OVERWORLD,
+    STORAGE,
+    UNKNOWN,
+    classify_image,
+    is_disc_modal,
+    is_disc_preview,
+)
 
 
 @pytest.fixture(scope="module")
@@ -72,3 +81,25 @@ def test_upgrade_return_real_screens(qapp, name, page, modal):
     image = QImage(str(Path(__file__).parent / "fixtures" / name))
     assert classify_image(image) == page
     assert is_disc_modal(image) is modal
+
+
+def test_zoom_preview_layer_is_recognized(qapp):
+    """缩放预览层没有关闭 X，只能靠右上角「等级xx/15」认。
+
+    2026-10-02 真机：从强化页 Esc 一层后停在这一层，旧判据当成未知画面，
+    回退重拍耗尽导致整条任务链失败。
+    """
+    image = QImage(str(Path(__file__).parent / "fixtures" / "zoom-preview.png"))
+    assert classify_image(image) == UNKNOWN
+    assert is_disc_modal(image) is False
+    assert is_disc_preview(image) is True
+
+
+@pytest.mark.parametrize("name", [
+    "upgrade-modal.png",
+    "warehouse-after-upgrade-discard.png",
+    "warehouse-detail.png",
+])
+def test_other_layers_are_not_zoom_preview(qapp, name):
+    image = QImage(str(Path(__file__).parent / "fixtures" / name))
+    assert is_disc_preview(image) is False

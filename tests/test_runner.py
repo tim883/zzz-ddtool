@@ -11,6 +11,7 @@ from PySide6.QtGui import QImage
 
 import zzz_ddtool.ocr as ocr_module
 import zzz_ddtool.runner as runner_module
+import zzz_ddtool.screen as screen_module
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
@@ -162,6 +163,8 @@ def offline_runner(monkeypatch):
         monkeypatch.setattr(runner_module, name, mock)
     monkeypatch.setattr("zzz_ddtool.overlay.overlay_hide", Mock())
     monkeypatch.setattr("zzz_ddtool.overlay.overlay_show", Mock())
+    # 缩放预览层判据默认关掉（真实现要跑 OCR）；需要模拟它的用例自行覆盖。
+    monkeypatch.setattr(screen_module, "is_disc_preview", lambda image: False)
     return inputs
 
 
@@ -666,6 +669,22 @@ def test_return_from_warehouse_does_not_press_escape(offline_runner, monkeypatch
     runner._discard_from_upgrade(1)
     offline_runner["press_key"].assert_not_called()
     offline_runner["press_key_once"].assert_called_once_with(1, runner_module.VK_R)
+
+
+def test_return_from_zoom_preview_escapes_then_r(offline_runner, monkeypatch):
+    """强化页 Esc 一层后停在缩放预览层：认出来再 Esc 一次，不能当未知画面卡住。"""
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(0)
+    frames = iter([(image, "unknown", "test", 1), (image, "drive_disc", "test", 1)])
+    runner = Runner(Preset(), hotkeys=False)
+    monkeypatch.setattr(runner, "_grab", lambda **kw: next(frames))
+    monkeypatch.setattr(screen_module, "is_disc_preview", lambda img: True)
+    runner._discard_from_upgrade(1)
+    assert offline_runner["press_key_once"].call_args_list == [
+        call(1, runner_module.VK_ESCAPE),
+        call(1, runner_module.VK_R),
+    ]
+    offline_runner["press_key"].assert_not_called()
 
 
 @pytest.mark.parametrize("layers", [1, 2])
