@@ -28,6 +28,15 @@ FILTER_RESET_AREA = (1250, 990, 1650, 1080)
 FULL_WINDOW = (0, 0, 1920, 1080)
 # 滚动找词条时的尝试上限
 _MAX_SCROLL_ROUNDS = 8
+# 筛选面板中部滚轮落点。面板内容比视口高，「主属性词条」区默认在视口外。
+FILTER_PANEL_SCROLL = (1560, 500)
+# 主属性 / 副属性词条区的标题文字，用来框定主属性选项的纵向范围。
+MAINSTAT_TITLE = "主属性词条"
+SUBSTAT_TITLE = "副属性词条"
+# 把面板滚到主属性区的尝试上限（真机实测 3~4 次滚轮即到底）
+_MAX_PANEL_SCROLLS = 8
+# 主属性名与词条名的相似度下限，低于它宁可中断也不猜（手册 01 底线）
+_MATCH_CUTOFF = 0.75
 
 
 class FilterClickError(RuntimeError):
@@ -90,7 +99,7 @@ def _select_names(
         for name in pending:
             hit = None
             for line in lines:
-                if name in line.text or SequenceMatcher(None, name, line.text).ratio() >= 0.75:
+                if name in line.text or SequenceMatcher(None, name, line.text).ratio() >= _MATCH_CUTOFF:
                     hit = line
                     break
             if hit is None:
@@ -117,6 +126,141 @@ def _confirm_popup(hwnd: int) -> None:
     time.sleep(0.4)
 
 
+def _text_lines() -> list:
+    """抓一帧，返回全窗口的 OCR 文本行。"""
+    image, _ = _grab()
+    return read_rect(image, FULL_WINDOW)
+
+
+def _title_y(lines, title: str) -> int | None:
+    """找标题行的中心 y（取最靠上的那条），找不到返回 None。"""
+    found = None
+    for line in lines:
+        if title not in line.text.replace(" ", ""):
+            continue
+        y = (line.top + line.bottom) // 2
+        if found is None or y < found:
+            found = y
+    return found
+
+
+def _toggle_below(lines, title_y: int):
+    """标题正下方的「点击展开 / 点击收起」开关，取 y 最小的一条。"""
+    best = None
+    for line in lines:
+        y = (line.top + line.bottom) // 2
+        if y <= title_y:
+            continue
+        text = line.text.replace(" ", "")
+        if "点击" not in text or ("展开" not in text and "收起" not in text):
+            continue
+        if best is None or y < best[0]:
+            best = (y, line)
+    return best[1] if best else None
+
+
+def _open_mainstat_section(hwnd: int, width: int, height: int) -> None:
+    """把筛选面板滚到「主属性词条」区，并确保该区已展开。
+
+    真机标定（2026-10-02，log/captures/probe-filter-open.png）：
+    面板内容比视口高，滚到顶时「主属性词条」区在视口外；
+    该区默认**收起**，只有一条「点击展开」，点开后才是
+    「生命值 / 攻击力百分比 / …」这些复选框。
+    此前直接点名，OCR 永远找不到主属性名，滚 8 轮后中断——B5 的根因。
+    """
+    log = get_logger("zzz_ddtool.gamefilter")
+    for _round in range(_MAX_PANEL_SCROLLS + 1):
+        lines = _text_lines()
+        title_y = _title_y(lines, MAINSTAT_TITLE)
+        if title_y is None:
+            wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+            time.sleep(0.35)
+            continue
+        toggle = _toggle_below(lines, title_y)
+        if toggle is None:
+            raise FilterClickError("主属性词条区没找到「点击展开 / 点击收起」开关，中断。")
+        if "收起" in toggle.text.replace(" ", ""):
+            return
+        click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
+        time.sleep(0.7)
+        after = _text_lines()
+        after_y = _title_y(after, MAINSTAT_TITLE)
+        after_toggle = _toggle_below(after, after_y) if after_y is not None else None
+        if after_toggle is not None and "收起" in after_toggle.text.replace(" ", ""):
+            log.info("已点开主属性词条区")
+            return
+        raise FilterClickError("点了主属性「点击展开」但该区没有展开，中断。")
+    raise FilterClickError(
+        "滚动面板 %d 轮后仍未看到「主属性词条」区，中断。" % _MAX_PANEL_SCROLLS
+    )
+
+
+def _normalize_stat(text: str) -> str:
+    """把预设里的写法对齐到游戏 UI。
+
+    data/stats.json 的 slot_mainstats 写「攻击力%」，游戏面板显示「攻击力百分比」，
+    不归一化就永远认不上（B5 的第二半）。
+    """
+    return text.replace("％", "%").replace("%", "百分比")
+
+
+def _best_match(lines, name: str, top: int, bottom: int):
+    """在 [top, bottom] 纵向区间里挑最贴 name 的一条：全等 > 包含 > 相似度。
+
+    包含匹配按「名字占整条文本的比例」打分，避免「生命值」抢走
+    「生命值百分比」这种更长更具体的条目。
+    """
+    wanted = _normalize_stat(name)
+    best = None
+    best_score = 0.0
+    for line in lines:
+        y = (line.top + line.bottom) // 2
+        if not top <= y <= bottom:
+            continue
+        text = _normalize_stat(line.text.replace(" ", ""))
+        if text == wanted:
+            score = 3.0
+        elif wanted in text:
+            score = 2.0 + len(wanted) / max(1, len(text))
+        else:
+            score = SequenceMatcher(None, wanted, text).ratio()
+            if score < _MATCH_CUTOFF:
+                continue
+        if score > best_score:
+            best, best_score = line, score
+    return best
+
+
+def _pick_mainstats(hwnd: int, names: Sequence[str], *, width: int, height: int) -> None:
+    """在已展开的主属性词条区里点名勾选。
+
+    主属性是复选框，勾上即生效，没有弹层、也没有「确认筛选」；
+    逐条精确点名为主，找不齐直接中断，不滚动、不猜。
+    """
+    log = get_logger("zzz_ddtool.gamefilter")
+    pending = list(names)
+    if not pending:
+        return
+    lines = _text_lines()
+    title_y = _title_y(lines, MAINSTAT_TITLE)
+    if title_y is None:
+        raise FilterClickError("主属性词条区不在视口里，无法点名，中断。")
+    sub_y = _title_y(lines, SUBSTAT_TITLE)
+    top = title_y + 20
+    bottom = sub_y - 20 if sub_y is not None and sub_y - 20 > top else title_y + 320
+    missing: list[str] = []
+    for name in pending:
+        hit = _best_match(lines, name, top, bottom)
+        if hit is None:
+            missing.append(name)
+            continue
+        click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
+        log.info("mainstat clicked %r at (%d,%d)", name, hit.left, hit.top)
+        time.sleep(0.3)
+    if missing:
+        raise FilterClickError(f"主属性词条区里找不到：{missing}")
+
+
 def apply_sets_mainstats(
     hwnd: int,
     width: int,
@@ -125,9 +269,11 @@ def apply_sets_mainstats(
     sets: Sequence[str],
     mainstats: Sequence[str],
 ) -> None:
-    """在筛选面板里点开套装/主属性词条选择器并勾选。
+    """在筛选面板里点开套装 / 主属性词条并勾选。
 
-    实测弹层（setpicker-live.png）：图标+名字网格，底部「重置 / 确认筛选」。
+    两条路不一样：
+    - 套装：点「点击选择」开弹层 → 弹层里点名 → 点「确认筛选」关弹层；
+    - 主属性：面板滚到底 → 点「点击展开」展开词条区 → 区里点复选框（无确认按钮）。
     全部靠 OCR 找字点击；认不上就中断（手册 01 底线）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
@@ -139,9 +285,8 @@ def apply_sets_mainstats(
         _confirm_popup(hwnd)
         log.info("sets picked: %s", list(sets))
     if mainstats:
-        # 主属性词条区在面板下部；先滚到面板底再点名
-        _select_names(hwnd, mainstats, width=width, height=height, scroll_center=(1560, 700))
-        _confirm_popup(hwnd)
+        _open_mainstat_section(hwnd, width, height)
+        _pick_mainstats(hwnd, mainstats, width=width, height=height)
         log.info("mainstats picked: %s", list(mainstats))
 
 

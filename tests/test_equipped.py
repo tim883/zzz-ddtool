@@ -147,3 +147,22 @@ def test_real_small_list_tail_slots_confirmed(qapp: QApplication) -> None:
     assert tail_slots_confirmed(occupied, empty, rows=4, cols=9)
     # 抽掉一个空位（模拟没确认到）就必须拒绝，不能当到底
     assert not tail_slots_confirmed(occupied, empty - {(2, 8)}, rows=4, cols=9)
+
+
+def test_real_single_row_list_tail(qapp: QApplication) -> None:
+    """真机图重放：谶羽之誓 4 号位 + 攻击力% [3/3000]，只有首行 3 件，其余 33 格空位。"""
+    image = QImage(str(FIXTURES / "list-single-row-three-discs.png"))
+    assert not image.isNull()
+    occupied: set[tuple[int, int]] = set()
+    empty: set[tuple[int, int]] = set()
+    for row in range(4):
+        for col in range(9):
+            cx = 166 + 135 * col
+            cy = int(round(268.5 + 174.5 * row))
+            if tile_is_empty(image, cx, cy) is False:
+                occupied.add((row, col))
+            else:
+                empty.add((row, col))
+    assert occupied == {(0, 0), (0, 1), (0, 2)}
+    assert len(empty) == 33
+    assert tail_slots_confirmed(occupied, empty, rows=4, cols=9)

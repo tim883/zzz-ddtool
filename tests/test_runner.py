@@ -1141,3 +1141,33 @@ def test_single_row_list_is_flushed_as_bottom(offline_runner, monkeypatch):
     assert runner.outcome == "completed"
     assert len(grid.visited) == 5
     assert runner.processed_disc_count == 5
+
+
+# ---------------------------------------------------------- 单行小列表真机重放
+
+FIXTURE_SINGLE_ROW = Path(__file__).parent / "fixtures" / "list-single-row-three-discs.png"
+
+
+def test_scan_confirms_single_row_list_tail():
+    """真机图重放（谶羽之誓 4 号位 + 攻击力% [3/3000]）：3 件贴首行、其余 33 格空位。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    runner._origin_center_y = 268.5
+    runner._row_pitch = 174.5
+    image = QImage(str(FIXTURE_SINGLE_ROW))
+    assert not image.isNull(), FIXTURE_SINGLE_ROW
+    runner._grab = Mock(return_value=(image, "drive_disc", "test", 1))
+    state = _state()
+    state.confirm_viewport(0, 0.0, row_pitch_px=174.5, at_top=True, at_bottom=False)
+
+    cells, problems, _skips = runner._scan_cells(state)
+
+    assert problems == []
+    assert sorted((cell.screen_row0, cell.screen_col0) for cell in cells) == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+    ]
+    assert runner._tail_slots_confirmed is True
+    # 中间行没有可观测锚点 → 整屏小列表直接判到底（真机首次触发的那条路）
+    assert runner._single_screen_tail(state, cells) is True
