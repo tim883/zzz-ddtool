@@ -6,6 +6,7 @@ Spin boxes keep the system arrows (not styled).
 
 from __future__ import annotations
 
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -202,6 +203,15 @@ QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radi
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
+
+
+def _base_job_name(name: str) -> str:
+    """剥掉名字尾部的「(2)」这类自动编号，取基准名。
+
+    复制时用它算新名字：复制「紫手套 (2)」应该出「紫手套 (3)」，
+    而不是「紫手套 (2) (2)」。
+    """
+    return re.sub(r"\s*\(\d+\)\s*$", "", name).strip() or "任务"
 
 
 def _pencil_icon(size: int = 16):
@@ -1104,9 +1114,16 @@ class MainWindow(QMainWindow):
         name_row.addWidget(rename_btn)
         self.chain_list = QListWidget()
         self.chain_list.currentRowChanged.connect(self._on_chain_row)
-        add_btn = QPushButton("新建任务")
-        add_btn.setObjectName("primary")
-        add_btn.clicked.connect(self._add_job)
+        new_btn = QPushButton("新建任务")
+        new_btn.setObjectName("primary")
+        new_btn.clicked.connect(self._add_job)
+        copy_btn = QPushButton("复制任务")
+        copy_btn.setToolTip("复制当前选中的任务，名字自动加编号")
+        copy_btn.clicked.connect(self._copy_job)
+        add_row = QHBoxLayout()
+        add_row.setSpacing(4)
+        add_row.addWidget(new_btn, 1)
+        add_row.addWidget(copy_btn, 1)
         row = QHBoxLayout()
         up_btn = QPushButton("上移")
         down_btn = QPushButton("下移")
@@ -1120,7 +1137,7 @@ class MainWindow(QMainWindow):
         inner.addWidget(hint)
         inner.addLayout(name_row)
         inner.addWidget(self.chain_list, 1)
-        inner.addWidget(add_btn)
+        inner.addLayout(add_row)
         inner.addLayout(row)
         layout.addWidget(box)
         return panel
@@ -1308,6 +1325,34 @@ class MainWindow(QMainWindow):
         self._refresh_chain_list(job.job_id)
         self._clear_editor()
         self._focus_job_name()
+
+    def _copy_job(self) -> None:
+        """复制当前选中的任务：内容一模一样，新 id，名字加编号。
+
+        「紫手套」复制出「紫手套 (2)」，再复制「紫手套 (2)」出「紫手套 (3)」——
+        所以先剥掉名字尾部的编号取基准名，再找下一个没用过的编号。
+        新任务插在原任务下面，并选中它。
+        """
+        job = self._editing_job()
+        if job is None:
+            self.path_label.setText("先选中一个任务再复制。")
+            return
+        # 先把编辑器内容写回，免得复制出来的是上次写回时的旧值
+        self._commit_editor()
+        job = self._editing_job()
+        if job is None:
+            return
+        copied = job_from_dict(job.to_dict())
+        if copied is None:
+            return
+        # to_dict/job_from_dict 会把原 id 一起带过来，必须换成新的：
+        # 两个任务共用一个 job_id 会让「按 id 找当前任务」永远命中前一个。
+        copied.job_id = new_job_id()
+        copied.name = self._unique_job_name(_base_job_name(job.name))
+        row = self._jobs.index(job)
+        self._jobs.insert(row + 1, copied)
+        self._load_job(copied)
+        self._refresh_chain_list(copied.job_id)
 
     def _remove_job(self) -> None:
         row = self.chain_list.currentRow()

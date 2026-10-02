@@ -137,6 +137,48 @@ def test_slot_switch_retargets_selected_job(qapp: QApplication, tmp_path) -> Non
     window.close()
 
 
+def test_copy_job_duplicates_content_and_numbers_name(qapp: QApplication, tmp_path) -> None:
+    """复制任务：内容一样、id 是新的、名字加编号，两份互不影响。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.job_name_edit.setText("紫手套")
+    window.job_name_edit.editingFinished.emit()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    qapp.processEvents()
+    source_id = window._jobs[0].job_id
+
+    window._copy_job()
+    qapp.processEvents()
+    assert len(window._jobs) == 2
+    copied = window._jobs[1]
+    assert copied.name == "紫手套 (2)"
+    assert copied.job_id != source_id  # to_dict 会带旧 id，必须换掉
+    assert copied.weights == window._jobs[0].weights
+    assert window._editing_job_id == copied.job_id  # 复制后选中副本
+
+    # 再复制一次：基于基准名编号，不能叠成「紫手套 (2) (2)」
+    window._copy_job()
+    qapp.processEvents()
+    assert "紫手套 (3)" in [job.name for job in window._jobs]
+
+    # 两份独立
+    window.chain_list.setCurrentRow(0)
+    qapp.processEvents()
+    window.weight_editor.set_weights({"生命值%": 1.0})
+    window.chain_list.setCurrentRow(1)
+    qapp.processEvents()
+    assert "生命值%" in window._jobs[0].weights
+    assert "生命值%" not in window._jobs[1].weights
+    window.close()
+
+
+def test_copy_without_selection_does_nothing(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._copy_job()
+    assert window._jobs == []
+    window.close()
+
+
 def test_new_job_starts_empty_and_gets_unique_name(qapp: QApplication, tmp_path) -> None:
     """新建任务 = 建一个空任务并选中它，右侧跟着空；名字自动去重。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")
