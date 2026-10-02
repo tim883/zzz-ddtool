@@ -649,6 +649,45 @@ def test_uncertain_origin_stops_entire_chain(offline_runner, monkeypatch, page):
     offline_runner["press_key_once"].assert_not_called()
 
 
+def test_read_zoom_level_line_retries_until_readable(offline_runner, monkeypatch):
+    """缩放页抓图可能落在缩放动画里：读不到等级要重拍，而不是直接判失败崩链。"""
+    runner = Runner(Preset(), hotkeys=False)
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "unknown", "test", 1))
+    line = ocr_module.OcrLine("等级03", 1, 1200, 200, 1310, 245)
+    calls = {"n": 0}
+
+    def read_rect(img, area):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else [line]
+
+    monkeypatch.setattr(ocr_module, "read_rect", read_rect)
+
+    got, _image = runner._read_zoom_level_line(1)
+
+    assert got is line
+    assert calls["n"] == 2
+
+
+def test_read_zoom_level_line_gives_up_after_retries(offline_runner, monkeypatch):
+    """重拍次数用尽仍读不到，返回 None，由调用方走回退。"""
+    runner = Runner(Preset(), hotkeys=False)
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "unknown", "test", 1))
+    calls = {"n": 0}
+
+    def read_rect(img, area):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(ocr_module, "read_rect", read_rect)
+
+    got, _image = runner._read_zoom_level_line(1)
+
+    assert got is None
+    assert calls["n"] == runner.preset.ocr_retry
+
+
 def button_lines(runner, monkeypatch, missing=None):
     stage = ocr_module.OcrLine("阶段添加", 1, 1200, 840, 1360, 880)
     confirm = ocr_module.OcrLine("升级", 1, 1460, 840, 1560, 880)

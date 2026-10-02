@@ -880,7 +880,10 @@ class Runner:
     # 详情页右下大按钮（查看/强化，永远存在），OCR 实测标定
     UPGRADE_BTN_AREA = (1550, 780, 1900, 880)
     # 缩放页「等级00」文字区，>> 箭头在它右侧约 110px（实拍：文字 right≈1305，箭头中心≈1416）
-    ZOOM_LEVEL_AREA = (1100, 150, 1550, 300)
+    # 框必须只套住「等级xx」这一行：放宽到包含右侧「主属性」等行时，OCR 检测框会左移并把
+    # 「等级00」整行读成「00碳美」之类的废字（2026-10-02 真机第 6 轮 R5C5 实测，
+    # 同一布局下 (1100,150,1550,300) 误读、本框在 zoom-preview / 满级页 / 失败现场三张真机图上均正确）。
+    ZOOM_LEVEL_AREA = (1150, 170, 1500, 280)
     # 强化页按钮区（老大 2026-09-06 实拍截图标定）：
     # 「阶段添加」中心≈(1282,866)，「升级」中心≈(1511,866)。旧区 y=860 起把按钮拦腰切断导致 OCR 认不出。
     STAGE_ADD_AREA = (1150, 800, 1420, 940)
@@ -950,6 +953,25 @@ class Runner:
         self.trace.fail("upgrade", "click_cell", f"在{region_desc}没找到「{needle}」", image=image)
         return False
 
+    def _read_zoom_level_line(self, hwnd: int):
+        """读缩放页「等级xx」那一行（用它的右缘 +110px 算 >> 箭头位置）。
+
+        缩放页没有可轮询的选中框，抓图可能落在缩放动画里；读不到就重拍，
+        最多 max(1, ocr_retry) 张。返回 (line, image)，读不到时 line 为 None。
+        """
+        from zzz_ddtool.ocr import read_rect
+
+        attempts = max(1, self.preset.ocr_retry)
+        image = None
+        for attempt in range(attempts):
+            image, *_ = self._grab(allow_esc=False)
+            for line in read_rect(image, self.ZOOM_LEVEL_AREA):
+                if "等级" in line.text.replace(" ", ""):
+                    return line, image
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
+        return None, image
+
     def _enter_upgrade_page(self, hwnd: int) -> bool:
         """详情页点「查看/强化」→ 缩放页点「》」→ 强化页（弹层）。
 
@@ -976,12 +998,7 @@ class Runner:
         time.sleep(0.9)
 
         # 2) 缩放页「等级」右缘 +110px 的「>>」箭头
-        image, *_ = self._grab(allow_esc=False)
-        level_line = None
-        for line in read_rect(image, self.ZOOM_LEVEL_AREA):
-            if "等级" in line.text.replace(" ", ""):
-                level_line = line
-                break
+        level_line, image = self._read_zoom_level_line(hwnd)
         if level_line is None:
             self.log.warning("UPGRADE: 缩放页没找到「等级」")
             self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字", image=image)
@@ -1004,12 +1021,7 @@ class Runner:
             if stage_clicked:
                 break
             self.trace.warn("zoom", "enter_upgrade", f"第 {attempt} 次点箭头没进强化页", image=image)
-            image, *_ = self._grab(allow_esc=False)
-            level_line = None
-            for line in read_rect(image, self.ZOOM_LEVEL_AREA):
-                if "等级" in line.text.replace(" ", ""):
-                    level_line = line
-                    break
+            level_line, _image = self._read_zoom_level_line(hwnd)
             if level_line is None:
                 break  # 不是缩放页也没有阶段添加，别乱点，回退
             ax = level_line.right + 110

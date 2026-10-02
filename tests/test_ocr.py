@@ -14,6 +14,7 @@ from zzz_ddtool.ocr import (
     parse_disc_upgrade_page,
     read_level,
     read_mainstat,
+    read_rect,
 )
 
 SAMPLE = "手册/样张/详情页.png"
@@ -92,6 +93,23 @@ def test_upgrade_page_max_level_regression() -> None:
     assert disc is not None
     assert disc.level == 15
     assert [sub.name for sub in disc.substats] == ["攻击力", "攻击力%", "暴击伤害", "异常精通"]
+
+
+def test_zoom_level_area_regression() -> None:
+    """缩放页「等级00」识别区必须只套住等级那一行。
+
+    2026-10-02 真机第 6 轮 R5C5 现场：旧区 (1100,150,1550,300) 把「等级00/15」整行
+    读成「00碳美」，_enter_upgrade_page 找不到「等级」而崩链。收紧后同一张图读出「等级00」。
+    """
+    from zzz_ddtool.runner import Runner
+
+    image = QImage("tests/fixtures/zoom-preview-level00.png")
+    assert not image.isNull()
+    texts = [line.text.replace(" ", "") for line in read_rect(image, Runner.ZOOM_LEVEL_AREA)]
+    assert any("等级" in text for text in texts), texts
+    # 顺带保证旧区在这个现场确实是坏的，否则这条回归就失去意义
+    old_texts = [line.text.replace(" ", "") for line in read_rect(image, (1100, 150, 1550, 300))]
+    assert not any("等级" in text for text in old_texts), old_texts
 
 
 def test_level_rejects_unrelated_numbers(monkeypatch) -> None:
