@@ -5,6 +5,7 @@
 """
 
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import Mock, call
 
 import pytest
@@ -41,9 +42,10 @@ def make_cell(global_row0, col, screen_row0, level=0):
 class FakeGrid:
     """假仓库：4 行视口，按 offset 平移；filtered 行仍有格位、只被扫描跳过。"""
 
-    def __init__(self, total_rows=6, filtered_rows=()):
+    def __init__(self, total_rows=6, filtered_rows=(), last_row_cols=GRID_COLS):
         self.total_rows = total_rows
         self.filtered = set(filtered_rows)
+        self.last_row_cols = last_row_cols
         self.offset = 0
         self.selected: tuple[int, int] | None = None
         self.visited: list[tuple[int, int]] = []
@@ -75,7 +77,8 @@ class FakeGrid:
             grow = self.offset + screen
             if grow >= self.total_rows:
                 continue
-            for col in range(GRID_COLS):
+            cols = self.last_row_cols if grow == self.total_rows - 1 else GRID_COLS
+            for col in range(cols):
                 cell = make_cell(grow, col, screen)
                 cells.append(cell)
                 if grow in self.filtered:
@@ -174,7 +177,9 @@ def wire_grid(runner, monkeypatch, grid: FakeGrid):
 
     def scan(state):
         runner._selected_cell = grid.selected_cell()
-        return grid.scan()
+        cells, problems, skips = grid.scan()
+        runner._tail_slots_confirmed = grid.at_bottom
+        return cells, problems, skips
 
     def advance(hwnd, state, cells, *, rows):
         grid.offset = min(grid.total_rows - VIEWPORT_ROWS, grid.offset + rows)
@@ -978,3 +983,129 @@ def test_start_index_does_not_touch_earlier_cells(offline_runner, monkeypatch):
 def test_start_index_defaults_to_zero(offline_runner):
     assert Runner(Preset(), hotkeys=False).start_index == 0
     assert Runner(Preset(), hotkeys=False, start_index=-5).start_index == 0
+
+
+# ---------------------------------------------------------------- 末尾空位与到底判定
+
+FIXTURE_TAIL = Path(__file__).parent / "fixtures" / "list-tail-empty-slot.png"
+TAIL_ORIGIN_Y = 267.5
+TAIL_PITCH = 174.0
+
+
+def tail_image():
+    image = QImage(str(FIXTURE_TAIL))
+    assert not image.isNull(), FIXTURE_TAIL
+    return image
+
+
+def tail_runner():
+    runner = Runner(Preset(), hotkeys=False)
+    runner._origin_center_y = TAIL_ORIGIN_Y
+    runner._row_pitch = TAIL_PITCH
+    return runner
+
+
+def tail_state():
+    state = _state()
+    state.confirm_viewport(0, 0.0, row_pitch_px=TAIL_PITCH, at_top=True, at_bottom=False)
+    return state
+
+
+def test_scan_confirms_tail_empty_slot_from_tile_placeholder():
+    """真机图重放（驱动仓库 [152/3000] 末行 8 件）：空位由图标区占位确认，不是「没读到等级」。"""
+    runner = tail_runner()
+    runner.trace = Mock()
+    runner._grab = Mock(return_value=(tail_image(), "drive_disc", "test", 1))
+
+    cells, problems, _skips = runner._scan_cells(tail_state())
+
+    assert problems == []
+    assert len(cells) == 35
+    assert runner._tail_slots_confirmed is True
+
+
+def test_scan_flags_disc_without_level_label_as_barrier(monkeypatch):
+    """有盘但没读到等级：占位判据认出「有盘」，走进度屏障，既不当空位也不丢盘。"""
+    runner = tail_runner()
+    runner.trace = Mock()
+    runner._grab = Mock(return_value=(tail_image(), "drive_disc", "test", 1))
+    real_read = ocr_module.read_rect
+
+    def read_rect(image, area):
+        kept = []
+        for line in real_read(image, area):
+            cx = (line.left + line.right) / 2
+            cy = (line.top + line.bottom) / 2
+            if abs(cx - 706) < 45 and abs(cy - 877) < 30:  # 末行第 5 列，模拟漏读
+                continue
+            kept.append(line)
+        return kept
+
+    monkeypatch.setattr(ocr_module, "read_rect", read_rect)
+    cells, problems, _skips = runner._scan_cells(tail_state())
+
+    assert len(cells) == 34
+    assert any("有盘但没读到等级" in problem for problem in problems)
+
+
+def test_advance_requires_tail_placeholder_before_marking_bottom(monkeypatch):
+    """锚点被端点截停但末尾占位未确认时保留未知，不置 at_bottom（spec §5.4）。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    runner._origin_center_y = 267.0
+    runner._row_pitch = 175.0
+    runner._set_status = Mock()
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(runner_module, "click_client", Mock())
+    monkeypatch.setattr(runner_module, "grab_game_image", lambda hwnd=None: (None, "test", 1))
+    monkeypatch.setattr(
+        runner_module,
+        "scroll_rows",
+        lambda hwnd, rows, profile, **kw: ScrollSend(rows, rows, rows, profile.event_interval_ms),
+    )
+    state = _state()
+    for _ in range(5):
+        state.advance_batch()
+    state.confirm_viewport(10, 0.0, row_pitch_px=175.0, at_top=False, at_bottom=False)
+    anchor = make_cell(20, 0, 2)
+    monkeypatch.setattr(runner_module, "anchor_screen_rows", lambda image, **kw: [anchor.screen_row0])
+    monkeypatch.setattr(runner_module, "settle_and_read_anchor", lambda *a, **kw: ([2], 100, None))
+
+    runner._tail_slots_confirmed = False
+    assert runner._advance(1, state, [anchor], rows=2) is False
+    assert state.at_bottom is False
+
+    runner._tail_slots_confirmed = True
+    assert runner._advance(1, state, [anchor], rows=2) is True
+    assert state.at_bottom is True
+
+
+def test_single_screen_tail_needs_confirmed_placeholder_and_no_anchor():
+    """整屏小列表直接判到底的三个条件：贴顶、末尾占位确认、没有中间行锚点。"""
+    runner = Runner(Preset(), hotkeys=False)
+    state = _state()
+    state.confirm_viewport(0, 0.0, row_pitch_px=175.0, at_top=True, at_bottom=False)
+    cells = [make_cell(0, col, 0) for col in range(5)]
+
+    runner._tail_slots_confirmed = True
+    assert runner._single_screen_tail(state, cells) is True
+
+    runner._tail_slots_confirmed = False
+    assert runner._single_screen_tail(state, cells) is False
+
+    runner._tail_slots_confirmed = True
+    assert runner._single_screen_tail(state, cells + [make_cell(1, 0, 1)]) is False
+
+
+def test_single_row_list_is_flushed_as_bottom(offline_runner, monkeypatch):
+    """不足一行满 9 件的小列表：游戏不会滚动，必须靠末尾占位判到底并补齐末行。"""
+    runner = Runner(Preset(max_discs=10, accepted=()), hotkeys=False)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=1, last_row_cols=5))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert len(grid.visited) == 5
+    assert runner.processed_disc_count == 5

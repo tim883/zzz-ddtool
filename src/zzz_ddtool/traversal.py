@@ -390,6 +390,36 @@ def bottom_evidence(
     return any(observation.shortfall or observation.stopped for observation in observations)
 
 
+def tail_slots_confirmed(
+    occupied: set[tuple[int, int]],
+    confirmed_empty: set[tuple[int, int]],
+    *,
+    rows: int,
+    cols: int,
+) -> bool:
+    """末尾占位是否已确认（spec §5.4、§5.5 第 259 行）。
+
+    ``occupied``/``confirmed_empty`` 都是 (屏幕逻辑行, 列) 的集合，两者都来自
+    同一张视口截图：前者是读到「等级」标签的实体盘，后者是图标区确认画着空位
+    占位（不是「没读到等级」）的位置。只有「空位恰好构成从末尾起的连续尾段」
+    才算确认——最后一行的实体盘不满一行时其右侧全为空位，更后的屏幕行全为空位；
+    空列表要求整屏确认空。中间冒出空位、或尾段里有拿不准的位置，都返回 False，
+    调用方保留未知并停止推进（不得转用滑块补证）。
+    """
+    viewport = {(row, col) for row in range(rows) for col in range(cols)}
+    if not occupied:
+        return bool(viewport) and viewport <= confirmed_empty
+    last_row = max(row for row, _ in occupied)
+    last_cols = sorted(col for row, col in occupied if row == last_row)
+    if last_cols != list(range(len(last_cols))):
+        return False
+    tail = {(last_row, col) for col in range(len(last_cols), cols)}
+    tail |= {(row, col) for row in range(last_row + 1, rows) for col in range(cols)}
+    if not tail <= confirmed_empty:
+        return False
+    return not (confirmed_empty - tail)
+
+
 @dataclass
 class ScrollOperation:
     """一次批量滚动的发送进度；暂停期间保留（spec §5.2）。"""

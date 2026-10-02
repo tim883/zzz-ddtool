@@ -57,6 +57,24 @@ def main(argv: list[str] | None = None) -> int:
         "前面的格标为已跳过、不点击不识别不计数。默认 0（不跳过，正常从第一个开始）。",
     )
 
+    list_p = sub.add_parser(
+        "snapshot-list",
+        help="[开发] 进驱动盘仓库→按预设设筛选→分块滚动→逐帧存图（E1/E5/E6 场景图）",
+    )
+    list_p.add_argument("--config", type=Path, required=True, help="YAML preset")
+    list_p.add_argument("--job", type=int, default=0, help="任务链下标，默认 0")
+    list_p.add_argument(
+        "--scroll",
+        type=int,
+        default=0,
+        metavar="ROWS",
+        help="设筛选后向下滚动的总行数，0=只取顶部图",
+    )
+    list_p.add_argument(
+        "--chunk", type=int, default=4, metavar="ROWS", help="每次滚动的行数，默认 4（一屏）"
+    )
+    list_p.add_argument("--out", type=Path, help="存图目录，默认 log/captures")
+    list_p.add_argument("--name", default="list", help="截图文件名前缀，默认 list")
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
     preview_p.add_argument("--out", type=Path, help="HTML path, default log/pattern-cards.html")
@@ -80,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_snapshot_pages()
     if args.cmd == "run":
         return _cmd_run(args)
+    if args.cmd == "snapshot-list":
+        return _cmd_snapshot_list(args)
     if args.cmd == "preview":
         return _cmd_preview(args)
     return 1
@@ -143,6 +163,77 @@ def _cmd_snapshot_pages() -> int:
         return 2
     for name, dest in pages.items():
         print(f"{name}\t{dest}")
+    return 0
+
+
+def _cmd_snapshot_list(args: argparse.Namespace) -> int:
+    """[开发] 取列表实图：进驱动盘仓库 → 按预设设筛选 → 分块滚动 → 逐帧存图。
+
+    只服务开发标定与实图重放（E1/E5/E6 的场景图），不参与生产任务链。
+    每滚一屏存一张，滚到列表被端点截停后继续发送也只是停在底部，帧序即现场。
+    """
+    import time
+
+    from zzz_ddtool.capture import CaptureError, grab_game_image, save_image
+    from zzz_ddtool.gamefilter import apply_game_filter
+    from zzz_ddtool.nav import NavError, goto_warehouse
+    from zzz_ddtool.navigation import load_profile, probe_environment, scroll_rows
+    from zzz_ddtool.runner import Runner
+
+    preset = load_preset(args.config)
+    jobs = Runner(preset, hotkeys=False)._jobs()
+    if not 0 <= args.job < len(jobs):
+        print(f"--job 越界：该预设只有 {len(jobs)} 个任务")
+        return 2
+    job = jobs[args.job]
+
+    try:
+        goto_warehouse()
+    except NavError as exc:
+        print(exc)
+        return 2
+
+    try:
+        image, _method, hwnd = grab_game_image()
+    except CaptureError as exc:
+        print(exc)
+        return 2
+
+    apply_game_filter(
+        hwnd,
+        image.width(),
+        image.height(),
+        slots=[job.slot],
+        sets=job.sets,
+        mainstats=job.mainstats,
+    )
+    time.sleep(0.4)
+    image = grab_game_image(hwnd)[0]
+    dest = save_image(image, hwnd, "printwindow", name=f"{args.name}-top", dest_dir=args.out)
+    print(f"top\t{dest}")
+
+    if args.scroll <= 0:
+        return 0
+
+    profile = load_profile(probe_environment(hwnd))
+    if profile is None:
+        print("没有可用的滚轮协议缓存：先在游戏里跑一次 run 走完标定，再取图")
+        return 2
+    settle_ms = profile.settle_wait_ms or 500
+    remaining = int(args.scroll)
+    step = max(1, int(args.chunk))
+    done = 0
+    while remaining > 0:
+        rows = min(step, remaining)
+        scroll_rows(hwnd, rows, profile)
+        time.sleep(settle_ms / 1000.0)
+        remaining -= rows
+        done += rows
+        image = grab_game_image(hwnd)[0]
+        dest = save_image(
+            image, hwnd, "printwindow", name=f"{args.name}-scroll{done}", dest_dir=args.out
+        )
+        print(f"scroll{done}\t{dest}")
     return 0
 
 

@@ -23,7 +23,7 @@ from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
-from zzz_ddtool.layout import LABEL_SCAN_AREA
+from zzz_ddtool.layout import GRID_COLS, GRID_ROWS, LABEL_SCAN_AREA
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse, reset_to_top
@@ -48,6 +48,7 @@ from zzz_ddtool.traversal import (
     GridMetrics,
     PositionError,
     TraversalState,
+    bottom_evidence,
     check_forward_move,
     check_layout_reference,
     global_row_col,
@@ -55,6 +56,7 @@ from zzz_ddtool.traversal import (
     map_labels,
     max_restore_rows,
     split_stable_cells,
+    tail_slots_confirmed,
 )
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once
 
@@ -114,6 +116,9 @@ class Runner:
         self._row_pitch: float = 175.0
         # 强化后恢复时的校验扫描结果，直接交给主循环复用（避免重复 OCR 目标列表）
         self._restored_scan: tuple | None = None
+        # 最近一次扫描的末尾占位判定（spec §5.4）：只有它和锚点端点行为同时成立
+        # 才允许把视口标记为到底。
+        self._tail_slots_confirmed = False
 
     @property
     def processed_disc_count(self) -> int:
@@ -234,6 +239,7 @@ class Runner:
         self._status_lines = []
         self._state = None
         self._restored_scan = None
+        self._tail_slots_confirmed = False
         self.outcome = "running"
         self.end_reason = ""
         jobs = self._jobs()
@@ -391,6 +397,15 @@ class Runner:
                 if state.at_bottom:
                     self.log.info("已到底且无待处理格位，本任务结束")
                     break
+                if self._single_screen_tail(state, cells):
+                    self.log.info("列表整屏可见且末尾占位已确认，直接判到底并补齐末行")
+                    state.confirm_viewport(
+                        state.viewport_top_row0 or 0,
+                        state.row_phase_px or 0.0,
+                        at_top=True,
+                        at_bottom=True,
+                    )
+                    continue
                 before_top = state.viewport_top_row0
                 if not self._advance(hwnd, state, cells, rows=_FORWARD_ROWS):
                     self.log.info("无法继续前进，本任务结束")
@@ -568,6 +583,42 @@ class Runner:
             row_pitch_px=self._row_pitch,
         )
 
+    def _classify_empty_slots(self, metrics: GridMetrics, state: TraversalState, image, cells):
+        """没有「等级」标签的屏幕位置 → (确认空位集合, 拿不准集合)。
+
+        空位认的是图标区原始占位（``tile_is_empty``），不是「没读到等级」。相位
+        不为零（视口停在半行、格子被裁切）或格子超出画面时一律拿不准：spec §5.5
+        第 259 行要求按失败路径处理，不能宣布空位。只有带标签的位置天然有盘，
+        不必再采样，所以中途推进时这一步不增加额外像素开销。
+        """
+        from zzz_ddtool.equipped import tile_is_empty
+
+        phase = state.row_phase_px or 0.0
+        top = state.viewport_top_row0 or 0
+        occupied = {
+            (cell.screen_row0, cell.screen_col0)
+            for cell in cells
+            if 0 <= cell.screen_row0 < GRID_ROWS
+        }
+        empties: set[tuple[int, int]] = set()
+        unclear: dict[tuple[int, int], str] = {}
+        for row in range(GRID_ROWS):
+            for col in range(GRID_COLS):
+                if (row, col) in occupied:
+                    continue
+                if phase != 0.0:
+                    unclear[(row, col)] = "视口未对齐，占位不可判"
+                    continue
+                icon_y = int(round(metrics.row_center_y(top + row, top, phase)))
+                verdict = tile_is_empty(image, metrics.center_x_of(col), icon_y)
+                if verdict is True:
+                    empties.add((row, col))
+                elif verdict is False:
+                    unclear[(row, col)] = "图标区有盘但没读到等级"
+                else:
+                    unclear[(row, col)] = "图标区占位不确定"
+        return empties, unclear
+
     def _scan_cells(self, state: TraversalState):
         """扫描当前视口 → (全部原始格位, 问题, 扫描跳过表)。
 
@@ -608,6 +659,23 @@ class Runner:
             labels,
             viewport_top_row0=state.viewport_top_row0 or 0,
             row_phase_px=state.row_phase_px or 0.0,
+        )
+
+        # 没读到「等级」的屏幕位置不等于空位（spec §5.5 第 259 行）：逐个看图标
+        # 区原始占位，确认是游戏画的空格子才算合法空位；有盘漏读或占位拿不准都
+        # 进 problems，作为进度屏障重读，重读耗尽后 failed，next_index 不越过缺口。
+        empties, unclear = self._classify_empty_slots(metrics, state, image, cells)
+        for (row, col), reason in sorted(unclear.items()):
+            problems.append(f"屏幕第{row + 1}行第{col + 1}列{reason}")
+        self._tail_slots_confirmed = tail_slots_confirmed(
+            {
+                (cell.screen_row0, cell.screen_col0)
+                for cell in cells
+                if 0 <= cell.screen_row0 < GRID_ROWS
+            },
+            empties,
+            rows=GRID_ROWS,
+            cols=GRID_COLS,
         )
 
         skips: dict[int, str] = {}
@@ -768,6 +836,16 @@ class Runner:
         mids.sort(key=lambda c: (abs(c.screen_row0 - 2), c.screen_col0))
         return mids[0]
 
+    def _single_screen_tail(self, state: TraversalState, cells: list[GridCell]) -> bool:
+        """列表短到一屏装得下时是否可直接判到底（spec §5.4 末尾布局）。
+
+        这种列表游戏根本不会滚动，没有可观测的锚点位移，端点行为这条路走不通，
+        只能靠末尾占位确认结束（spec §5.5 第 259 行）。三条同时成立才算：
+        贴在顶部、末尾占位已确认、网格里没有任何能当导航锚点的中间行格位——
+        也就是只有首行有盘、盘数不足一行满 9 件。不满足就走原来的前进路径。
+        """
+        return self._tail_slots_confirmed and state.at_top and self._pick_anchor(cells) is None
+
     def _advance(self, hwnd: int, state: TraversalState, cells: list[GridCell], *, rows: int) -> bool:
         """正常短距前进（spec §5.2）：选中锚点 → 按协议发送 → 用锚点位移确认。
 
@@ -824,12 +902,21 @@ class Runner:
             raise RunnerError(f"正常前进校验失败：{exc}，停止任务链") from exc
 
         state.advance_batch()
-        at_bottom = observation.shortfall or observation.stopped
+        # 到底 = 锚点端点行为（实际位移小于请求或完全没动） + 末尾占位已确认
+        # （spec §5.4）。相位相同或滑块都不能替代这两条依据；末尾占位拿不准时
+        # 保留未知，不置 at_bottom，相关推进到此为止。
+        at_bottom = bottom_evidence((observation,), tail_slots_confirmed=self._tail_slots_confirmed)
         state.confirm_viewport(new_top, state.row_phase_px or 0.0, at_top=False, at_bottom=at_bottom)
         state.clear_scroll()
         self._set_status("scroll", f"+{advanced} 行", "")
         if at_bottom:
             self.log.info("滚动被端点截停（请求 %d 实际 %d），标记到底", rows, advanced)
+        elif observation.shortfall or observation.stopped:
+            self.log.info(
+                "滚动被端点截停（请求 %d 实际 %d），但末尾占位未确认，保留未知不置到底",
+                rows,
+                advanced,
+            )
         return advanced > 0 or at_bottom
 
     # ---------------------------------------------------------------- 强化后恢复

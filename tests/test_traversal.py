@@ -33,6 +33,7 @@ from zzz_ddtool.traversal import (
     rate_candidate,
     restore_request_rows,
     split_stable_cells,
+    tail_slots_confirmed,
 )
 
 W, H = 1920, 1080
@@ -572,3 +573,60 @@ def test_task_states_are_isolated():
     assert second.work_batch_count == 0
     assert second.filter_signature != first.filter_signature
     assert first.next_index == 1 and first.work_batch_count == 1  # 互不影响
+
+
+# --------------------------------------------------------------------------
+# 末尾占位确认（spec §5.4、§5.5 第 259 行）
+# --------------------------------------------------------------------------
+
+ROWS, COLS = 4, 9
+
+
+def _screen_set(pairs):
+    return {(row, col) for row, col in pairs}
+
+
+def _full_rows(*rows):
+    return [(row, col) for row in rows for col in range(COLS)]
+
+
+def test_tail_slots_confirmed_for_partial_last_row():
+    occupied = _screen_set(_full_rows(0, 1, 2) + [(3, col) for col in range(8)])
+    assert tail_slots_confirmed(occupied, {(3, 8)}, rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_rejects_undecided_tail():
+    """末行剩下的位置没确认是空位：不当空位，也不宣布到底。"""
+    occupied = _screen_set(_full_rows(0, 1, 2) + [(3, col) for col in range(8)])
+    assert not tail_slots_confirmed(occupied, set(), rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_rejects_middle_hole():
+    """中间冒出空位说明这不是真正的列表末尾。"""
+    occupied = _screen_set(_full_rows(0) + [(3, col) for col in range(8)])
+    assert not tail_slots_confirmed(occupied, {(1, 4)}, rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_rejects_ragged_last_row():
+    """末行实体盘从左端起不连续：列分布有歧义，走失败路径。"""
+    occupied = _screen_set(_full_rows(0) + [(3, 0), (3, 2)])
+    assert not tail_slots_confirmed(occupied, {(3, 1)}, rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_accepts_full_bottom_row():
+    """末行满行时看不到占位，空位不构成矛盾；是否到底仍由锚点端点行为决定。"""
+    occupied = _screen_set(_full_rows(0, 1, 2, 3))
+    assert tail_slots_confirmed(occupied, set(), rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_for_empty_list():
+    viewport = _screen_set(_full_rows(0, 1, 2, 3))
+    assert tail_slots_confirmed(set(), viewport, rows=ROWS, cols=COLS)
+    assert not tail_slots_confirmed(set(), set(), rows=ROWS, cols=COLS)
+
+
+def test_tail_slots_confirmed_for_short_list_ending_mid_viewport():
+    occupied = _screen_set(_full_rows(0) + [(1, 0)])
+    rest = [(1, col) for col in range(1, COLS)] + _full_rows(2, 3)
+    assert tail_slots_confirmed(occupied, _screen_set(rest), rows=ROWS, cols=COLS)
+    assert not tail_slots_confirmed(occupied, _screen_set(rest[:-1]), rows=ROWS, cols=COLS)

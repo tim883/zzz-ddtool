@@ -95,3 +95,48 @@ def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
                     return True
     return False
 
+
+
+# 空位占位（列表末尾不足 9 件时游戏画的空格子）的判据阈值。
+# 2026-10-02 真机标定（log/captures/list-e5-scroll20.png，驱动仓库 [152/3000]，末行 8 件）：
+# - 占位格图标区 (cx±58, cy±52) 实测彩色像素 0%、亮像素 0%（整块黑底 + 灰叉）
+# - 有盘格同区域实测彩色像素 6~10%、亮像素 30~37%（两帧共 72 格全测）
+# 两档阈值：双低=确认空位，任一偏高=确认有盘，中间带=拿不准。
+EMPTY_TILE_COLORFUL_MAX = 0.02
+EMPTY_TILE_BRIGHT_MAX = 0.10
+EMPTY_TILE_COLORFUL_FULL = 0.04
+EMPTY_TILE_BRIGHT_FULL = 0.20
+
+
+def tile_is_empty(image, cx: int, cy: int) -> bool | None:
+    """图标区是否为游戏画出来的空位占位。
+
+    True=已确认这里没有盘（合法空位），False=已确认有盘，None=拿不准。
+    只采样图标区域，不看「等级」标签——spec §5.5 第 259 行明确禁止只凭
+    「没 OCR 到等级」宣布空位；拿不准的位置由调用方按失败路径处理。
+    """
+    width, height = image.width(), image.height()
+    x0, x1 = cx - 58, cx + 58
+    y0, y1 = cy - 52, cy + 50
+    if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+        return None
+    colorful = bright = total = 0
+    for y in range(y0, y1, 3):
+        for x in range(x0, x1, 3):
+            color = image.pixelColor(x, y)
+            r, g, b = color.red(), color.green(), color.blue()
+            top, low = max(r, g, b), min(r, g, b)
+            total += 1
+            if top > 90:
+                bright += 1
+            if top - low > 60 and top > 70:
+                colorful += 1
+    if total == 0:
+        return None
+    colorful_ratio = colorful / total
+    bright_ratio = bright / total
+    if colorful_ratio <= EMPTY_TILE_COLORFUL_MAX and bright_ratio <= EMPTY_TILE_BRIGHT_MAX:
+        return True
+    if colorful_ratio >= EMPTY_TILE_COLORFUL_FULL or bright_ratio >= EMPTY_TILE_BRIGHT_FULL:
+        return False
+    return None
