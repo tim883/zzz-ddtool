@@ -118,6 +118,46 @@ def test_mainstat_excluded_from_substat_cards(qapp: QApplication, tmp_path) -> N
     window.close()
 
 
+def test_weight_edit_only_fires_on_commit(qapp: QApplication, tmp_path) -> None:
+    """改词条单价：敲键盘的过程中一次都不重算，只在编辑结束（回车/失焦）算一次。
+
+    默认 QDoubleSpinBox 每敲一个字符就发一次 valueChanged，而每改一次价都要重算
+    整屏组合（实测 4 词条 = 837 张卡，一次 4.2 秒），于是打「1.5」三下就卡三下。
+    关掉 keyboardTracking 之后只在提交时发一次；点上下箭头调值仍然即时生效
+    （那是「调一次」，不是「敲一下」）。
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    window.rebuild_cards()
+
+    fires: list[int] = []
+    window.weight_editor.changed.connect(lambda: fires.append(1))
+    _combo, spin, _row = window.weight_editor._rows[0]
+
+    window.show()
+    spin.setFocus()
+    QTest.keyClick(spin, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+    fires.clear()
+    for key in (Qt.Key.Key_1, Qt.Key.Key_Period, Qt.Key.Key_5):
+        QTest.keyClick(spin, key)
+    qapp.processEvents()
+    assert fires == [], "敲键盘的过程中不该重算"
+
+    QTest.keyClick(spin, Qt.Key.Key_Return)
+    qapp.processEvents()
+    assert len(fires) == 1, "回车应当只提交一次"
+    assert spin.value() == 1.5
+
+    fires.clear()
+    spin.stepUp()  # 点上下箭头是「调一次」，必须即时生效
+    assert len(fires) == 1
+    window.close()
+
+
 def test_slot_switch_retargets_selected_job(qapp: QApplication, tmp_path) -> None:
     """换部位 = 改当前选中任务的部位，任务保持选中、内容保留。
 

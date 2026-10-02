@@ -663,11 +663,19 @@ class WeightEditor(QWidget):
         spin.setRange(0.0, 20.0)
         spin.setSingleStep(0.1)
         spin.setFixedHeight(24)
+        # 关掉「边敲边发」：默认 QDoubleSpinBox 每敲一个字符就发一次 valueChanged，
+        # 而每次改价都要重算整屏组合（八百多张卡，两秒起步），于是打「1.5」三下就
+        # 卡三下。关掉之后，信号只在**编辑结束**时发一次——回车、Tab 或点到别处；
+        # 点上下箭头调值仍然立即生效（那是「调整一次」，不是「敲一下」）。
+        spin.setKeyboardTracking(False)
         spin.setValue(value)
         remove = QPushButton("×")
         remove.setFixedWidth(28)
         remove.clicked.connect(lambda: self._delete(row))
-        combo.currentTextChanged.connect(lambda *_: self.changed.emit())
+        # 词条名同理：这是个可编辑下拉框，正在输入名字时不必每敲一个字就重算。
+        # 从下拉列表里选中（activated）和输入完按回车/失焦（editingFinished）都要认。
+        combo.activated.connect(lambda *_: self.changed.emit())
+        combo.lineEdit().editingFinished.connect(lambda: self.changed.emit())
         spin.valueChanged.connect(lambda *_: self.changed.emit())
         combo.setFixedWidth(150)
         layout.addWidget(combo)
