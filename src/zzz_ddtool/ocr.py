@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -29,6 +30,7 @@ from zzz_ddtool.layout import (
     WAREHOUSE_SUB_STATS,
     scale_rect,
 )
+from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.gamedata import MAINSTAT_NAMES as _MAINSTAT_NAMES, SUBSTAT_NAMES as _SUBSTAT_NAMES
 
@@ -83,20 +85,40 @@ def qimage_to_bgr(image: QImage) -> np.ndarray:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
+def _log_rect(image: QImage, rect: tuple[int, int, int, int], count: int, started: float) -> None:
+    """每次识别留一条 DEBUG，供事后审计「有没有多余 / 重复识别」。
+
+    记区域、读出几行、图尺寸、耗时，以及图像对象标识——同一次截图上的多次识别
+    共享同一个标识，据此可数出「一张图被识别了几次」。默认级别（信息）下不输出。
+    """
+    get_logger("zzz_ddtool.ocr").debug(
+        "识别 %s → %d 行（%dx%d，%.0fms，图#%x）",
+        rect,
+        count,
+        image.width(),
+        image.height(),
+        (time.perf_counter() - started) * 1000,
+        image.cacheKey(),
+    )
+
+
 def read_rect(image: QImage, rect: tuple[int, int, int, int]) -> list[OcrLine]:
     """裁出矩形后识别，返回按位置排序的文本行。坐标是 1920x1080 设计坐标。"""
+    started = time.perf_counter()
     left, top, right, bottom = scale_rect(*rect, image.width(), image.height())
     left = max(0, left)
     top = max(0, top)
     right = min(image.width(), right)
     bottom = min(image.height(), bottom)
     if right <= left or bottom <= top:
+        _log_rect(image, rect, 0, started)
         return []
 
     bgr = qimage_to_bgr(image)
     crop = bgr[top:bottom, left:right]
     result = _get_engine()(crop)
     if result is None or not result.txts:
+        _log_rect(image, rect, 0, started)
         return []
 
     lines: list[OcrLine] = []
@@ -114,6 +136,7 @@ def read_rect(image: QImage, rect: tuple[int, int, int, int]) -> list[OcrLine]:
             )
         )
     lines.sort(key=lambda line: (round(line.top / 12), line.left))
+    _log_rect(image, rect, len(lines), started)
     return lines
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from zzz_ddtool.layout import BACK_BTN_REGION, BOTTOM_ICON_BAND, OVERWORLD_HINT, scale_rect
+from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.template import IconMark, all_marks_hit, marks_hit
 
 MENU = "menu"
@@ -126,7 +127,11 @@ def _classify_heuristic(image) -> str:
 
 
 def classify_image(image) -> str:
+    """认页：逐页对模板，全不过再走启发式。判定结果记 DEBUG，供事后核对认页依据。"""
     for page in PAGE_ORDER:
         if is_page(image, page):
+            get_logger("zzz_ddtool.screen").debug("认页 → %s（模板命中）", page)
             return page
-    return _classify_heuristic(image)
+    page = _classify_heuristic(image)
+    get_logger("zzz_ddtool.screen").debug("认页 → %s（启发式兜底）", page)
+    return page

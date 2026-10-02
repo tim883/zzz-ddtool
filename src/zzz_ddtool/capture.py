@@ -248,6 +248,9 @@ def grab_game_image(hwnd: int | None = None):
         method = "grabwindow"
         if _is_mostly_black(image):
             raise CaptureError("窗口截到的是黑图。改成窗口化再试。")
+    get_logger("zzz_ddtool.capture").debug(
+        "截屏 %s %dx%d hwnd=%s", method, image.width(), image.height(), target
+    )
     return image, method, target
 
 
