@@ -2,21 +2,45 @@ from __future__ import annotations
 
 
 def tile_is_selected(image, cx: int, cy: int) -> bool:
-    """选中框在盘图两侧的亮黄色竖边；避开稀有度的底部色条。"""
+    """选中框在格位左右两侧的高亮竖边；避开稀有度的底部色条。
+
+    2026-10-02 真机标定（1920×1080，log/captures/标定-锚点-点击后.png）：
+    点中第 3 行第 5 列后扫描该格：
+    - 左右竖线中心在 x = cx-62 / cx+64，线宽约 6px（横扫 y=cy 得 x:641-647 / 767-773）
+    - 上下边在 y = cy-56 / cy+54（竖扫 x=cx 得 y:558-564 / 666-677）
+    - 竖线在 y ∈ [cy-45, cy+45] 内连续
+
+    旧实现只在 dx=-62 / +60 两条固定线上按 0.6 占比判决：真机右边线中心是
+    cx+64，采样线落在 cx+60 已经偏出线外，实测占比 19/38=0.5 → 恒判未选中。
+    改为在左右候选带内各取「黄色占比最高」的一列，两侧都达标（≥0.7）才判选中，
+    对线宽、缩放与 1px 偏移都稳。左右基本对称是选中框的固有几何，用它兜住
+    误命中（半列间距内的其它竖直元素不会同时满足两侧）。
+    阈值取 0.7 而非 0.8：选中框有黄↔黄绿闪现动画，
+    tests/fixtures/grid-before-autoscroll.png 捕获的即是动画帧，右线占比实测
+    0.79；同图邻格因候选带扫到相邻框线左侧可达 0.79，但另一侧为空，不误判。
+    """
     from zzz_ddtool.layout import scale_point
 
-    hits = total = 0
-    for dx in (-62, 60):
-        for dy in range(-35, 51, 5):
-            x, y = scale_point(cx + dx, cy + dy, image.width(), image.height())
-            if not (0 <= x < image.width() and 0 <= y < image.height()):
+    width, height = image.width(), image.height()
+
+    def column_ratio(design_x: int) -> float:
+        hits = total = 0
+        for dy in range(-45, 46, 5):
+            x, y = scale_point(design_x, cy + dy, width, height)
+            if not (0 <= x < width and 0 <= y < height):
                 continue
-            color = image.pixelColor(x, y)
             total += 1
+            color = image.pixelColor(x, y)
             # 选中框会在黄绿色/黄色之间闪动，两种动画颜色都应命中。
             if color.red() > 100 and color.green() > 140 and color.blue() < 80:
                 hits += 1
-    return total > 0 and hits / total >= 0.6
+        return hits / total if total else 0.0
+
+    left = max(range(cx - 80, cx - 44), key=column_ratio)
+    right = max(range(cx + 44, cx + 81), key=column_ratio)
+    if column_ratio(left) < 0.7 or column_ratio(right) < 0.7:
+        return False
+    return abs((cx - left) - (right - cx)) <= 16
 
 
 def grid_scroll_position(image) -> tuple[int, int] | None:

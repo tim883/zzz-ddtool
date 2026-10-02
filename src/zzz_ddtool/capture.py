@@ -51,7 +51,7 @@ class CaptureError(RuntimeError):
     pass
 
 
-def _client_size(hwnd: int) -> tuple[int, int]:
+def client_size(hwnd: int) -> tuple[int, int]:
     rect = wintypes.RECT()
     user32.GetClientRect(hwnd, ctypes.byref(rect))
     return rect.right - rect.left, rect.bottom - rect.top
@@ -72,18 +72,33 @@ def _pid_of(hwnd: int) -> int:
     return int(pid.value)
 
 
-def _exe_name(pid: int) -> str:
+def window_pid(hwnd: int) -> int:
+    """窗口所属进程 PID（spec §5.1 实例绑定用）。"""
+    return _pid_of(hwnd)
+
+
+def process_exe_path(pid: int) -> str | None:
+    """进程的完整 exe 绝对路径；读取失败返回 None。
+
+    spec §5.1 第 2 条：不取文件名、不从 PATH 猜路径；查询链与 find_game_hwnd
+    共用 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) → QueryFullProcessImageNameW。
+    """
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return ""
+        return None
     try:
         buf = ctypes.create_unicode_buffer(32768)
         size = wintypes.DWORD(len(buf))
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            return ""
-        return Path(buf.value).name
+            return None
+        return buf.value or None
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _exe_name(pid: int) -> str:
+    full = process_exe_path(pid)
+    return Path(full).name if full else ""
 
 
 def _title_looks_like_game(title: str) -> bool:
@@ -100,7 +115,7 @@ def find_game_hwnd() -> int:
             return True
         title = _window_title(hwnd)
         exe = _exe_name(_pid_of(hwnd))
-        width, height = _client_size(hwnd)
+        width, height = client_size(hwnd)
         area = width * height
         if exe.lower() == PROCESS_NAME.lower():
             # 游戏本体：最小化时客户区为 0×0，仍要记录，截图前恢复窗口
@@ -140,7 +155,7 @@ def _is_mostly_black(image) -> bool:
 def _print_window(hwnd: int):
     from PySide6.QtGui import QImage
 
-    width, height = _client_size(hwnd)
+    width, height = client_size(hwnd)
     if width < 8 or height < 8:
         return None
 

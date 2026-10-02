@@ -60,6 +60,9 @@ GRID_ORIGIN = (166, 267)
 GRID_STEP = (135, 175)
 # 图标中心到「等级」标签中心的垂直偏移（OCR 标定用）
 GRID_LABEL_DY = 87
+# 等级标签 OCR 扫描区（设计坐标）。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280）；
+# 上边界放宽到 80：列表滚动停在半行位置时，首行标签位置会随滚动偏移。
+LABEL_SCAN_AREA = (60, 80, 1330, 1020)
 
 
 def scale_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:

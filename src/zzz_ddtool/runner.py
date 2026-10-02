@@ -18,7 +18,7 @@ from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
-from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_STEP, scale_point
+from zzz_ddtool.layout import GRID_COLS, GRID_ORIGIN, GRID_STEP, LABEL_SCAN_AREA, scale_point
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
 from zzz_ddtool.nav import NavError, goto_warehouse
@@ -26,9 +26,6 @@ from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
 from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once, wheel_client
 
-# 等级标签 OCR 扫描区。右边界必须盖住第 9 列标签（中心 x≈1246，右缘≈1280）；
-# 上边界放宽到 80：列表滚动停在半行位置时，首行标签位置会随滚动偏移
-LABEL_SCAN_AREA = (60, 80, 1330, 1020)
 # 单个盘子连续升阶上限（0→15 最多 5 阶，留余量防 OCR 读级错误导致死循环）
 _MAX_STAGE_UPGRADES = 6
 
