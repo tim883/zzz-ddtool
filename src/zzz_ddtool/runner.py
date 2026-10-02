@@ -845,6 +845,22 @@ class Runner:
     def _parse_disc(self, image: QImage) -> Disc | None:
         return self._read_disc_with_retry(image, parse_disc, "detail")
 
+    def _parse_upgrade_page(self, image: QImage) -> Disc | None:
+        """强化页识别：先按强化页坐标读，读不到再按详情页坐标读。
+
+        满级后游戏把强化界面切成「展示态」——等级标到右上角 15/15 MAX、强化按钮
+        消失，强化页专用区域读不到等级，会误报「未识别出盘面」打断整条任务链
+        （2026-10-02 真机第 5 轮实测：12→15 满级确认后 UPGRADE_LEVEL 区域无文字、
+        DISC_LEVEL 区域读到「等级15」）。回退详情页坐标仍能读出 level=15，
+        交给 decide 走 keep_max_level 正常收尾。
+        """
+        from zzz_ddtool import ocr as _ocr  # 走模块属性，保持可打桩
+
+        disc = _ocr.parse_disc_upgrade_page(image)
+        if disc is not None:
+            return disc
+        return _ocr.parse_disc(image)
+
     def _read_disc_with_retry(self, image, parser, page):
         reason = "未识别出盘面"
         for attempt in range(max(1, self.preset.ocr_retry)):
@@ -1051,12 +1067,10 @@ class Runner:
         判断在强化页做（左边卡片有副属性），判升级就「阶段添加」+「升级」原地
         循环，判弃置才 Esc 回详情页按 R。不再每次升级完都 Esc 回网格全量重扫。
         """
-        from zzz_ddtool.ocr import parse_disc_upgrade_page
-
         upgraded = 0
         while True:
             image, *_ = self._grab(allow_esc=False)
-            disc = self._read_disc_with_retry(image, parse_disc_upgrade_page, "upgrade")
+            disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
             if self._detail_disc is not None:
                 disc = replace(
                     disc,

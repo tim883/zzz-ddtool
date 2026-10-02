@@ -11,6 +11,7 @@ from zzz_ddtool.ocr import (
     _parse_substat,
     _parse_value,
     parse_disc,
+    parse_disc_upgrade_page,
     read_level,
     read_mainstat,
 )
@@ -76,6 +77,21 @@ def test_warehouse_sidebar_regression() -> None:
     assert disc.level == 3
     assert disc.substats == tuple(Substat(name) for name in ("暴击伤害", "暴击率", "攻击力", "异常精通"))
     assert read_mainstat(image) == "生命值"
+
+
+def test_upgrade_page_max_level_regression() -> None:
+    """满级后强化界面切成展示态：强化页坐标读空，详情页坐标仍能读出 +15。
+
+    2026-10-02 真机第 5 轮失败现场：12→15 满级确认后，强化页 UPGRADE_LEVEL 区域
+    无文字（等级挪到右上角），parse_disc_upgrade_page 返回 None 直接打断任务链。
+    """
+    image = QImage("tests/fixtures/upgrade-maxed.png")
+    assert not image.isNull()
+    assert parse_disc_upgrade_page(image) is None  # 强化页坐标随布局变化已失效
+    disc = parse_disc(image)  # 回退详情页坐标
+    assert disc is not None
+    assert disc.level == 15
+    assert [sub.name for sub in disc.substats] == ["攻击力", "攻击力%", "暴击伤害", "异常精通"]
 
 
 def test_level_rejects_unrelated_numbers(monkeypatch) -> None:

@@ -689,6 +689,54 @@ def test_run_calls_real_upgrade_buttons_then_rejudges(offline_runner, monkeypatc
     discard.assert_called_once_with(1)
 
 
+def test_upgrade_page_falls_back_to_detail_layout_when_maxed(offline_runner, monkeypatch):
+    """满级后强化界面切成展示态：强化页坐标读不到等级，必须回退详情页坐标解析。
+
+    真机第 5 轮实测：12→15 满级确认后 UPGRADE_LEVEL 区域无文字、DISC_LEVEL 读到
+    「等级15」，原实现直接报「未识别出盘面」把整条任务链打断。
+    """
+    job = TaskJob(
+        slot=4,
+        weights={"暴击率": 1},
+        stage_require={"four": {0: 0, 3: 0, 6: 0, 9: 0, 12: 0}},
+    )
+    runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
+    initial = sample_disc()
+    # +15 四词条盘：强化 5 次全部落在已有词条上（rolls 6 = 1+5），origin 才能推断为 four
+    maxed = Disc(15, (Substat("暴击率", 6),) + initial.substats[1:])
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: initial)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: None)
+    fallback = Mock(return_value=maxed)
+    monkeypatch.setattr(ocr_module, "parse_disc", fallback)
+    back = Mock(return_value=True)
+    monkeypatch.setattr(runner, "_esc_back_to_grid", back)
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert fallback.called, "满级展示态必须回退详情页坐标解析"
+    assert [(r.action, r.level, r.reason) for r in runner.results] == [
+        ("skip", 15, "keep_max_level")
+    ]
+    back.assert_called_once()
+
+
+def test_upgrade_page_fails_when_both_layouts_unreadable(offline_runner, monkeypatch):
+    """强化页与详情页两套坐标都读不出时，仍按原语义报错停止任务链。"""
+    job = TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0}})
+    runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: None)
+    monkeypatch.setattr(ocr_module, "parse_disc", lambda image: None)
+
+    runner.run()
+
+    assert runner.outcome == "failed"
+    assert "未识别出盘面" in runner.end_reason
+
+
 @pytest.mark.parametrize("missing, click_count", [("stage", 0), ("confirm", 1)])
 def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch, missing, click_count):
     runner = Runner(Preset(), hotkeys=False)
