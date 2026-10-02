@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
+
 from zzz_ddtool.layout import BACK_BTN_REGION, BOTTOM_ICON_BAND, OVERWORLD_HINT, scale_rect
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.template import IconMark, all_marks_hit, marks_hit
+from zzz_ddtool.template import IconMark, all_marks_hit, marks_hit, to_rgb
 
 MENU = "menu"
 OVERWORLD = "overworld"
@@ -68,27 +70,22 @@ def is_page(image, page: str) -> bool:
 
 def _red_back_hits(image) -> int:
     left, top, right, bottom = scale_rect(*BACK_BTN_REGION, image.width(), image.height())
-    hits = 0
     step = max(1, (right - left) // 40)
-    for y in range(top, bottom, step):
-        for x in range(left, right, step):
-            color = image.pixelColor(x, y)
-            if color.red() > 170 and color.green() < 100 and color.blue() < 100:
-                hits += 1
-    return hits
+    block = to_rgb(image)[top:bottom:step, left:right:step].astype(np.int32)
+    if block.size == 0:
+        return 0
+    hit = (block[:, :, 0] > 170) & (block[:, :, 1] < 100) & (block[:, :, 2] < 100)
+    return int(hit.sum())
 
 
 def _bottom_icon_centers(image) -> list[int]:
     left, top, right, bottom = scale_rect(*BOTTOM_ICON_BAND, image.width(), image.height())
-    bright_xs: list[int] = []
-    for x in range(left, right, 2):
-        bright = 0
-        for y in range(top, bottom, 3):
-            color = image.pixelColor(x, y)
-            if color.red() + color.green() + color.blue() > 600:
-                bright += 1
-        if bright >= 4:
-            bright_xs.append(x)
+    block = to_rgb(image)[top:bottom:3, left:right:2].astype(np.int32)
+    if block.size == 0:
+        return []
+    bright_per_col = (block.sum(axis=2) > 600).sum(axis=0)
+    xs = np.arange(block.shape[1]) * 2 + left
+    bright_xs = [int(x) for x in xs[bright_per_col >= 4]]
     if not bright_xs:
         return []
     groups: list[tuple[int, int]] = []
@@ -104,15 +101,12 @@ def _bottom_icon_centers(image) -> list[int]:
 
 def _overworld_hint(image) -> float:
     left, top, right, bottom = scale_rect(*OVERWORLD_HINT, image.width(), image.height())
-    hits = 0
-    total = 0
-    for y in range(top, bottom, 2):
-        for x in range(left, right, 2):
-            total += 1
-            color = image.pixelColor(x, y)
-            if color.red() > 200 and color.green() > 200 and color.blue() > 200:
-                hits += 1
-    return hits / total if total else 0.0
+    block = to_rgb(image)[top:bottom:2, left:right:2].astype(np.int32)
+    total = block.shape[0] * block.shape[1]
+    if not total:
+        return 0.0
+    white = (block[:, :, 0] > 200) & (block[:, :, 1] > 200) & (block[:, :, 2] > 200)
+    return int(white.sum()) / total
 
 
 def _classify_heuristic(image) -> str:
