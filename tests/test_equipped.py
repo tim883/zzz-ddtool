@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
 from zzz_ddtool.equipped import tile_has_portrait, tile_is_empty, tile_is_selected
+from zzz_ddtool.traversal import tail_slots_confirmed
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -107,3 +108,42 @@ def test_real_list_tail_only_last_slot_is_empty(qapp: QApplication) -> None:
             if tile_is_empty(image, cx, cy) is True:
                 empty.append((row, col))
     assert empty == [(3, 8)]
+
+
+def test_real_small_list_three_rows_empty_tail(qapp: QApplication) -> None:
+    """真机图重放：谶羽之誓 1 号位 [23/3000] 只有 3 行（9+9+5），
+
+    第 3 行第 6~9 格与整个第 4 行都是游戏画出来的空位占位；其余 23 格有盘。
+    这张图对应 E6「1~3 行小列表」场景（一屏装得下，游戏根本不滚动）。
+    """
+    image = QImage(str(FIXTURES / "list-small-three-rows.png"))
+    assert not image.isNull()
+    origin_y, pitch = 268.5, 174.5
+    empty: list[tuple[int, int]] = []
+    occupied: set[tuple[int, int]] = set()
+    for row in range(4):
+        for col in range(9):
+            cx = 166 + 135 * col
+            cy = int(round(origin_y + pitch * row))
+            verdict = tile_is_empty(image, cx, cy)
+            if verdict is True:
+                empty.append((row, col))
+            elif verdict is False:
+                occupied.add((row, col))
+    assert empty == [(2, 5), (2, 6), (2, 7), (2, 8)] + [(3, col) for col in range(9)]
+    assert len(occupied) == 23
+
+
+def test_real_small_list_tail_slots_confirmed(qapp: QApplication) -> None:
+    """同一张真机图：23 件占满前 3 行、末行 5 件，末尾占位构成连续尾段 → 确认到底。"""
+    image = QImage(str(FIXTURES / "list-small-three-rows.png"))
+    origin_y, pitch = 268.5, 174.5
+    occupied, empty = set(), set()
+    for row in range(4):
+        for col in range(9):
+            cx = 166 + 135 * col
+            cy = int(round(origin_y + pitch * row))
+            (occupied if tile_is_empty(image, cx, cy) is False else empty).add((row, col))
+    assert tail_slots_confirmed(occupied, empty, rows=4, cols=9)
+    # 抽掉一个空位（模拟没确认到）就必须拒绝，不能当到底
+    assert not tail_slots_confirmed(occupied, empty - {(2, 8)}, rows=4, cols=9)
