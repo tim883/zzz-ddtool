@@ -47,6 +47,11 @@ def archives_file() -> Path:
     return user_dir() / "archives.json"
 
 
+def last_config_file() -> Path:
+    """记着「上次用的是哪份 yaml」，下次启动直接打开它。用户数据，更新永不碰。"""
+    return user_dir() / "last-config.json"
+
+
 def log_dir() -> Path:
     """所有运行时产出的根目录，第一层就叫 log。
 

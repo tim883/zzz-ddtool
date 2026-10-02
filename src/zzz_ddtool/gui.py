@@ -239,7 +239,51 @@ def _pencil_icon(size: int = 16):
     return QIcon(pix)
 
 
+def remember_config_path(path: Path) -> None:
+    """记下这次用的 yaml，下次启动直接打开它。
+
+    只在用户**换了文件**的时候记（打开、另存为）。写失败不影响使用——
+    这只是个便利功能，坏了顶多回到默认档。
+    """
+    import json
+
+    from zzz_ddtool.paths import last_config_file
+
+    target = last_config_file()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"path": str(Path(path).resolve())}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def last_config_path() -> Path | None:
+    """读上次用的 yaml。没记过、读不出来、或那个文件已经不在了，都返回 None。"""
+    import json
+
+    from zzz_ddtool.paths import last_config_file
+
+    try:
+        raw = json.loads(last_config_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    value = str(raw.get("path") or "").strip()
+    if not value:
+        return None
+    path = Path(value)
+    return path if path.exists() else None
+
+
 def default_config_path() -> Path:
+    """启动时打开哪份 yaml：优先用上次打开的，否则用自带的 example.yaml。"""
+    remembered = last_config_path()
+    if remembered is not None:
+        return remembered
     from zzz_ddtool.paths import data_dir
 
     return data_dir() / "example.yaml"
@@ -2121,6 +2165,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "打开预设", str(self._path.parent), "YAML (*.yaml *.yml)")
         if path:
             self._load_path(Path(path))
+            remember_config_path(self._path)
 
     def save_current(self) -> None:
         save_preset(self._path, self.collect_preset())
@@ -2151,6 +2196,8 @@ class MainWindow(QMainWindow):
             return
         self._path = Path(path)
         self.save_current()
+        # 另存为换了工作文件，下次启动就打开它
+        remember_config_path(self._path)
 
     def run_trial(self) -> None:
         disc = self.trial.disc()

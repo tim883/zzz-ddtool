@@ -197,6 +197,92 @@ def test_new_job_starts_empty_and_gets_unique_name(qapp: QApplication, tmp_path)
     window.close()
 
 
+def test_remembers_last_opened_yaml(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """打开时用上次的 yaml。
+
+    只在用户换了文件（打开 / 另存为）时记；没记过、记的文件被删了、记录损坏，
+    都回落自带的 example.yaml，不能启动不了。
+    """
+    import json
+
+    from zzz_ddtool import paths
+    from zzz_ddtool.config import preset_from_dict, save_preset
+    from zzz_ddtool.gui import default_config_path, last_config_path, remember_config_path
+
+    # user 目录指到临时目录，别碰真实的 user/
+    monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
+
+    assert last_config_path() is None
+    assert default_config_path().name == "example.yaml"
+
+    # 故意用 2 个词条的轻量档：4 词条会生成 837 张卡，光是建卡就把测试拖慢十几秒
+    mine = tmp_path / "我的方案.yaml"
+    save_preset(
+        mine,
+        preset_from_dict(
+            {
+                "name": "轻量",
+                "weights": {"暴击率": 1.0},
+                "task_chain": [
+                    {"id": "a", "slot": 1, "weights": {"暴击率": 1.0}},
+                    {"id": "b", "slot": 2, "weights": {"暴击率": 1.5}},
+                ],
+            }
+        ),
+    )
+    remember_config_path(mine)
+    assert last_config_path() == mine.resolve()
+    assert default_config_path() == mine.resolve()
+
+    # 不传 config_path 启动 → 载入上次那份
+    window = MainWindow()
+    assert window._path == mine.resolve()
+    assert len(window._jobs) == 2
+    window.close()
+
+    # 文件没了 → 回落默认，不能拿一个不存在的路径去启动
+    mine.unlink()
+    assert last_config_path() is None
+    assert default_config_path().name == "example.yaml"
+
+    # 记录损坏 → 回落默认，不抛异常
+    last_file = paths.last_config_file()
+    last_file.parent.mkdir(parents=True, exist_ok=True)
+    for broken in ("{ 这不是 json", json.dumps({"path": "   "}), json.dumps(["不是字典"])):
+        last_file.write_text(broken, encoding="utf-8")
+        assert last_config_path() is None
+        assert default_config_path().name == "example.yaml"
+
+
+def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """点「打开」/「另存为」换了文件之后，那份就被记住。"""
+    from zzz_ddtool import gui, paths
+    from zzz_ddtool.config import preset_from_dict, save_preset
+    from zzz_ddtool.gui import last_config_path
+
+    monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
+    light = preset_from_dict({"name": "轻量", "weights": {"暴击率": 1.0}})
+
+    target = tmp_path / "手动打开.yaml"
+    save_preset(target, light)
+    monkeypatch.setattr(
+        gui.QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(target), "YAML"))
+    )
+    window = MainWindow(config_path=tmp_path / "空.yaml")
+    window.open_preset()
+    assert last_config_path() == target.resolve()
+
+    # 另存为换了当前工作文件，也要记住
+    target2 = tmp_path / "另存出去.yaml"
+    monkeypatch.setattr(
+        gui.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target2), "YAML"))
+    )
+    window.save_as()
+    assert target2.exists()
+    assert last_config_path() == target2.resolve()
+    window.close()
+
+
 def decide_sample(preset) -> Action:
     from zzz_ddtool.decide import decide
 
