@@ -51,6 +51,7 @@ from zzz_ddtool.traversal import (
     bottom_evidence,
     check_forward_move,
     check_layout_reference,
+    forward_batch_for_top,
     global_row_col,
     make_filter_signature,
     map_labels,
@@ -328,11 +329,12 @@ class Runner:
         self._state = state
 
         profile = self._prepare_navigation(hwnd, state)
+        # 先起第 1 批，再摆起点：跳号启动要按新视口覆盖批次计数（见 _seed_start_index）。
+        state.start_first_batch()
         if self.start_index > 0:
             self._seed_start_index(hwnd, state, self.start_index)
         else:
             state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=False)
-        state.start_first_batch()
         self._set_status("batch", "首批网格起点")
 
         up_counts: dict[int, int] = {}
@@ -548,13 +550,17 @@ class Runner:
             at_bottom=False,
         )
         state.clear_scroll()
+        # 视口已经不在顶部，批次计数按等效批次数对齐：check_forward_move 的上界
+        # 是「每批 2 行」推出来的，不同步就会把这次合法的深序号视口判成超量推进。
+        state.work_batch_count = state.work_batch_id = forward_batch_for_top(top_row0)
         self.log.warning(
-            "测试入口：跳号启动 next_index=%d（全局第 %d 行第 %d 列），视口顶部全局第 %d 行；"
-            "前 %d 格标记为已跳过（未实际处理）",
+            "测试入口：跳号启动 next_index=%d（全局第 %d 行第 %d 列），视口顶部全局第 %d 行"
+            "（批次对齐为第 %d 批）；前 %d 格标记为已跳过（未实际处理）",
             start_index,
             row0 + 1,
             col0 + 1,
             top_row0 + 1,
+            state.work_batch_count,
             start_index,
         )
         self._set_status(

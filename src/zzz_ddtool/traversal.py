@@ -75,6 +75,18 @@ def forward_top_limit(batch_no: int) -> int:
     return FORWARD_ROWS_PER_BATCH * (max(1, batch_no) - 1)
 
 
+def forward_batch_for_top(top_row0: int, rows: int = FORWARD_ROWS_PER_BATCH) -> int:
+    """视口顶部位于 top_row0 时等效的正常前进批次数（与 forward_top_limit 配对）。
+
+    跳号启动把视口直接摆到列表深处，批次计数必须同步跟上——否则
+    check_forward_move 按「从顶部每批 2 行」推算的上界会把合法视口误判成超量推进。
+    取值保证 forward_top_limit(返回值) >= top_row0。
+    """
+    if top_row0 <= 0:
+        return 1
+    return (top_row0 + rows - 1) // rows + 1
+
+
 def max_restore_rows(max_pages: int) -> int:
     """开局可计算的恢复请求行数上界 H（spec §4.2、§5.1）。
 

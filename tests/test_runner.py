@@ -20,7 +20,14 @@ from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Action, Disc, Substat
 from zzz_ddtool.navigation import Environment, NavProfile, ScrollSend
 from zzz_ddtool.runner import Runner, RunnerError
-from zzz_ddtool.traversal import CellStatus, GridCell, TraversalState, max_restore_rows
+from zzz_ddtool.traversal import (
+    CellStatus,
+    GridCell,
+    TraversalState,
+    check_forward_move,
+    forward_batch_for_top,
+    max_restore_rows,
+)
 
 VIEWPORT_ROWS = 4
 GRID_COLS = 9
@@ -983,6 +990,31 @@ def test_start_index_does_not_touch_earlier_cells(offline_runner, monkeypatch):
 def test_start_index_defaults_to_zero(offline_runner):
     assert Runner(Preset(), hotkeys=False).start_index == 0
     assert Runner(Preset(), hotkeys=False, start_index=-5).start_index == 0
+
+
+def test_start_index_aligns_batch_count_with_viewport(offline_runner, monkeypatch):
+    """跳号到深处后批次计数按等效批次对齐。
+
+    真机回归：start-index 134 把视口摆到全局第 14 行，批次计数仍是 1，
+    下一次正常前进时 check_forward_move 按「每批 2 行」算出的上界只有 2，
+    于是合法的视口被判「第 2 批顶部行 13 超过上界 2」，整轮 failed。
+    """
+    sent: list[int] = []
+    spy_scroll(monkeypatch, sent)
+    runner = Runner(Preset(max_discs=1), hotkeys=False, start_index=134)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    state = seed_state()
+    state.start_first_batch()
+
+    runner._seed_start_index(1, state, runner.start_index)
+
+    assert state.viewport_top_row0 == 13
+    assert state.work_batch_count == forward_batch_for_top(13) == 8
+    assert state.work_batch_id == state.work_batch_count
+    # 下一次前进的批次上界必须放行这个顶部行
+    check_forward_move(state.work_batch_count + 1, 13, 13, 2)
+    assert sent == [13]
 
 
 # ---------------------------------------------------------------- 末尾空位与到底判定

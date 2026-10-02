@@ -22,6 +22,7 @@ from zzz_ddtool.traversal import (
     bottom_evidence,
     check_forward_move,
     check_layout_reference,
+    forward_batch_for_top,
     forward_top_limit,
     global_index,
     global_row_col,
@@ -348,6 +349,26 @@ def test_forward_top_limit():
     assert forward_top_limit(1) == 0
     assert forward_top_limit(2) == 2
     assert forward_top_limit(20) == 38
+
+
+def test_forward_batch_for_top_is_the_inverse_of_the_limit():
+    """跳号把视口摆到任意深度后，等效批次必须让 forward_top_limit 放行该顶部行。"""
+    for top in range(0, 40):
+        batch = forward_batch_for_top(top)
+        assert forward_top_limit(batch) >= top, (top, batch)
+        assert batch >= 1
+    assert forward_batch_for_top(0) == 1
+    assert forward_batch_for_top(1) == 2
+    assert forward_batch_for_top(2) == 2
+    assert forward_batch_for_top(13) == 8  # 真机回归：全局第 14 行视口
+
+
+def test_forward_move_allows_a_seeded_deep_viewport():
+    """真机回归：跳号到全局第 14 行（顶部 13）后，下一次前进不再被判「超过上界」。"""
+    top = 13
+    check_forward_move(forward_batch_for_top(top) + 1, top, top, 2)
+    with pytest.raises(PositionError, match="超过上界"):
+        check_forward_move(2, top, top, 2)  # 批次没跟着走时的原症状
 
 
 def test_forward_move_validation():
