@@ -1095,8 +1095,6 @@ class MainWindow(QMainWindow):
         add_btn = QPushButton("加入任务链")
         add_btn.setObjectName("primary")
         add_btn.clicked.connect(self._add_job)
-        update_btn = QPushButton("更新当前任务")
-        update_btn.clicked.connect(self._update_job)
         row = QHBoxLayout()
         up_btn = QPushButton("上移")
         down_btn = QPushButton("下移")
@@ -1111,10 +1109,17 @@ class MainWindow(QMainWindow):
         inner.addLayout(name_row)
         inner.addWidget(self.chain_list, 1)
         inner.addWidget(add_btn)
-        inner.addWidget(update_btn)
         inner.addLayout(row)
         layout.addWidget(box)
         return panel
+
+    @staticmethod
+    def _job_item_text(index: int, job: TaskJob) -> str:
+        """列表条目文本：两行——第一行名字，第二行内容摘要。没名字的老档案只有摘要一行，
+        免得两行一模一样。改实时写回后摘要会跟着变，所以抽出来给两处共用。"""
+        if job.name:
+            return f"{index + 1}. {job.name}\n      {job.title()}"
+        return f"{index + 1}. {job.title()}"
 
     def _refresh_chain_list(self, select_id: str | None = None) -> None:
         current_id = select_id or self._editing_job_id
@@ -1124,12 +1129,7 @@ class MainWindow(QMainWindow):
         self.chain_list.blockSignals(True)
         self.chain_list.clear()
         for index, job in enumerate(self._jobs):
-            # 两行条目：第一行是名字，第二行是内容摘要。没名字的老档案只显示摘要，
-            # 免得两行一模一样。
-            text = f"{index + 1}. {job.title()}"
-            if job.name:
-                text = f"{index + 1}. {job.name}\n      {job.title()}"
-            item = QListWidgetItem(text)
+            item = QListWidgetItem(self._job_item_text(index, job))
             item.setData(Qt.ItemDataRole.UserRole, job.job_id)
             self.chain_list.addItem(item)
         if current_id:
@@ -1183,6 +1183,27 @@ class MainWindow(QMainWindow):
         job.name = name
         self._refresh_chain_list(job.job_id)
 
+    def _commit_editor(self) -> None:
+        """把右侧编辑器当前状态写回。编辑器是唯一真相，只在「要离开它」的时候快照一次：
+        切任务节点、切部位、落盘/试判/开始任务。这样就不需要「更新当前任务」按钮了。
+
+        有选中任务时写进那个任务节点（名字不在编辑器里，原样保留），顺带刷新它那行的摘要；
+        没选中任务时只更新部位暂存，切回去时还能看到刚才编的内容。
+        """
+        if self._loading:
+            return
+        self._slot_plans[self._active_slot] = self._snapshot_slot()
+        for index, job in enumerate(self._jobs):
+            if job.job_id != self._editing_job_id:
+                continue
+            fresh = self._job_from_editor(job.job_id)
+            fresh.name = job.name
+            self._jobs[index] = fresh
+            item = self.chain_list.item(index)
+            if item is not None:
+                item.setText(self._job_item_text(index, fresh))
+            return
+
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
         snap = self._snapshot_slot()
         return TaskJob(
@@ -1227,7 +1248,8 @@ class MainWindow(QMainWindow):
     def _on_chain_row(self, row: int) -> None:
         if self._loading or row < 0 or row >= len(self._jobs):
             return
-        self._slot_plans[self._active_slot] = self._snapshot_slot()
+        # 先把手头这个任务编的内容写回去，再切走——不然刚改的权重会丢。
+        self._commit_editor()
         self._load_job(self._jobs[row])
 
     def _add_job(self) -> None:
@@ -1251,20 +1273,6 @@ class MainWindow(QMainWindow):
             self._refresh_archive_combo(name)
         self._refresh_chain_list(job.job_id)
         self._focus_job_name()
-
-    def _update_job(self) -> None:
-        if not self._editing_job_id:
-            self.path_label.setText("先点任务链里的一项，或先「加入任务链」。")
-            return
-        for index, job in enumerate(self._jobs):
-            if job.job_id != self._editing_job_id:
-                continue
-            self._jobs[index] = self._job_from_editor(job.job_id)
-            self._slot_plans[self._jobs[index].slot] = self._snapshot_slot()
-            self._refresh_chain_list(self._editing_job_id)
-            self.path_label.setText(f"已更新任务  {self._jobs[index].title()}")
-            return
-        self.path_label.setText("当前任务不在链里，请先加入。")
 
     def _remove_job(self) -> None:
         row = self.chain_list.currentRow()
@@ -1467,7 +1475,7 @@ class MainWindow(QMainWindow):
     def _on_slot_clicked(self, slot: int) -> None:
         if self._loading or slot == self._active_slot:
             return
-        self._slot_plans[self._active_slot] = self._snapshot_slot()
+        self._commit_editor()
         self._editing_job_id = None
         self._active_slot = slot
         plan = self._slot_plans.get(slot) or empty_slot_plan(slot)
@@ -1479,6 +1487,8 @@ class MainWindow(QMainWindow):
         self.chain_list.blockSignals(True)
         self.chain_list.clearSelection()
         self.chain_list.blockSignals(False)
+        # 切部位等于取消选中任务：名字框跟着空掉并禁用
+        self._sync_job_name_edit()
 
     def _on_filter_changed(self) -> None:
         if self._loading:
@@ -1902,6 +1912,9 @@ class MainWindow(QMainWindow):
         return is_checked
 
     def collect_preset(self) -> Preset:
+        # 落盘 / 试判 / 开始任务都走这里，是「离开编辑器」的汇总口：先把当前编辑内容
+        # 写回任务节点，再取配置，否则跑的是上一次提交的旧值。
+        self._commit_editor()
         self._slot_plans[self._active_slot] = self._snapshot_slot()
         current = self._slot_plans[self._active_slot]
         return preset_from_dict(
