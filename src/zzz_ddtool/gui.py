@@ -764,6 +764,9 @@ class MainWindow(QMainWindow):
         self.resize(1320, 820)
         self._path = Path(config_path) if config_path else default_config_path()
         self._loading = False
+        self._rebuilding = False
+        self._rebuild_pending = False
+        self._busy_cursor = False
         self._rebuild_timer = QTimer(self)
         self._rebuild_timer.setSingleShot(True)
         self._rebuild_timer.setInterval(250)
@@ -1717,11 +1720,49 @@ class MainWindow(QMainWindow):
         self.rebuild_cards(accepted)
 
     def _schedule_rebuild(self) -> None:
-        if self._loading:
+        if self._loading or self._rebuilding:
             return
         self._rebuild_timer.start()
 
+    # 组合卡片超过这个数量才提示「正在生成…」，小批量重建是毫秒级，
+    # 弹提示反而是一闪而过，比不提示更烦。
+    _BUSY_CARD_THRESHOLD = 120
+
+    def _begin_busy(self, text: str) -> None:
+        """在建卡前把提示先画出来。
+
+        建卡是同步的，会把事件循环堵死——所以提示必须在堵死**之前**排一次绘制，
+        否则它和卡片一起在最后才出现，等于没提示。这是这里唯一有意义的一步。
+        """
+        self.status.setText(text)
+        if not self._busy_cursor:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._busy_cursor = True
+        # 排一次绘制把上面的文案真正刷到屏上；之后主线程再堵，用户也能看见这句话。
+        QApplication.processEvents()
+
+    def _end_busy(self) -> None:
+        if self._busy_cursor:
+            QApplication.restoreOverrideCursor()
+            self._busy_cursor = False
+
     def rebuild_cards(self, accepted: tuple[str, ...] | None = None) -> None:
+        if self._rebuilding:
+            # processEvents（_begin_busy 里那一下）可能把已到期的重建定时器放出来，
+            # 造成重入。记下来，等这一轮跑完再补一次，避免嵌套重建。
+            self._rebuild_pending = True
+            return
+        self._rebuilding = True
+        try:
+            self._rebuild_cards_inner(accepted)
+        finally:
+            self._rebuilding = False
+            self._end_busy()
+            if self._rebuild_pending:
+                self._rebuild_pending = False
+                self._schedule_rebuild()
+
+    def _rebuild_cards_inner(self, accepted: tuple[str, ...] | None = None) -> None:
         blocked = set(self._selected_mains())
         weights = {name: value for name, value in self.weight_editor.weights().items() if name not in blocked}
         patterns = enumerate_all(weights, hide_junk_bonus=True)
@@ -1729,9 +1770,19 @@ class MainWindow(QMainWindow):
         for pattern in patterns:
             grouped[(pattern.origin.value, pattern.checkpoint)].append(pattern)
         is_checked = self._card_check_policy(accepted)
+        # 先算出这一轮要真建多少张卡，只有够大才值得提示。
+        # 判定结果顺便复用给下面的主循环，避免同一个 patterns_match 跑两遍。
+        todo: dict[tuple[str, int], list[Pattern]] = {}
         for key, section in self.sections.items():
             wanted = grouped.get(key, [])
-            if section.patterns_match(wanted):
+            if not section.patterns_match(wanted):
+                todo[key] = wanted
+        pending_cards = sum(len(wanted) for wanted in todo.values())
+        if pending_cards >= self._BUSY_CARD_THRESHOLD:
+            self._begin_busy(f"正在生成组合…  共 {pending_cards} 张，请稍候")
+        for key, section in self.sections.items():
+            wanted = grouped.get(key, [])
+            if key not in todo:
                 section.update_card_states(wanted, is_checked)
             else:
                 section.set_cards(wanted, is_checked)
