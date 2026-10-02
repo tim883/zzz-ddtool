@@ -4,6 +4,7 @@
 不发送任何真实游戏输入。
 """
 
+from dataclasses import replace
 from unittest.mock import Mock, call
 
 import pytest
@@ -349,6 +350,41 @@ def test_restore_position_returns_to_saved_viewport(offline_runner, monkeypatch)
     assert state.position_valid is True
     offline_runner["reset_to_top"].assert_called_once()
     assert runner._restored_scan is not None  # 校验扫描结果留给主循环复用
+
+
+def test_restore_waits_for_scroll_settle_before_scan(offline_runner, monkeypatch):
+    """恢复批量滚动发完必须等列表缓动停稳，再让校验扫描抓图。
+
+    真机第 4 轮：不等稳定时「等级」标签整体偏 3px，压过 2% 容差（3.49px），
+    本来正确的恢复被误判成两次失败。
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    runner = Runner(Preset(), hotkeys=False)
+
+    runner._await_scroll_settle(fake_profile())  # settle_wait_ms=100
+    assert sleeps == [0.1]
+
+    sleeps.clear()
+    runner._await_scroll_settle(replace(fake_profile(), settle_wait_ms=0))
+    assert sleeps == [runner_module._SETTLE_FALLBACK_MS / 1000]
+
+
+def test_restore_settles_only_after_actually_scrolling(offline_runner, monkeypatch):
+    """保存视口就在顶部（请求 0 行）时不发送也不等待。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.confirm_viewport(0, 0.0, row_pitch_px=175.0, at_top=True, at_bottom=False)
+    state.begin_upgrade(3)
+    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0)], [], {}))
+    slept: list[float] = []
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(runner_module, "scroll_rows", Mock())
+
+    runner._restore_position(1, state)
+    assert slept == []
 
 
 def test_restore_retries_once_when_grid_unreadable(offline_runner, monkeypatch):

@@ -61,6 +61,8 @@ from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_
 _MAX_STAGE_UPGRADES = 6
 # 正常前进每次请求的行数上界（spec §5.1：只允许 1 或 2 行，维持 H）
 _FORWARD_ROWS = 2
+# 恢复批量滚动后的兜底稳定等待；标定给出 settle_wait_ms 时优先用它
+_SETTLE_FALLBACK_MS = 500
 
 
 class RunnerError(RuntimeError):
@@ -809,6 +811,9 @@ class Runner:
             send = scroll_rows(hwnd, rows, profile, before_event=lambda _index: self._checkpoint())
             if not send.complete:
                 raise RunnerError("恢复批量发送未完成，停止任务链")
+            # 事件发完只说明输入已送出，列表仍在缓动。立刻抓图会让「等级」标签
+            # 整体偏几像素，残差压过 §5.4 的 2% 映射容差，把正确的恢复误判成失败。
+            self._await_scroll_settle(profile)
         # 提交保存的实际视口，不新建工作批次（spec §5.3、§6.4）。
         state.confirm_viewport(
             saved.viewport_top_row0,
@@ -818,6 +823,22 @@ class Runner:
             at_bottom=saved.at_bottom,
         )
         state.clear_scroll()
+
+    def _await_scroll_settle(self, profile: NavProfile) -> None:
+        """恢复批量滚动后等列表缓动停稳，再让校验扫描抓图。
+
+        滚动事件发完只说明输入已送出，列表仍在缓动；此时抓到的「等级」标签会整体
+        偏几像素，残差压过 §5.4 的 2% 映射容差（174.5px 行距时约 3.49px），把本来
+        正确的恢复误判成失败（2026-10-02 真机第 4 轮实测偏 3px）。
+
+        等待量取标定实测的 settle_wait_ms ——正常前进就是靠它轮询到锚点稳定，
+        恢复没有选中框可轮询，只能按实测值等待；缺失时用兜底值。
+        """
+        wait_ms = int(getattr(profile, "settle_wait_ms", 0) or 0)
+        if wait_ms <= 0:
+            wait_ms = _SETTLE_FALLBACK_MS
+        self.log.info("恢复滚动完成，等列表稳定 %dms", wait_ms)
+        time.sleep(wait_ms / 1000)
 
     # ---------------------------------------------------------------- 详情与强化
 
