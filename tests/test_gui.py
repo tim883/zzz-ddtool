@@ -520,3 +520,97 @@ def test_weight_editor_rejects_non_substats(qapp: QApplication) -> None:
     choices = editor._choices()
     assert "穿透率" not in choices
     assert set(choices) <= set(SUBSTAT_NAMES)
+
+
+def _card_fingerprint(window: MainWindow) -> dict:
+    """把每张卡「显示出来的东西」和它携带的图案逐字核对后快照下来。
+
+    复用卡片时是就地改写文字，一旦哪一行漏改，屏幕上就会出现和图案对不上的
+    内容——也就是假信息。所以这里不只看 pattern_id，还要看 label 的实际文本。
+    """
+    out = {}
+    for key, section in window.sections.items():
+        rows = []
+        for card in section.cards:
+            shown = [(label.text(), extra.text()) for label, extra in card._slot_rows]
+            expect = [
+                (slot.name, f"+{slot.bonus}" if slot.bonus > 0 else "")
+                for slot in card.pattern.slots
+            ]
+            assert shown == expect, f"{key} 的卡片文字与图案不符：{shown} != {expect}"
+            assert card.score_label.text() == f"{card.pattern.score:g}"
+            rows.append((card.pattern.pattern_id, card.pattern.score))
+        out[key] = rows
+    return out
+
+
+def _spy_set_cards(monkeypatch, window: MainWindow) -> list:
+    """记录哪些分区真的走了「销毁重建」。"""
+    rebuilt = []
+    for section in window.sections.values():
+        original = section.set_cards
+
+        def spy(patterns, is_checked, _original=original, _section=section):
+            rebuilt.append(_section)
+            return _original(patterns, is_checked)
+
+        monkeypatch.setattr(section, "set_cards", spy)
+    return rebuilt
+
+
+def test_weight_edit_reuses_cards_and_stays_truthful(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """改词条单价只改分值和行的排列，绝不能整屏销毁重建。
+
+    重建八百多张卡的代价是两三秒，其中「摘除旧卡」和「造新卡」各占一半；每敲
+    一下单价都重来一遍，就是卡顿的来源。而改单价时穷举的是同一个组合空间，
+    每个阶段的张数一张不差，所以可以原地复用、只把文字改掉。
+
+    复用本身有个风险：改了一半的文字会和图案对不上，那就是假信息。所以下面
+    还要拿「清空后全量重建」的结果做逐张比对。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
+    window.rebuild_cards()
+    assert any(section.cards for section in window.sections.values())
+
+    rebuilt = _spy_set_cards(monkeypatch, window)
+
+    # 把「攻击力%」的单价抬到 1.5，跨过 暴击率/暴击伤害 的排序位置
+    spin = next(s for combo, s, _ in window.weight_editor._rows if combo.currentText() == "攻击力%")
+    spin.setValue(1.5)
+    window._rebuild_timer.stop()  # 不等防抖，直接跑
+    window.rebuild_cards()
+
+    assert rebuilt == []  # 一张卡都没重建，走的是复用
+    reused = _card_fingerprint(window)
+
+    # 清空所有卡片再全量重建一次，两条路径的结果必须逐张一致
+    for section in window.sections.values():
+        section.set_cards([], lambda _pattern_id: False)
+    window.rebuild_cards()
+    assert _card_fingerprint(window) == reused
+    window.close()
+
+
+def test_card_count_change_falls_back_to_rebuild(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """词条被置零后图案数量会变，数量对不上就不能复用，必须老实重建。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
+    window.rebuild_cards()
+    before = sum(len(section.cards) for section in window.sections.values())
+    assert before > 0
+
+    rebuilt = _spy_set_cards(monkeypatch, window)
+
+    spin = next(s for combo, s, _ in window.weight_editor._rows if combo.currentText() == "攻击力%")
+    spin.setValue(0.0)  # 置零 = 这个位置的词条不再算「有用词条」
+    window._rebuild_timer.stop()
+    window.rebuild_cards()
+
+    after = sum(len(section.cards) for section in window.sections.values())
+    assert after < before
+    assert rebuilt, "张数变了还走复用，卡片会和图案对不上"
+    _card_fingerprint(window)
+    window.close()

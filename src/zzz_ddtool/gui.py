@@ -404,6 +404,7 @@ class PatternCard(QFrame):
         head_row.addStretch()
         head_row.addWidget(score)
         layout.addLayout(head_row)
+        self._slot_rows: list[tuple[QLabel, QLabel]] = []
         for slot in pattern.slots:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
@@ -422,6 +423,32 @@ class PatternCard(QFrame):
             row.addWidget(name, 1)
             row.addWidget(extra)
             layout.addLayout(row)
+            self._slot_rows.append((name, extra))
+
+    def set_pattern(self, pattern: Pattern) -> None:
+        """就地换一张图案：只改写文字，不销毁重建控件。
+
+        改词条单价时，图案的数量和分行结构都不变，变的只是分值与行的排列；
+        而重建一张卡要 1.5ms（控件树 + 布局 + 样式匹配），全屏 800 多张就是
+        两秒多。这里逐行做 diff，没变的行一个字节都不写。
+
+        行数恒为 MAX_SUBSTAT_SLOTS（patterns.canonicalize 会补齐并截断），
+        所以 self._slot_rows 与 pattern.slots 一定等长。
+        """
+        self.pattern = pattern
+        for (name_label, extra_label), slot in zip(self._slot_rows, pattern.slots):
+            if name_label.text() != slot.name:
+                name_label.setText(slot.name)
+                wanted = JUNK if slot.name == JUNK else EMPTY if slot.name == EMPTY else "slot"
+                if name_label.objectName() != wanted:
+                    # objectName 是 QSS 选择器的依据，换了必须重新匹配样式
+                    name_label.setObjectName(wanted)
+                    name_label.style().unpolish(name_label)
+                    name_label.style().polish(name_label)
+            text = f"+{slot.bonus}" if slot.bonus > 0 else ""
+            if extra_label.text() != text:
+                extra_label.setText(text)
+        self.set_score(pattern.score)
 
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
         if event.button() == Qt.MouseButton.LeftButton:
@@ -531,25 +558,30 @@ class StageSection(QWidget):
             self.cards.append(card)
         self.apply_filter()
 
-    def patterns_match(self, patterns: list[Pattern]) -> bool:
-        """卡片结构与目标是否一致。一致即可原地复用，不必重建控件。
+    def can_reuse(self, patterns: list[Pattern]) -> bool:
+        """能否原地复用现有卡片。
 
-        pattern_id 不含分数（见 patterns.pattern_id），所以「同一批图案、只改了权重值」
-        也会判定为可复用——分值由 update_card_states 就地改写。
+        判据只看**张数**，不逐位比 pattern_id。原因：改词条单价时穷举的是同一个
+        组合空间，每个阶段的张数一张不差（实测 4 词条场景 837 张、12 个阶段的分
+        布完全不变），变的只是分值，以及「分值降序」带来的排列顺序。
+
+        原先这里逐位比 pattern_id，顺序一动就判定「不匹配」，于是每改一下单价都
+        要销毁重建整屏——摘除旧卡 1.3s + 构造新卡 1.2s，这就是卡顿的来源。
         """
         if len(patterns) != len(self.cards):
             return False
-        return all(
-            card.pattern.pattern_id == pattern.pattern_id
-            for card, pattern in zip(self.cards, patterns)
-        )
+        # 行数必须对得上，否则 set_pattern 没法逐行改（正常情况下恒为 4，兜底而已）
+        return all(len(card.pattern.slots) == len(pattern.slots) for card, pattern in zip(self.cards, patterns))
 
-    def update_card_states(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
-        """复用既有卡片，只写分值差与勾选态，避免整屏销毁重建。"""
+    def reuse_cards(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
+        """复用既有卡片：就地改写分值/行文字/勾选态，不摘除也不重建。"""
         for card, pattern in zip(self.cards, patterns):
-            card.pattern = pattern
-            card.set_score(pattern.score)
-            card.set_checked_silent(bool(is_checked(pattern.pattern_id)))
+            card.set_pattern(pattern)
+            # 勾选态绝大多数时候没变，先在本地比一次再调用；set_checked_silent 内部
+            # 虽然也会提前返回，但八百多次跨 Qt 边界的方法调用本身就要一百多毫秒。
+            wanted = bool(is_checked(pattern.pattern_id))
+            if card.checkbox.isChecked() != wanted:
+                card.set_checked_silent(wanted)
         self.apply_filter()
 
     def apply_filter(self) -> None:
@@ -557,7 +589,10 @@ class StageSection(QWidget):
         shown = 0
         for card in self.cards:
             visible = card.pattern.score + 1e-9 >= need
-            card.setVisible(visible)
+            # 同值再调 setVisible 会白走一遍 show()/hide() 的内部流程，复用路径上
+            # 绝大多数卡片的可见性根本没变，先比一下省掉。
+            if card.isHidden() == visible:
+                card.setVisible(visible)
             if not card.isHidden():
                 shown += 1
         self.count_label.setText(f"{shown} / {len(self.cards)} 张")
@@ -2056,22 +2091,22 @@ class MainWindow(QMainWindow):
         for pattern in patterns:
             grouped[(pattern.origin.value, pattern.checkpoint)].append(pattern)
         is_checked = self._card_check_policy(accepted)
-        # 先算出这一轮要真建多少张卡，只有够大才值得提示。
-        # 判定结果顺便复用给下面的主循环，避免同一个 patterns_match 跑两遍。
+        # 先分拣：能原地复用的走复用，真需要建卡的才进 todo。
+        # 只有真建卡的数量够大才值得提示——复用是几十毫秒，提示一闪而过反而更烦。
         todo: dict[tuple[str, int], list[Pattern]] = {}
         for key, section in self.sections.items():
             wanted = grouped.get(key, [])
-            if not section.patterns_match(wanted):
+            if not section.can_reuse(wanted):
                 todo[key] = wanted
         pending_cards = sum(len(wanted) for wanted in todo.values())
         if pending_cards >= self._BUSY_CARD_THRESHOLD:
             self._begin_busy(f"正在生成组合…  共 {pending_cards} 张，请稍候")
         for key, section in self.sections.items():
             wanted = grouped.get(key, [])
-            if key not in todo:
-                section.update_card_states(wanted, is_checked)
-            else:
+            if key in todo:
                 section.set_cards(wanted, is_checked)
+            else:
+                section.reuse_cards(wanted, is_checked)
         self.trial.set_name_choices(list(weights), blocked)
         self._update_status()
 
