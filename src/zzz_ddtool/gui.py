@@ -51,14 +51,28 @@ from PySide6.QtWidgets import (
 
 from zzz_ddtool.chain import TaskJob, job_from_dict, new_job_id
 from zzz_ddtool.config import Preset, load_preset, preset_from_dict, save_preset
-from zzz_ddtool.gamedata import SETS, SLOTS, empty_slot_plan, selectable_mainstats
+from zzz_ddtool.gamedata import (
+    SETS,
+    SLOTS,
+    SUBSTAT_NAMES,
+    empty_slot_plan,
+    selectable_mainstats,
+)
 from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
 from zzz_ddtool.patterns import CHECKPOINTS, EMPTY, JUNK, Pattern, enumerate_all
 
-KNOWN_SUBSTATS = (
+# 词条下拉的顺序偏好：常用的排前面（双爆最常用）。
+#
+# 这里**只声明顺序**，不声明内容。名字以 data/stats.json 的 substat_names 为准
+# （那是 OCR 词典，也是唯一真相源）：
+#   * 对不上的名字直接丢弃 —— 曾经在这里把「穿透值」误写成「穿透率」（穿透率是
+#     5 号位主属性，副词条里不存在），于是下拉框能选出一个游戏里根本没有的词条，
+#     选进去的组合永远命不中；
+#   * 没列到的名字自动补在后面，stats.json 加了新词条不用再改代码。
+_SUBSTAT_ORDER = (
     "暴击率",
     "暴击伤害",
     "攻击力%",
@@ -68,8 +82,13 @@ KNOWN_SUBSTATS = (
     "防御力%",
     "防御力",
     "异常精通",
-    "穿透率",
+    "穿透值",
     "异常掌控",
+)
+
+KNOWN_SUBSTATS = tuple(
+    [name for name in _SUBSTAT_ORDER if name in SUBSTAT_NAMES]
+    + [name for name in SUBSTAT_NAMES if name not in _SUBSTAT_ORDER]
 )
 
 # 游戏内筛选-主词条按槽位固定三列网格，每页尺寸一致，切部位不抖动

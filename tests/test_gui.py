@@ -390,3 +390,39 @@ def test_worker_qt_capture_dispatches_to_main_thread(qapp, monkeypatch):
     assert not worker.is_alive()
     assert calls == [(main_id, 123)]
     assert result[0].width() == 10
+
+
+def test_substat_choices_match_the_authoritative_dictionary() -> None:
+    """副词条下拉框的内容必须与 data/stats.json 的 substat_names 一致。
+
+    这里曾经硬编码过一份，把「穿透值」误写成「穿透率」——穿透率是 5 号位主属性，
+    副词条里根本不存在。后果是下拉框能选出一个游戏里没有的词条，选进去的组合
+    永远命不中，还会把这种废组合写进 accepted。
+    现在代码只声明顺序，内容取自 stats.json，这个测试守住这条不变量。
+    """
+    from zzz_ddtool.gamedata import MAINSTAT_NAMES, SUBSTAT_NAMES
+    from zzz_ddtool.gui import KNOWN_SUBSTATS
+
+    # 内容必须一模一样（只允许顺序不同）
+    assert set(KNOWN_SUBSTATS) == set(SUBSTAT_NAMES)
+    assert len(KNOWN_SUBSTATS) == len(set(KNOWN_SUBSTATS))  # 不能有重复
+
+    # 常见笔误：「穿透率」是主属性，副词条是「穿透值」
+    assert "穿透值" in KNOWN_SUBSTATS
+    assert "穿透率" not in KNOWN_SUBSTATS
+    assert "穿透率" in MAINSTAT_NAMES
+
+
+def test_penetration_names_are_not_swapped() -> None:
+    """「穿透率」和「穿透值」这一对最容易搞混，单独钉死。
+
+    注意：主属性和副词条**大量重名是正常的**（生命值、攻击力、暴击率、暴击伤害、
+    异常精通、异常掌控、冲击力、能量自动回复 两边都有），所以不能笼统断言两个词典
+    无交集。只有穿透这一对是同概念不同名 —— 主属性叫「穿透率」，副词条叫「穿透值」。
+    """
+    from zzz_ddtool.gamedata import MAINSTAT_NAMES, SUBSTAT_NAMES
+
+    assert "穿透率" in MAINSTAT_NAMES
+    assert "穿透率" not in SUBSTAT_NAMES
+    assert "穿透值" in SUBSTAT_NAMES
+    assert "穿透值" not in MAINSTAT_NAMES
