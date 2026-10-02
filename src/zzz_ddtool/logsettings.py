@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from zzz_ddtool.retain import MAX_CAPTURE_FILES, clear_captures, count_captures, retain_captures
+from zzz_ddtool.retain import clear_captures, count_captures, get_max_files, retain_captures, set_max_files
 
 # 级别只影响日志写多少，不影响截图
 LEVELS: tuple[tuple[str, int], ...] = (
@@ -86,7 +86,7 @@ class LogSettingsDialog(QDialog):
         self.keep_spin.setRange(20, 5000)
         self.keep_spin.setSingleStep(50)
         self.keep_spin.setSuffix(" 张")
-        self.keep_spin.setValue(MAX_CAPTURE_FILES)
+        self.keep_spin.setValue(get_max_files())
         form.addRow("截图最多留", self.keep_spin)
 
         keep_note = QLabel("超了从最旧的轮次整轮删。半截的轮次没参考价值。")
@@ -147,11 +147,16 @@ class LogSettingsDialog(QDialog):
         return self.keep_spin.value()
 
     def apply_settings(self) -> None:
-        """应用设置：改级别 + 按新上限回收。"""
+        """应用设置：改级别 + 记下新上限并按它回收。
+
+        上限要记住（set_max_files），否则下一次 save_image 走默认值又裁回 300，
+        用户填的数字等于白填。
+        """
         from zzz_ddtool.logutil import set_level
 
         set_level(self.chosen_level())
-        retain_captures(max_files=self.chosen_keep())
+        set_max_files(self.chosen_keep())
+        retain_captures()
 
 
 class _LevelCombo(QComboBox):

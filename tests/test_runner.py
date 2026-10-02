@@ -327,6 +327,26 @@ def test_max_discs_stops_mid_batch_without_scrolling(offline_runner, monkeypatch
     assert grid.visited == [(0, c) for c in range(5)]
 
 
+@pytest.mark.parametrize("limits", [(2, 3), (None, None)])
+def test_each_task_has_its_own_processing_limit(offline_runner, monkeypatch, limits):
+    jobs = tuple(TaskJob(slot=slot, max_discs=limit, accepted=()) for slot, limit in zip((4, 5), limits))
+    runner = Runner(Preset(task_chain=jobs, max_discs=1), hotkeys=False)
+    runner.log = Mock()
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=6))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+    runner.run()
+    assert runner.outcome == "completed"
+    first, second = (limit if limit is not None else 1 for limit in limits)
+    assert runner.processed_disc_count == first + second
+    assert grid.visited == [(0, c) for c in range(first)] + [(0, c) for c in range(second)]
+    assert runner._job_limit_reached()
+    offline_runner["apply_game_filter"].assert_has_calls([
+        call(1, 1920, 1080, slots=[4], sets=(), mainstats=()),
+        call(1, 1920, 1080, slots=[5], sets=(), mainstats=()),
+    ])
+
+
 # ---------------------------------------------------------------- 重扫与失败传播
 
 
@@ -360,7 +380,8 @@ def test_restore_position_returns_to_saved_viewport(offline_runner, monkeypatch)
     assert (state.viewport_top_row0, state.row_phase_px) == (10, 50.0)
     assert state.resume_point is None  # 恢复完成即释放
     assert state.position_valid is True
-    offline_runner["reset_to_top"].assert_called_once()
+    # 置顶必须带上本任务绑定的 hwnd，不许再在内部重新选窗口（spec §5.1）
+    offline_runner["reset_to_top"].assert_called_once_with(1)
     assert runner._restored_scan is not None  # 校验扫描结果留给主循环复用
 
 
@@ -483,7 +504,8 @@ def test_restore_failure_stops_entire_chain(offline_runner, monkeypatch):
     runner.run()
     assert runner.outcome == "failed"
     assert "恢复保存视口失败" in runner.end_reason
-    offline_runner["goto_warehouse"].assert_called_once()
+    # 导航同样要绑定本任务的 hwnd（find_game_hwnd 在 fixture 里返回 1）
+    offline_runner["goto_warehouse"].assert_called_once_with(1)
 
 
 def test_upgrade_cap_does_not_open_upgrade_page(offline_runner, monkeypatch):
@@ -1206,12 +1228,17 @@ def test_upgrade_shortfall_stops_chain(offline_runner, monkeypatch):
 
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
     monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+    esc = Mock()
+    monkeypatch.setattr(runner, "_esc_back_to_grid", esc)
 
     with pytest.raises(RunnerError, match="升级素材不足"):
         runner._upgrade_loop(1, job, 0, "R1C1", runner._sub_preset(job), None, {})
 
     assert calls["n"] == runner.preset.ocr_retry + 1
-    runner.trace.fail.assert_called_once()
+    # 素材不足要留下失败记录，且报的就是素材不足（不许被收尾时的回退失败盖掉）
+    assert any("升级素材不足" in str(c) for c in runner.trace.fail.call_args_list)
+    # 收尾先把游戏退回仓库，别把玩家卡在强化弹层里（正常业务场景的干净收尾）
+    esc.assert_called_once_with(1)
 
 
 def test_upgrade_reaching_next_stage_keeps_going(offline_runner, monkeypatch):

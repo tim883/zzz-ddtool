@@ -185,7 +185,7 @@ class Trace:
     def finish(self) -> None:
         """收尾：按总张数回收旧轮次（纯按数量，不做特殊保留）。"""
         log = get_logger("zzz_ddtool.trace")
-        from zzz_ddtool.retain import MAX_CAPTURE_FILES, retain_captures
+        from zzz_ddtool.retain import get_max_files, retain_captures
 
         removed = retain_captures()
         log.info(
@@ -197,4 +197,4 @@ class Trace:
             self.tag,
         )
         if removed:
-            log.info("截图总数超 %d 张，清理了最旧的 %d 张", MAX_CAPTURE_FILES, len(removed))
+            log.info("截图总数超 %d 张，清理了最旧的 %d 张", get_max_files(), len(removed))

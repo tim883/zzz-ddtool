@@ -113,6 +113,8 @@ class Runner:
         self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
         self.results: list[RunResult] = []
         self._processed = 0
+        self._job_started_at = 0
+        self._job_max_discs = preset.max_discs
         self._scan_image = None  # 最近一次整页扫描的图（存盘用）
         self.hotkeys = controller if controller is not None else (HotkeyController() if hotkeys else None)
         self.on_status = on_status
@@ -160,7 +162,9 @@ class Runner:
             "cell": cell,
             "message": message,
             "processed": self._processed,
-            "max_discs": self.preset.max_discs,
+            "max_discs": sum(self._job_limit(job) for job in self._jobs()),
+            "job_processed": self._processed - getattr(self, "_job_started_at", 0),
+            "job_max_discs": getattr(self, "_job_max_discs", self.preset.max_discs),
         }
         if self._state is not None:
             payload.update(self._state.status_payload())
@@ -225,15 +229,33 @@ class Runner:
             },
             accepted=self.preset.accepted,
             min_useful_types=self.preset.min_useful_types,
+            max_discs=self.preset.max_discs,
         )
 
     def _jobs(self) -> tuple[TaskJob, ...]:
         return self.preset.task_chain or (self._default_job(),)
 
+    def _job_limit(self, job: TaskJob) -> int:
+        return max(1, job.max_discs if job.max_discs is not None else self.preset.max_discs)
+
+    def _job_limit_reached(self) -> bool:
+        return self._processed - self._job_started_at >= self._job_max_discs
+
+    def _log_job_limit_reached(self) -> None:
+        """本节处理数到上限、收工前记一条，避免静默 break（排查时看不清是限额还是到底）。"""
+        self.log.info(
+            "本节已处理 %d 个盘，达到上限 %d，收工",
+            self._processed - self._job_started_at,
+            self._job_max_discs,
+        )
+
     def _sub_preset(self, job: TaskJob) -> Preset:
         """用单个 job 的权重/门槛构造临时 Preset 给 decide 用。"""
         return Preset(
             weights=job.weights,
+            filter_slot=job.slot,
+            filter_slots=(job.slot,),
+            filter_mainstats=job.mainstats,
             stage_require=job.stage_require,
             min_useful_types=job.min_useful_types,
             require_s_rank=self.preset.require_s_rank,
@@ -252,6 +274,8 @@ class Runner:
             return []
         self.results = []
         self._processed = 0
+        self._job_started_at = 0
+        self._job_max_discs = self.preset.max_discs
         self._status_lines = []
         self._state = None
         self._restored_scan = None
@@ -265,14 +289,12 @@ class Runner:
 
         overlay_handler = OverlayLogHandler()
         logging.getLogger("zzz_ddtool").addHandler(overlay_handler)
-        self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), self.preset.max_discs)
+        total_limit = sum(self._job_limit(job) for job in jobs)
+        self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), total_limit)
         self._set_status("run_start", f"jobs={len(jobs)}")
-        self.trace.ok("unknown", "run", f"共 {len(jobs)} 个任务，本轮最多处理 {self.preset.max_discs} 个盘")
+        self.trace.ok("unknown", "run", f"共 {len(jobs)} 个任务，各任务独立限额，合计最多处理 {total_limit} 个盘")
         try:
             for job in jobs:
-                if self._processed >= self.preset.max_discs:
-                    self.trace.ok("unknown", "run", f"到上限 {self.preset.max_discs} 个，收工")
-                    break
                 self._checkpoint()
                 self._run_job(job)
             self.outcome = "completed"
@@ -303,10 +325,12 @@ class Runner:
     # ---------------------------------------------------------------- 主任务
 
     def _run_job(self, job: TaskJob) -> None:
+        self._job_started_at = self._processed
+        self._job_max_discs = self._job_limit(job)
         self.log.info("job start slot=%d sets=%s mains=%s", job.slot, job.sets, job.mainstats)
         hwnd = self._bind_instance()
         try:
-            goto_warehouse()
+            goto_warehouse(hwnd)
             self.trace.ok("drive_disc", "navigate", "已到驱动盘仓库")
         except NavError as exc:
             self.trace.fail("unknown", "navigate", str(exc))
@@ -356,7 +380,8 @@ class Runner:
 
         while True:
             self._checkpoint()
-            if self._processed >= self.preset.max_discs:
+            if self._job_limit_reached():
+                self._log_job_limit_reached()
                 break
             if state.work_batch_count > self.preset.max_pages:
                 self.log.info(
@@ -436,7 +461,8 @@ class Runner:
             restore_after_upgrade = False
             for cell in pending:
                 self._checkpoint()
-                if self._processed >= self.preset.max_discs:
+                if self._job_limit_reached():
+                    self._log_job_limit_reached()
                     break
                 result = self._process_cell(
                     hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
@@ -452,10 +478,11 @@ class Runner:
                 self._set_status("progress", f"next_index={state.next_index}", self._cell_tag(cell))
             if broke:
                 state.invalidate_position()
-                if restore_after_upgrade and self._processed < self.preset.max_discs:
+                if restore_after_upgrade and not self._job_limit_reached():
                     self._restore_position(hwnd, state)
                 continue
-            if self._processed >= self.preset.max_discs:
+            if self._job_limit_reached():
+                self._log_job_limit_reached()
                 break
             if state.at_bottom:
                 break
@@ -474,7 +501,7 @@ class Runner:
         标定/检查结束必须再次置顶，才获取正式首批网格。
         """
         env = probe_environment(hwnd)
-        reset_to_top()
+        reset_to_top(hwnd)
         image, _method, _hwnd = grab_game_image(hwnd)
         origin, pitch = measure_layout(image)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
@@ -501,7 +528,7 @@ class Runner:
         profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
         self._profile = profile
         state.navigation_profile = profile.as_dict()
-        reset_to_top()
+        reset_to_top(hwnd)
         self.trace.ok(
             "drive_disc",
             "calibrate",
@@ -993,7 +1020,7 @@ class Runner:
         if profile is None:
             raise RunnerError("没有可用的滚轮协议，无法恢复位置")
 
-        reset_to_top()
+        reset_to_top(hwnd)
         image, _method, _hwnd = grab_game_image(hwnd)
         origin, pitch = measure_layout(image)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
@@ -1345,6 +1372,12 @@ class Runner:
                     )
                     self.log.error("cell %s %s", cell_tag, reason)
                     self.trace.fail("upgrade", "upgrade", reason, image=image)
+                    # 素材耗尽是正常业务收尾，不是异常画面：先把游戏退回仓库侧栏，
+                    # 别把玩家卡在强化弹层里。回退本身失败也不该盖掉真正的原因。
+                    try:
+                        self._esc_back_to_grid(hwnd)
+                    except RunnerError as esc_exc:
+                        self.log.warning("素材不足收尾时回退仓库失败：%s", esc_exc)
                     raise RunnerError(f"{cell_tag} {reason}")
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
             if decision.action == Action.STOP:

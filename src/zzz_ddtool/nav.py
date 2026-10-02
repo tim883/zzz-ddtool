@@ -30,8 +30,8 @@ class NavError(RuntimeError):
     pass
 
 
-def _shot(tag: str) -> tuple[object, str, Path]:
-    dest = capture_game()
+def _shot(tag: str, hwnd: int | None = None) -> tuple[object, str, Path]:
+    dest = capture_game(hwnd=hwnd)
     from PySide6.QtGui import QImage
 
     image = QImage(str(dest))
@@ -80,19 +80,22 @@ def _open_drive_disc(hwnd: int, image, page: str, retries: int = 2) -> tuple[obj
     raise NavError(f"点了驱动盘页签还是没切过去（{detail}），已中断。")
 
 
-def goto_warehouse() -> Path:
+def goto_warehouse(hwnd: int | None = None) -> Path:
     """任意正常操作状态 → 驱动盘仓库页。
 
     逐状态认页处理，循环直到站稳驱动盘页：
     drive_disc=完事；storage=点驱动盘页签；menu=点仓库；overworld/unknown=Esc 剥一层
     （unknown=详情/缩放/强化弹层等正常操作残留页，每次 Esc 关一层再认）。
     全程不点强化/弃置/拆解。
+
+    hwnd 传了就一直用它（跑任务时必须传绑定的那个），不传才现找。
     """
     log = get_logger("zzz_ddtool.nav")
     try:
-        image, _method, hwnd = grab_game_image()
+        image, _method, found = grab_game_image(hwnd)
     except CaptureError as exc:
         raise NavError(str(exc)) from exc
+    hwnd = found
 
     try:
         unknown_streak = 0
@@ -100,14 +103,14 @@ def goto_warehouse() -> Path:
             page = classify_image(image)
             log.info("goto warehouse step=%d page=%s", step, page)
             if is_page(image, DRIVE_DISC):
-                return capture_game()
+                return capture_game(hwnd=hwnd)
             if is_page(image, STORAGE) or page == STORAGE:
                 image, page = _open_drive_disc(hwnd, image, page)
-                return capture_game()
+                return capture_game(hwnd=hwnd)
             if page == MENU:
                 _click(hwnd, image, WAREHOUSE_BTN)
                 time.sleep(0.8)
-                image, page, _dest = _shot("after-warehouse")
+                image, page, _dest = _shot("after-warehouse", hwnd)
                 continue
             # overworld=Esc 出菜单是正常路径；unknown（详情/缩放/强化弹层）=先存图再剥一层
             if page == UNKNOWN:
@@ -122,7 +125,7 @@ def goto_warehouse() -> Path:
                 unknown_streak = 0
             press_key(hwnd, VK_ESCAPE)
             time.sleep(0.6)
-            image = grab_game_image()[0]
+            image = grab_game_image(hwnd)[0]
         raise NavError("转了 8 圈都没站上驱动盘页，已中断（页面状态见日志）。")
     except InputError as exc:
         raise NavError(str(exc)) from exc
@@ -162,22 +165,27 @@ def _switch_tab(
     raise NavError(f"切{what}失败（{detail}），已中断以免进错页。")
 
 
-def reset_to_top(*, ocr_retry: int = 3) -> Path:
+def reset_to_top(hwnd: int | None = None, *, ocr_retry: int = 3) -> Path:
     """切页置顶：驱动盘仓库 → 音擎仓库 → 驱动盘仓库（spec §4.3 reset_to_top）。
 
     只切页，不改筛选、不强化、不打标。游戏在切回驱动盘时把列表滚回顶部；
     成功返回置顶后的驱动盘页截图，调用方据此确认原点与行对齐。
     失败一律抛 NavError，由上层按任务失败终止，不发送额外归位操作掩盖失败。
+
+    hwnd 传了就一直用它。跑任务时必须传绑定的 hwnd——本函数在恢复视口的关键
+    路径上（runner._prepare_navigation / _restore_once），自己 find 会破坏
+    spec §5.1「不因另一个窗口变大而重新选窗口」的约束。
     """
     log = get_logger("zzz_ddtool.nav")
     try:
-        image, _method, hwnd = grab_game_image()
+        image, _method, found = grab_game_image(hwnd)
     except CaptureError as exc:
         raise NavError(str(exc)) from exc
+    hwnd = found
 
     if not is_page(image, DRIVE_DISC):
         log.info("置顶前不在驱动盘页（%s），先走导航站稳", classify_image(image))
-        goto_warehouse()
+        goto_warehouse(hwnd)
         image, _method, hwnd = grab_game_image(hwnd)
         if not is_page(image, DRIVE_DISC):
             raise NavError("置顶前到不了驱动盘仓库，已中断。")

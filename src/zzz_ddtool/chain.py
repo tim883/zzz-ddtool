@@ -22,6 +22,7 @@ class TaskJob:
     stage_require: dict[str, dict[int, float]] = field(default_factory=dict)
     accepted: tuple[str, ...] | None = None
     min_useful_types: int = 0
+    max_discs: int | None = None
 
     def title(self) -> str:
         """内容摘要。不是名字——名字在 name 字段，这里只描述"这条是什么"。"""
@@ -48,6 +49,8 @@ class TaskJob:
             data["accepted"] = list(self.accepted)
         if self.name:
             data["name"] = self.name
+        if self.max_discs is not None:
+            data["max_discs"] = self.max_discs
         return data
 
 
@@ -73,6 +76,7 @@ def job_from_dict(data: dict[str, Any]) -> TaskJob | None:
         stage_require=stage_require,
         accepted=accepted,
         min_useful_types=int(data.get("min_useful_types") or 0),
+        max_discs=max(1, int(data["max_discs"])) if data.get("max_discs") is not None else None,
     )
 
 

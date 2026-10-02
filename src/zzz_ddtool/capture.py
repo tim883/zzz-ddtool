@@ -273,6 +273,12 @@ def save_image(image, hwnd: int, method: str, name: str | None = None, dest_dir:
     return dest
 
 
-def capture_game(dest_dir: Path | None = None, name: str | None = None) -> Path:
-    image, method, hwnd = grab_game_image()
-    return save_image(image, hwnd, method, name=name, dest_dir=dest_dir)
+def capture_game(
+    dest_dir: Path | None = None, name: str | None = None, *, hwnd: int | None = None
+) -> Path:
+    """截游戏窗口存盘。hwnd 传了就用它，不传按 find_game_hwnd() 现找。
+
+    run 路径必须传绑定的 hwnd（spec §5.1：不因另一个窗口变大而重新选窗口）。
+    """
+    image, method, target = grab_game_image(hwnd)
+    return save_image(image, target, method, name=name, dest_dir=dest_dir)

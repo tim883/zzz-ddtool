@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from zzz_ddtool import retain
 from zzz_ddtool import paths
 from zzz_ddtool.retain import clear_captures, count_captures, retain_captures
 
@@ -79,3 +80,31 @@ def test_count_on_missing_dir_is_zero(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(paths, "captures_dir", lambda: tmp_path / "nope")
     assert count_captures() == 0
     assert retain_captures(max_files=10) == []
+
+
+def test_set_max_files_sticks_for_the_save_path(
+    fake_captures: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """日志设置里填的上限要一直生效，不能只在点确定那一下管用。
+
+    capture.save_image / trace.finish 调的是 retain_captures()（不带参数），
+    所以上限必须记在模块里；否则用户填的 500 会被下一次写图裁回默认 300。
+    """
+    monkeypatch.setattr(retain, "_max_files", retain.MAX_CAPTURE_FILES)
+    _make_round(fake_captures, "20260907-100000", 5)
+    _make_round(fake_captures, "20260907-110000", 5)
+    assert retain.get_max_files() == retain.MAX_CAPTURE_FILES
+
+    retain.set_max_files(10)
+    assert retain.get_max_files() == 10
+    assert retain_captures() == []  # 10 张 == 上限，不删
+
+    retain.set_max_files(5)
+    assert len(retain_captures()) == 5  # 不带参数也按改后的上限删
+    assert count_captures() == 5
+
+
+def test_set_max_files_floor_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(retain, "_max_files", retain.MAX_CAPTURE_FILES)
+    retain.set_max_files(0)
+    assert retain.get_max_files() == 1
