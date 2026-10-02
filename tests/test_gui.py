@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from zzz_ddtool.gui import MainWindow
+from zzz_ddtool.gui import MainWindow, WeightEditor
 from zzz_ddtool.models import Action, Disc, Substat
 
 
@@ -503,3 +503,20 @@ def test_penetration_names_are_not_swapped() -> None:
     assert "穿透率" not in SUBSTAT_NAMES
     assert "穿透值" in SUBSTAT_NAMES
     assert "穿透值" not in MAINSTAT_NAMES
+
+
+def test_weight_editor_rejects_non_substats(qapp: QApplication) -> None:
+    """配置里的脏名字（如「穿透率」）不能出现在界面的权重表和下拉候选里。
+
+    这是三个入口里最靠前的那个：脏数据从 yaml 载入时就在这里被挡住，下拉框
+    也就不会再显示游戏里选不中的词条。守卫配合 patterns 层的过滤一起用。
+    """
+    from zzz_ddtool.gamedata import SUBSTAT_NAMES
+
+    editor = WeightEditor()
+    editor.set_weights({"攻击力%": 1.5, "穿透率": 0.6})
+
+    assert editor.weights() == {"攻击力%": 1.5}  # 脏名字既没显示也没参与取值
+    choices = editor._choices()
+    assert "穿透率" not in choices
+    assert set(choices) <= set(SUBSTAT_NAMES)

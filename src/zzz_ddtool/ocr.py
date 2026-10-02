@@ -195,10 +195,12 @@ def _parse_substat(name_text: str, value_text: str) -> Substat | None:
     if is_percent and not base_name.endswith("%"):
         base_name = base_name + "%"
 
-    # 一些常见 OCR 错字兜底
+    # 一些常见 OCR 错字兜底。
+    #
+    # 只放**副词条**的错字。曾经这里有一条「昇常掌控 → 异常掌控」：异常掌控是 6 号位
+    # 主属性，不在副词条池里，纠正了也会在下方的 _best_match 里被丢掉，纯空转。
     fixes = {
         "昇常精通": "异常精通",
-        "昇常掌控": "异常掌控",
         "穿透値": "穿透值",
         "攻击": "攻击",
         "防街": "防御",

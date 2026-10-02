@@ -6,10 +6,15 @@ from itertools import combinations, combinations_with_replacement
 
 from zzz_ddtool.origin import Origin, bonus_budget, filled_count, infer_origin
 from zzz_ddtool.models import MAX_SUBSTAT_SLOTS, Disc
+from zzz_ddtool.gamedata import SUBSTAT_NAMES
 
 JUNK = "废词条"
 EMPTY = "未出"
 CHECKPOINTS = (0, 3, 6, 9, 12, 15)
+
+# 真正的副词条（固定 10 种）。权重表来自配置文件，历史配置里混进过「穿透率」这种
+# 主属性名——不过滤的话它会被当有用词条参与穷举，凭空多出上千张游戏里不存在的组合。
+_SUBSTAT_SET = frozenset(SUBSTAT_NAMES)
 
 
 @dataclass(frozen=True)
@@ -44,7 +49,15 @@ class Pattern:
 
 
 def useful_ordered(weights: Mapping[str, float]) -> tuple[str, ...]:
-    names = [name for name, weight in weights.items() if weight > 0]
+    """权重为正的词条名，按权重降序（同权重按名字）。
+
+    只认真正的副词条（见 _SUBSTAT_SET）。这是最后一道闸：不管权重表从哪来
+    ——配置文件的脏数据、界面上手敲的名字——非副词条一律不参与穷举，
+    免得算出游戏里根本不存在的组合。JUNK/EMPTY 是占位符，也不该在这里出现。
+    """
+    names = [
+        name for name, weight in weights.items() if weight > 0 and name in _SUBSTAT_SET
+    ]
     return tuple(sorted(names, key=lambda name: (-float(weights[name]), name)))
 
 

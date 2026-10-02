@@ -615,7 +615,9 @@ class WeightEditor(QWidget):
         while self._rows:
             self._remove_row(self._rows[0][2])
         for name, value in weights.items():
-            if name in self._blocked:
+            # 主属性（被 blocked）本来就不该当副词条；非副词条的名字则是配置里的脏数据
+            # （历史配置出现过「穿透率」），放进来下拉框会多出游戏里选不中的词条。
+            if name in self._blocked or name not in SUBSTAT_NAMES:
                 continue
             self._add_row(name, value)
 
@@ -628,11 +630,15 @@ class WeightEditor(QWidget):
             out[name] = float(spin.value())
         return out
 
-    def _choices(self, current: str = "") -> list[str]:
-        names = [name for name in KNOWN_SUBSTATS if name not in self._blocked]
-        if current and current not in names and current not in self._blocked:
-            names = [current, *names]
-        return names
+    def _choices(self) -> list[str]:
+        """下拉候选：只给真正的副词条，减去当前被 blocked 的主属性。
+
+        这里原先有一句「current 不在候选里就插到最前面」的兜底，本意是别让已选中的值
+        消失；实际效果是**把配置里的脏名字（如「穿透率」）原样塞回下拉框**，于是下拉框
+        多出游戏里选不中的词条。现在不注入了：set_weights 已挡掉非法名，用户自己敲进来
+        的名字由 editable 下拉框自己显示。
+        """
+        return [name for name in KNOWN_SUBSTATS if name not in self._blocked]
 
     def _refresh_add_combo(self) -> None:
         current = self.add_combo.currentText()
@@ -656,7 +662,7 @@ class WeightEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         combo = QComboBox()
         combo.setEditable(True)
-        combo.addItems(self._choices(name))
+        combo.addItems(self._choices())
         combo.setCurrentText(name)
         spin = QDoubleSpinBox()
         spin.setDecimals(1)
