@@ -23,9 +23,15 @@ from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
-from zzz_ddtool.layout import GRID_COLS, GRID_ROWS, LABEL_SCAN_AREA
+from zzz_ddtool.layout import (
+    GRID_COLS,
+    GRID_ROWS,
+    LABEL_SCAN_AREA,
+    UPGRADE_MATERIAL_SLOTS,
+    scale_point,
+)
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
+from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc, next_stage_level
 from zzz_ddtool.nav import NavError, goto_warehouse, reset_to_top
 from zzz_ddtool.navigation import (
     NavProfile,
@@ -93,11 +99,16 @@ class Runner:
         controller=None,
         on_status=None,
         start_index: int = 0,
+        material_slot: int = 0,
     ) -> None:
         self.preset = preset
         # 测试入口：>0 时跳过前 start_index 个内部序号直接从它开始（见 _seed_start_index）。
         # 只在 CLI --start-index 显式给出时非零，预设文件不带这个字段。
         self.start_index = max(0, int(start_index))
+        # 测试入口：>0 时升级改成点第 N 个材料槽（1~3）而不是「阶段添加」，
+        # 只加一份素材、吃不满一档，用来在真机复现「素材不足、升完到不了下一档」。
+        # 只在 CLI --material-slot 显式给出时非零，预设文件不带这个字段。
+        self.material_slot = max(0, int(material_slot))
         self.log = get_logger("zzz_ddtool.runner")
         self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
         self.results: list[RunResult] = []
@@ -1219,23 +1230,47 @@ class Runner:
         self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
         return True
 
-    def _upgrade_once(self, hwnd: int) -> bool:
-        """强化页点「阶段添加」→「升级」，升一阶。返回是否完成。"""
+    def _pick_material(self, hwnd: int, material_slot: int) -> bool:
+        """[测试入口] 点第 N 个材料槽，只加一份素材（替代「阶段添加」）。
+
+        真机复现「素材不足」用：单个材料槽加的经验吃不满一整档，点「升级」后
+        等级停在下一档之前，正好走 _upgrade_loop 的期望等级校验。
+        返回是否真的点出去了（槽号越界按最近的一档夹住）。
+        """
+        image, *_ = self._grab(allow_esc=False)
+        index = min(max(1, material_slot), len(UPGRADE_MATERIAL_SLOTS))
+        mx, my = scale_point(*UPGRADE_MATERIAL_SLOTS[index - 1], image.width(), image.height())
+        click_client(hwnd, mx, my)
+        self.log.info("action=UPGRADE 测试入口：点第 %d 个材料槽 (%d,%d)", index, mx, my)
+        self.trace.ok("upgrade", "step-material", f"测试入口：点第 {index} 个材料槽", image=image)
+        return True
+
+    def _upgrade_once(self, hwnd: int, material_slot: int = 0) -> bool:
+        """强化页选好素材 →「升级」，升一阶。返回两步是否都走完。
+
+        material_slot=0 走生产的「阶段添加」（一键补满本档素材）；>0 是测试入口，
+        改成点第 N 个材料槽（见 _pick_material）。
+        """
         from zzz_ddtool.ocr import read_rect
 
-        image, *_ = self._grab(allow_esc=False)
-        if not self._click_text(
-            hwnd, read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add", image=image
-        ):
-            return False
-        time.sleep(0.6)
+        if material_slot:
+            if not self._pick_material(hwnd, material_slot):
+                return False
+            time.sleep(0.6)
+        else:
+            image, *_ = self._grab(allow_esc=False)
+            if not self._click_text(
+                hwnd, read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add", image=image
+            ):
+                return False
+            time.sleep(0.6)
         image, *_ = self._grab(allow_esc=False)
         if not self._click_text(
             hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step-upgrade-confirm", image=image
         ):
             return False
         time.sleep(1.5)
-        self.log.info("action=UPGRADE 完成（阶段添加→升级）")
+        self.log.info("action=UPGRADE 完成（%s→升级）", "材料槽" if material_slot else "阶段添加")
         self.trace.ok("upgrade", "upgrade", "强化了一阶")
         return True
 
@@ -1262,8 +1297,14 @@ class Runner:
 
         判断在强化页做（左边卡片有副属性），判升级就「阶段添加」+「升级」原地
         循环，判弃置才 Esc 回详情页按 R。不再每次升级完都 Esc 回网格全量重扫。
+        每升一阶后复核等级有没有到下一档（3/6/9/12/15），到不了就是素材耗尽，
+        报错停止整条任务链。
         """
         upgraded = 0
+        # 上一轮点了「升级」后应到达的等级（None = 没在等复核）与累计重读次数。
+        expect_level: int | None = None
+        expect_from = 0
+        rechecks = 0
         while True:
             image, *_ = self._grab(allow_esc=False)
             disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
@@ -1275,6 +1316,32 @@ class Runner:
                     equipped=self._detail_disc.equipped,
                     discarded=False,
                 )
+            # 先复核上一轮升级有没有到位。素材不够吃满一档时游戏只加到部分经验、
+            # 等级停在期望值之前（3/6/9/12/15 之前），必须当场停链；否则等级没变、
+            # decide 会一直判 UPGRADE，白转 _MAX_STAGE_UPGRADES 次后当「到升阶上限」
+            # 成功收尾，把素材耗尽静默吞掉。读一次可能撞上强化动画，按 ocr_retry 重读。
+            if expect_level is not None:
+                if disc.level >= expect_level:
+                    expect_level = None
+                elif rechecks < max(1, self.preset.ocr_retry) - 1:
+                    rechecks += 1
+                    self.log.warning(
+                        "cell %s 升级后等级还是 %d（期望到 %d），重读第 %d 次",
+                        cell_tag,
+                        disc.level,
+                        expect_level,
+                        rechecks,
+                    )
+                    time.sleep(0.4)
+                    continue
+                else:
+                    reason = (
+                        f"升级素材不足：从 {expect_from} 级升级后期望到 {expect_level} 级，"
+                        f"实际只有 {disc.level} 级，停止任务链"
+                    )
+                    self.log.error("cell %s %s", cell_tag, reason)
+                    self.trace.fail("upgrade", "upgrade", reason, image=image)
+                    raise RunnerError(f"{cell_tag} {reason}")
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
             if decision.action == Action.STOP:
                 self._record(job, disc, decision)
@@ -1294,13 +1361,21 @@ class Runner:
                     )
                     self._esc_back_to_grid(hwnd)
                     return
-                if not self._upgrade_once(hwnd):
+                if not self._upgrade_once(hwnd, self.material_slot):
                     raise RunnerError(f"{cell_tag} 强化按钮识别失败，停止任务链")
                 upgraded += 1
                 up_counts[global_index] = up_counts.get(global_index, 0) + 1
                 self._record(job, disc, decision)
-                self.log.info("cell %s UPGRADE done, level %d -> 强化页重判", cell_tag, disc.level)
-                self._set_status("upgraded", f"level {disc.level}", cell_tag)
+                expect_from = disc.level
+                expect_level = next_stage_level(disc.level)
+                rechecks = 0
+                self.log.info(
+                    "cell %s UPGRADE done, level %d -> 期望到 %d 级，强化页重判",
+                    cell_tag,
+                    disc.level,
+                    expect_level,
+                )
+                self._set_status("upgraded", f"level {disc.level} -> {expect_level}", cell_tag)
                 continue  # 留强化页再判断
             if decision.action == Action.MARK_DISCARD:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)

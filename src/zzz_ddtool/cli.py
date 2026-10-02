@@ -56,6 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         help="[测试用] 跳过前 N 个内部序号，直接把视口摆到第 N 个并从这里开始；"
         "前面的格标为已跳过、不点击不识别不计数。默认 0（不跳过，正常从第一个开始）。",
     )
+    run_p.add_argument(
+        "--material-slot",
+        type=int,
+        default=0,
+        metavar="N",
+        help="[测试用] 升级时改点第 N 个材料槽（1~3）而不是「阶段添加」：只加一份素材、"
+        "吃不满一档，用来复现「素材不足、升完到不了下一档」。默认 0（正常用「阶段添加」）。",
+    )
 
     list_p = sub.add_parser(
         "snapshot-list",
@@ -314,7 +322,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     logging.getLogger("zzz_ddtool").addHandler(handler)
 
     preset = load_preset(args.config)
-    runner = Runner(preset, start_index=getattr(args, "start_index", 0) or 0)
+    runner = Runner(
+        preset,
+        start_index=getattr(args, "start_index", 0) or 0,
+        material_slot=getattr(args, "material_slot", 0) or 0,
+    )
     try:
         results = runner.run()
     except RunnerError as exc:

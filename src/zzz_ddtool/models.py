@@ -9,6 +9,16 @@ MAX_LEVEL = 15
 UPGRADE_STEP = 3
 
 
+def next_stage_level(level: int) -> int:
+    """升一阶后应到达的等级（3 / 6 / 9 / 12 / 15）。
+
+    强化页「阶段添加」按整个阶段补素材：从档内任意等级（0、1、2）出发都补到本档
+    末尾，所以期望是「本档末尾」而不是 level + 3。素材不够吃满一档时游戏只加到
+    部分经验，等级停在期望值之前——那正是「素材不足」的现场。
+    """
+    return min((max(0, level) // UPGRADE_STEP) * UPGRADE_STEP + UPGRADE_STEP, MAX_LEVEL)
+
+
 class Action(str, Enum):
     UPGRADE = "upgrade"
     MARK_DISCARD = "mark_discard"

@@ -1171,3 +1171,132 @@ def test_scan_confirms_single_row_list_tail():
     assert runner._tail_slots_confirmed is True
     # 中间行没有可观测锚点 → 整屏小列表直接判到底（真机首次触发的那条路）
     assert runner._single_screen_tail(state, cells) is True
+
+
+# ---------------------------------------------------- 升级素材不足（升完到不了下一档）
+
+
+def test_next_stage_level_is_block_end():
+    """期望等级是「本档末尾」（3/6/9/12/15），不是 level + 3。
+
+    强化页「阶段添加」按整个阶段补素材：从档内任意等级出发都补到本档末尾。
+    """
+    from zzz_ddtool.models import next_stage_level
+
+    assert [next_stage_level(level) for level in range(0, 16)] == [
+        3, 3, 3, 6, 6, 6, 9, 9, 9, 12, 12, 12, 15, 15, 15, 15
+    ]
+
+
+def test_upgrade_shortfall_stops_chain(offline_runner, monkeypatch):
+    """升级后等级到不了下一档 = 素材耗尽：必须报错，不许当「到升阶上限」收尾。
+
+    素材不够吃满一档时游戏只加部分经验，等级停在 3/6/9/12/15 之前。这里模拟
+    0 → 1（期望 3）：第一次读到 0 判 UPGRADE，升级后连读 ocr_retry 次都只有 1。
+    """
+    job = TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}})
+    runner = Runner(Preset(task_chain=(job,)), hotkeys=False)
+    image = blank_image()
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "upgrade", "test", 1))
+    calls = {"n": 0}
+
+    def parse_upgrade(img):
+        calls["n"] += 1
+        return sample_disc(0 if calls["n"] == 1 else 1)
+
+    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
+    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+
+    with pytest.raises(RunnerError, match="升级素材不足"):
+        runner._upgrade_loop(1, job, 0, "R1C1", runner._sub_preset(job), None, {})
+
+    assert calls["n"] == runner.preset.ocr_retry + 1
+    runner.trace.fail.assert_called_once()
+
+
+def test_upgrade_reaching_next_stage_keeps_going(offline_runner, monkeypatch):
+    """0 → 3 按期望到位：不误判素材不足，照常交给 decide。"""
+    job = TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}})
+    runner = Runner(Preset(task_chain=(job,)), hotkeys=False)
+    image = blank_image()
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "upgrade", "test", 1))
+    # 0 级只有 1 次强化次数说不通来源，0 → 3 必须带一次强化次数（+3 即一次）
+    initial = sample_disc(0)
+    upgraded = Disc(3, (Substat("暴击率", 2),) + initial.substats[1:])
+    calls = {"n": 0}
+
+    def parse_upgrade(img):
+        calls["n"] += 1
+        return initial if calls["n"] == 1 else upgraded
+
+    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
+    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+    discard = Mock()
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
+
+    runner._upgrade_loop(1, job, 0, "R1C1", runner._sub_preset(job), None, {})
+
+    assert calls["n"] == 2  # 升级前后各读一次，没有多余重读
+    discard.assert_called_once()
+
+
+def test_upgrade_shortfall_stops_later_jobs(offline_runner, monkeypatch):
+    """素材不足要停整条任务链，不是只跳过这一个盘。"""
+    jobs = (
+        TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}}),
+        TaskJob(slot=5, weights={"暴击率": 1}),
+    )
+    runner = Runner(Preset(task_chain=jobs, max_discs=2), hotkeys=False)
+    monkeypatch.setattr(
+        runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
+    )
+    monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    calls = {"n": 0}
+
+    def parse_upgrade(img):
+        calls["n"] += 1
+        return sample_disc(0 if calls["n"] == 1 else 1)
+
+    monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
+    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+
+    runner.run()
+
+    assert runner.outcome == "failed"
+    assert "升级素材不足" in runner.end_reason
+    assert runner.processed_disc_count == 1  # 第一个盘就炸，后一个任务没轮到
+
+
+def test_material_slot_entry_clicks_slot_not_stage_add(offline_runner, monkeypatch):
+    """测试入口 --material-slot 3：升级改点第 3 个材料槽槽心，不再读「阶段添加」。"""
+    runner = Runner(Preset(), hotkeys=False)
+    image = blank_image()
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "upgrade", "test", 1))
+    confirm = ocr_module.OcrLine("升级", 1, 1460, 840, 1560, 880)
+
+    def read_rect(img, area):
+        if area == runner.UPGRADE_CONFIRM_AREA:
+            return [confirm]
+        raise AssertionError(f"测试入口不该读这个区域：{area}")
+
+    monkeypatch.setattr(ocr_module, "read_rect", read_rect)
+
+    assert runner._upgrade_once(99, 3) is True
+    assert offline_runner["click_client"].call_args_list == [call(99, 1405, 677), call(99, 1510, 860)]
+
+
+def test_material_slot_scales_with_window_size(offline_runner, monkeypatch):
+    """材料槽坐标按实际客户区缩放，不是写死 1920×1080。"""
+    runner = Runner(Preset(), hotkeys=False)
+    image = QImage(1600, 900, QImage.Format.Format_RGB32)
+    image.fill(0)
+    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, "upgrade", "test", 1))
+    confirm = ocr_module.OcrLine("升级", 1, 1460, 840, 1560, 880)
+    monkeypatch.setattr(
+        ocr_module, "read_rect", lambda img, area: [confirm] if area == runner.UPGRADE_CONFIRM_AREA else []
+    )
+
+    assert runner._upgrade_once(99, 2) is True
+    assert offline_runner["click_client"].call_args_list[0] == call(99, 1069, 564)
