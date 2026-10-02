@@ -296,6 +296,7 @@ class PatternCard(QFrame):
         score = QLabel(f"{pattern.score:g}")
         score.setObjectName("score")
         score.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.score_label = score
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -339,6 +340,22 @@ class PatternCard(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         self.toggled.emit()
+
+    def set_checked_silent(self, on: bool) -> None:
+        """复用卡片时同步勾选态：不发 toggled，只刷新样式，避免连锁重建。"""
+        if self.checkbox.isChecked() == on:
+            return
+        self.checkbox.blockSignals(True)
+        self.checkbox.setChecked(on)
+        self.checkbox.blockSignals(False)
+        self.setProperty("checked", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_score(self, value: float) -> None:
+        text = f"{value:g}"
+        if self.score_label.text() != text:
+            self.score_label.setText(text)
 
     @property
     def accepted(self) -> bool:
@@ -412,6 +429,27 @@ class StageSection(QWidget):
             card.toggled.connect(self.selection_changed.emit)
             self.flow.addWidget(card)
             self.cards.append(card)
+        self.apply_filter()
+
+    def patterns_match(self, patterns: list[Pattern]) -> bool:
+        """卡片结构与目标是否一致。一致即可原地复用，不必重建控件。
+
+        pattern_id 不含分数（见 patterns.pattern_id），所以「同一批图案、只改了权重值」
+        也会判定为可复用——分值由 update_card_states 就地改写。
+        """
+        if len(patterns) != len(self.cards):
+            return False
+        return all(
+            card.pattern.pattern_id == pattern.pattern_id
+            for card, pattern in zip(self.cards, patterns)
+        )
+
+    def update_card_states(self, patterns: list[Pattern], is_checked) -> None:  # noqa: ANN001
+        """复用既有卡片，只写分值差与勾选态，避免整屏销毁重建。"""
+        for card, pattern in zip(self.cards, patterns):
+            card.pattern = pattern
+            card.set_score(pattern.score)
+            card.set_checked_silent(bool(is_checked(pattern.pattern_id)))
         self.apply_filter()
 
     def apply_filter(self) -> None:
@@ -1037,19 +1075,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_chain_list(self, select_id: str | None = None) -> None:
         current_id = select_id or self._editing_job_id
+        # 选中行必须也在屏蔽信号区间内：否则 setCurrentRow 会触发 currentRowChanged
+        # → _on_chain_row → _load_job → rebuild_cards，把 242 张卡片整屏重建一遍
+        # （实测 ~250ms），而调用方（加入/更新/删除）本身已经不需要重新载入。
         self.chain_list.blockSignals(True)
         self.chain_list.clear()
         for index, job in enumerate(self._jobs):
             item = QListWidgetItem(f"{index + 1}. {job.title()}")
             item.setData(Qt.ItemDataRole.UserRole, job.job_id)
             self.chain_list.addItem(item)
-        self.chain_list.blockSignals(False)
         if current_id:
             for row in range(self.chain_list.count()):
                 item = self.chain_list.item(row)
                 if item is not None and item.data(Qt.ItemDataRole.UserRole) == current_id:
                     self.chain_list.setCurrentRow(row)
                     break
+        self.chain_list.blockSignals(False)
         self._update_status()
 
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
@@ -1689,7 +1730,11 @@ class MainWindow(QMainWindow):
             grouped[(pattern.origin.value, pattern.checkpoint)].append(pattern)
         is_checked = self._card_check_policy(accepted)
         for key, section in self.sections.items():
-            section.set_cards(grouped.get(key, []), is_checked)
+            wanted = grouped.get(key, [])
+            if section.patterns_match(wanted):
+                section.update_card_states(wanted, is_checked)
+            else:
+                section.set_cards(wanted, is_checked)
         self.trial.set_name_choices(list(weights), blocked)
         self._update_status()
 
