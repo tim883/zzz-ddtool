@@ -855,7 +855,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(2)
         title = QLabel("驱动盘强化辅助")
         title.setObjectName("bannerTitle")
-        hint = QLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就加入链，不必凑齐 6 个。")
+        hint = QLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就新建任务，不必凑齐 6 个。")
         hint.setObjectName("hint")
         self.path_label = QLabel()
         self.path_label.setObjectName("hint")
@@ -1073,7 +1073,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 8, 0)
         box = QGroupBox("任务链")
         inner = QVBoxLayout(box)
-        hint = QLabel("编完一个部位再加入。执行按从上到下的顺序。")
+        hint = QLabel("编完一个部位再新建。执行按从上到下的顺序。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         # 任务名字：选中节点后可改。名字只影响列表标签，不参与执行判断。
@@ -1092,7 +1092,7 @@ class MainWindow(QMainWindow):
         name_row.addWidget(rename_btn)
         self.chain_list = QListWidget()
         self.chain_list.currentRowChanged.connect(self._on_chain_row)
-        add_btn = QPushButton("加入任务链")
+        add_btn = QPushButton("新建任务")
         add_btn.setObjectName("primary")
         add_btn.clicked.connect(self._add_job)
         row = QHBoxLayout()
@@ -1258,7 +1258,7 @@ class MainWindow(QMainWindow):
         self._editing_job_id = job.job_id
         snap = self._snapshot_slot()
         self._slot_plans[job.slot] = snap
-        # 加入任务链后，存为使用的存档：把该方案实际用的权重+档位要求写回所选存档
+        # 新建任务后，存为使用的存档：把该方案实际用的权重+档位要求写回所选存档
         name = self.archive_combo.currentText().strip()
         if name:
             data = self._load_archives()
