@@ -15,6 +15,7 @@ def new_job_id() -> str:
 class TaskJob:
     slot: int
     job_id: str = field(default_factory=new_job_id)
+    name: str = ""
     sets: tuple[str, ...] = ()
     mainstats: tuple[str, ...] = ()
     weights: dict[str, float] = field(default_factory=dict)
@@ -23,6 +24,7 @@ class TaskJob:
     min_useful_types: int = 0
 
     def title(self) -> str:
+        """内容摘要。不是名字——名字在 name 字段，这里只描述"这条是什么"。"""
         sets = "、".join(self.sets) if self.sets else "未选套装"
         if self.mainstats:
             mains = "、".join(self.mainstats)
@@ -44,6 +46,8 @@ class TaskJob:
         }
         if self.accepted is not None:
             data["accepted"] = list(self.accepted)
+        if self.name:
+            data["name"] = self.name
         return data
 
 
@@ -62,6 +66,7 @@ def job_from_dict(data: dict[str, Any]) -> TaskJob | None:
     return TaskJob(
         job_id=str(data.get("id") or new_job_id()),
         slot=slot,
+        name=str(data.get("name") or "").strip(),
         sets=tuple(str(item).strip() for item in (data.get("sets") or ()) if str(item).strip()),
         mainstats=tuple(str(item).strip() for item in (data.get("mainstats") or ()) if str(item).strip()),
         weights={str(name): float(weight) for name, weight in (data.get("weights") or {}).items()},

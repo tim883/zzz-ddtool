@@ -204,6 +204,31 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 
 
 
+def _pencil_icon(size: int = 16):
+    """自绘铅笔图标：微软雅黑没有 U+270E，直接写字符会渲染成缺字方框。"""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap
+
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#4a4a4a"))
+    pen.setWidthF(1.3)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    # 笔身（斜放）：左下一段到右上，两条边 + 两端封口
+    painter.drawLine(QPointF(4.6, 9.6), QPointF(11.2, 3.0))
+    painter.drawLine(QPointF(6.4, 11.4), QPointF(13.0, 4.8))
+    painter.drawLine(QPointF(4.6, 9.6), QPointF(6.4, 11.4))
+    painter.drawLine(QPointF(11.2, 3.0), QPointF(13.0, 4.8))
+    # 笔尖：收成左下角一点
+    painter.drawLine(QPointF(4.6, 9.6), QPointF(2.2, 13.0))
+    painter.drawLine(QPointF(6.4, 11.4), QPointF(2.2, 13.0))
+    painter.end()
+    return QIcon(pix)
+
+
 def default_config_path() -> Path:
     from zzz_ddtool.paths import data_dir
 
@@ -1051,6 +1076,20 @@ class MainWindow(QMainWindow):
         hint = QLabel("编完一个部位再加入。执行按从上到下的顺序。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
+        # 任务名字：选中节点后可改。名字只影响列表标签，不参与执行判断。
+        self.job_name_edit = QLineEdit()
+        self.job_name_edit.setPlaceholderText("任务名")
+        self.job_name_edit.setEnabled(False)
+        self.job_name_edit.editingFinished.connect(self._rename_job)
+        rename_btn = QPushButton()
+        rename_btn.setIcon(_pencil_icon())
+        rename_btn.setFixedWidth(30)
+        rename_btn.setToolTip("重命名当前任务")
+        rename_btn.clicked.connect(self._focus_job_name)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(4)
+        name_row.addWidget(self.job_name_edit, 1)
+        name_row.addWidget(rename_btn)
         self.chain_list = QListWidget()
         self.chain_list.currentRowChanged.connect(self._on_chain_row)
         add_btn = QPushButton("加入任务链")
@@ -1069,6 +1108,7 @@ class MainWindow(QMainWindow):
         row.addWidget(down_btn)
         row.addWidget(del_btn)
         inner.addWidget(hint)
+        inner.addLayout(name_row)
         inner.addWidget(self.chain_list, 1)
         inner.addWidget(add_btn)
         inner.addWidget(update_btn)
@@ -1084,7 +1124,12 @@ class MainWindow(QMainWindow):
         self.chain_list.blockSignals(True)
         self.chain_list.clear()
         for index, job in enumerate(self._jobs):
-            item = QListWidgetItem(f"{index + 1}. {job.title()}")
+            # 两行条目：第一行是名字，第二行是内容摘要。没名字的老档案只显示摘要，
+            # 免得两行一模一样。
+            text = f"{index + 1}. {job.title()}"
+            if job.name:
+                text = f"{index + 1}. {job.name}\n      {job.title()}"
+            item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, job.job_id)
             self.chain_list.addItem(item)
         if current_id:
@@ -1094,7 +1139,49 @@ class MainWindow(QMainWindow):
                     self.chain_list.setCurrentRow(row)
                     break
         self.chain_list.blockSignals(False)
+        self._sync_job_name_edit()
         self._update_status()
+
+    def _editing_job(self) -> TaskJob | None:
+        """当前正在编辑的任务节点。没选中或 id 失效时返回 None。"""
+        if not self._editing_job_id:
+            return None
+        for job in self._jobs:
+            if job.job_id == self._editing_job_id:
+                return job
+        return None
+
+    def _sync_job_name_edit(self) -> None:
+        """把名字文本框对齐到当前任务。没选中任务时清空并禁用。"""
+        job = self._editing_job()
+        self.job_name_edit.blockSignals(True)
+        if job is None:
+            self.job_name_edit.clear()
+            self.job_name_edit.setEnabled(False)
+        else:
+            self.job_name_edit.setText(job.name)
+            # 占位符给内容摘要，让人知道「不填名字就用这个」
+            self.job_name_edit.setPlaceholderText(job.title())
+            self.job_name_edit.setEnabled(True)
+        self.job_name_edit.blockSignals(False)
+
+    def _focus_job_name(self) -> None:
+        if not self.job_name_edit.isEnabled():
+            return
+        self.job_name_edit.setFocus()
+        self.job_name_edit.selectAll()
+
+    def _rename_job(self) -> None:
+        if self._loading:
+            return
+        job = self._editing_job()
+        if job is None:
+            return
+        name = self.job_name_edit.text().strip()
+        if name == job.name:
+            return
+        job.name = name
+        self._refresh_chain_list(job.job_id)
 
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
         snap = self._snapshot_slot()
@@ -1134,6 +1221,7 @@ class MainWindow(QMainWindow):
         self._slot_plans[job.slot] = plan
         self._apply_slot_widgets(plan)
         self._loading = False
+        self._sync_job_name_edit()
         self.rebuild_cards(job.accepted)
 
     def _on_chain_row(self, row: int) -> None:
@@ -1162,6 +1250,7 @@ class MainWindow(QMainWindow):
             self._write_archives(data)
             self._refresh_archive_combo(name)
         self._refresh_chain_list(job.job_id)
+        self._focus_job_name()
 
     def _update_job(self) -> None:
         if not self._editing_job_id:
