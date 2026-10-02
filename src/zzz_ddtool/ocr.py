@@ -19,20 +19,18 @@ from PySide6.QtGui import QImage
 from zzz_ddtool.layout import (
     ACTION_ROW,
     DISC_LEVEL,
-    MAIN_STAT,
     SUB_STAT_SPLIT_X,
     SUB_STATS,
     UPGRADE_LEVEL,
     UPGRADE_SUB_SPLIT_X,
     UPGRADE_SUB_STATS,
     WAREHOUSE_DISC_LEVEL,
-    WAREHOUSE_MAIN_STAT,
     WAREHOUSE_SUB_STATS,
     scale_rect,
 )
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import Disc, Substat
-from zzz_ddtool.gamedata import MAINSTAT_NAMES as _MAINSTAT_NAMES, SUBSTAT_NAMES as _SUBSTAT_NAMES
+from zzz_ddtool.gamedata import SUBSTAT_NAMES as _SUBSTAT_NAMES
 
 _engine = None
 _engine_lock = threading.Lock()
@@ -283,23 +281,6 @@ def read_substats(
         if sub is not None:
             substats.append(sub)
     return tuple(substats)
-
-
-def read_mainstat(image: QImage) -> str | None:
-    """读取主属性名（用来复核部位/套装信息，不做决策主键）。"""
-    area = WAREHOUSE_MAIN_STAT if read_level(image, WAREHOUSE_DISC_LEVEL) is not None else MAIN_STAT
-    lines = read_rect(image, area)
-    if not lines:
-        return None
-    # 取左侧那行作为名字
-    name_line = min(lines, key=lambda ln: (ln.left + ln.right) // 2)
-    value_line = max(lines, key=lambda ln: (ln.left + ln.right) // 2)
-    _, is_percent = _parse_value(value_line.text)
-    name = name_line.text
-    if is_percent and not name.endswith("%"):
-        name = name + "%"
-    matched = _best_match(name, _MAINSTAT_NAMES, cutoff=0.55)
-    return matched
 
 
 def read_action_state(image: QImage) -> dict[str, bool]:

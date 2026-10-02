@@ -26,11 +26,10 @@ DISMANTLE_FORBID = (210, 890, 460, 990)
 FILTER_RESET = (1432, 1029)
 
 # 右侧详情面板。2026-09-06 OCR 实测（log/captures/detail-page.png + 老大截图）重新标定：
-# 旧值 DISC_LEVEL/MAIN_STAT/SUB_STATS 偏下约 150px，导致 parse_disc 读不到副属性。
+# 旧值 DISC_LEVEL/SUB_STATS 偏下约 150px，导致 parse_disc 读不到副属性。
 DETAIL_PANEL = (1400, 225, 1870, 800)
 DISC_NAME = (1400, 260, 1620, 315)
 DISC_LEVEL = (1180, 190, 1310, 250)  # 等级（右上，避开右侧「15」上限数字）
-MAIN_STAT = (1150, 295, 1470, 345)  # 主属性名字+数值
 SUB_STATS = (1160, 390, 1790, 495)  # 副属性（两列：名字 数值 | 名字 数值）
 ACTION_ROW = (1600, 1000, 1880, 1070)
 # 副属性每行的高度，约 51px；第一行中心距副属性区顶部约 26px
@@ -42,7 +41,6 @@ SUB_STAT_SPLIT_X = 1650
 # 仓库中点选格子只更新右侧面板，不会打开放大详情页。
 # 2026-10-01 失败现场 0006-识别盘面.png 实拍标定，和上面的放大页分开使用。
 WAREHOUSE_DISC_LEVEL = (1460, 398, 1610, 445)
-WAREHOUSE_MAIN_STAT = (1410, 488, 1835, 530)
 WAREHOUSE_SUB_STATS = (1410, 560, 1835, 765)
 
 # 强化页（点详情页「查看/强化」进入的弹层）。2026-09-06 OCR 实测老大截图：

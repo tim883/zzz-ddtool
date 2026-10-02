@@ -13,7 +13,6 @@ from zzz_ddtool.ocr import (
     parse_disc,
     parse_disc_upgrade_page,
     read_level,
-    read_mainstat,
     read_rect,
 )
 
@@ -56,10 +55,6 @@ def test_read_level(sample_image: QImage) -> None:
     assert read_level(sample_image) is not None
 
 
-def test_read_mainstat(sample_image: QImage) -> None:
-    assert read_mainstat(sample_image) == "生命值"
-
-
 def test_parse_disc(sample_image: QImage) -> None:
     disc = parse_disc(sample_image)
     assert disc is not None
@@ -77,7 +72,6 @@ def test_warehouse_sidebar_regression() -> None:
     assert disc is not None
     assert disc.level == 3
     assert disc.substats == tuple(Substat(name) for name in ("暴击伤害", "暴击率", "攻击力", "异常精通"))
-    assert read_mainstat(image) == "生命值"
 
 
 def test_upgrade_page_max_level_regression() -> None:
