@@ -22,6 +22,10 @@ def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
     window = MainWindow(config_path=tmp_path / "t.yaml")
     assert window.windowTitle() == "驱动盘强化辅助"
     assert window.sections
+    # 右侧是选中任务的镜像：先建一个任务、编上词条，才有卡片可看
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0, "攻击力%": 0.8})
+    window.rebuild_cards()
     visible = sum(1 for section in window.sections.values() for card in section.cards if not card.isHidden())
     assert len(list(window.sections.values())[0].cards) > 0
     assert visible > 0
@@ -45,10 +49,36 @@ def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
 
 def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     window = MainWindow(config_path=tmp_path / "t.yaml")
+    # 右侧是选中任务的镜像：没有选中任务时右侧为空，得先新建一个任务才有的可收集
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
     preset = window.collect_preset()
-    assert preset.weights
+    assert preset.weights == {"暴击率": 1.0}
     assert preset.accepted is not None
     assert decide_sample(preset) in {Action.UPGRADE, Action.MARK_DISCARD, Action.SKIP, Action.STOP}
+    window.close()
+
+
+def test_editor_empty_when_no_job_selected(qapp: QApplication, tmp_path) -> None:
+    """死线：左侧没有选中任务时，右侧必须是空的，绝不能显示残留内容（假信息）。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert window._jobs == []
+    assert window.weight_editor.weights() == {}
+    assert not window.job_name_edit.isEnabled()
+    assert all(len(section.cards) == 0 for section in window.sections.values())
+
+    # 新建一个任务、编点内容，再删掉它 → 右侧必须回到空
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    window.filter_slots[5].click()
+    qapp.processEvents()
+    assert window.weight_editor.weights()
+
+    window._remove_job()
+    qapp.processEvents()
+    assert window._jobs == []
+    assert window.weight_editor.weights() == {}
+    assert not window.job_name_edit.isEnabled()
     window.close()
 
 
@@ -88,19 +118,40 @@ def test_mainstat_excluded_from_substat_cards(qapp: QApplication, tmp_path) -> N
     window.close()
 
 
-def test_slot_switch_keeps_separate_plans(qapp: QApplication, tmp_path) -> None:
+def test_slot_switch_retargets_selected_job(qapp: QApplication, tmp_path) -> None:
+    """换部位 = 改当前选中任务的部位，任务保持选中、内容保留。
+
+    原来换部位会把任务取消选中，于是「选中任务 → 换部位」永远做不到：
+    一点部位就丢选中，再点任务又跳回旧部位。
+    """
     window = MainWindow(config_path=tmp_path / "t.yaml")
-    window.filter_slots[4].click()
-    qapp.processEvents()
+    window._add_job()
     window.weight_editor.set_weights({"暴击率": 1.0})
     window.filter_slots[1].click()
     qapp.processEvents()
     assert window._active_slot == 1
-    assert "暴击率" not in window.weight_editor.weights()
-    window.weight_editor.set_weights({"生命值%": 1.0})
-    window.filter_slots[4].click()
-    qapp.processEvents()
-    assert window.weight_editor.weights().get("暴击率") == 1.0
+    job = window._jobs[-1]  # 写回时对象会被替换，这里重新取
+    assert job.slot == 1  # 部位跟着任务走
+    assert window._editing_job_id == job.job_id  # 仍然选中
+    assert window.weight_editor.weights().get("暴击率") == 1.0  # 内容没丢
+    window.close()
+
+
+def test_new_job_starts_empty_and_gets_unique_name(qapp: QApplication, tmp_path) -> None:
+    """新建任务 = 建一个空任务并选中它，右侧跟着空；名字自动去重。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    first = window._jobs[-1]
+    assert first.name == "任务"
+    assert window.weight_editor.weights() == {}
+    assert window._editing_job_id == first.job_id
+
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    window._add_job()
+    second = window._jobs[-1]
+    assert second.name == "任务 (2)"  # 不重名
+    assert second.weights == {}  # 新任务是空的，不会顺走上一个任务的内容
+    assert window.weight_editor.weights() == {}  # 右侧跟着空
     window.close()
 
 

@@ -447,6 +447,9 @@ class StageSection(QWidget):
                 break
             widget = item.widget()
             if widget is not None:
+                # takeAt 只是把它移出布局，控件还是 flow_host 的子控件、还会被画在
+                # 原来的位置上。必须再摘掉父级，否则重建期间旧卡和新卡叠着显示。
+                widget.setParent(None)
                 widget.deleteLater()
         self.cards = []
         for pattern in patterns:
@@ -607,7 +610,16 @@ class WeightEditor(QWidget):
         self.changed.emit()
 
     def _remove_row(self, row: QWidget) -> None:
+        """摘掉一行，并立刻把它从界面上拿下来。
+
+        只调 deleteLater() 是不够的：真正的销毁要等事件循环跑到 DeferredDelete，
+        在那之前控件仍挂在布局里、仍会被绘制——切任务时就会看到旧行和新行叠在一起，
+        也就是「凭空多出来的词条」。所以先把布局和父级都摘干净（这一步是同步生效的，
+        视觉上立即消失），再排队销毁。
+        """
         self._rows = [item for item in self._rows if item[2] is not row]
+        self._rows_box.removeWidget(row)
+        row.setParent(None)
         row.deleteLater()
 
 
@@ -1160,8 +1172,8 @@ class MainWindow(QMainWindow):
             self.job_name_edit.setEnabled(False)
         else:
             self.job_name_edit.setText(job.name)
-            # 占位符给内容摘要，让人知道「不填名字就用这个」
-            self.job_name_edit.setPlaceholderText(job.title())
+            # 名字就是名字，不用摘要顶替（摘要已经显示在列表第二行）
+            self.job_name_edit.setPlaceholderText("任务名")
             self.job_name_edit.setEnabled(True)
         self.job_name_edit.blockSignals(False)
 
@@ -1178,6 +1190,12 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         name = self.job_name_edit.text().strip()
+        if not name:
+            # 名字不能空：空了列表就只剩摘要，认不出这是谁。回落一个不重名的默认名。
+            name = self._unique_job_name("任务", exclude=job)
+        elif name != job.name:
+            # 不能重名：跟别的任务撞了就自动编号
+            name = self._unique_job_name(name, exclude=job)
         if name == job.name:
             return
         job.name = name
@@ -1203,6 +1221,22 @@ class MainWindow(QMainWindow):
             if item is not None:
                 item.setText(self._job_item_text(index, fresh))
             return
+
+    def _clear_editor(self) -> None:
+        """把右侧清成「什么都没有」。
+
+        死线：右侧是左侧选中任务的镜像。左侧没有选中任务时，右侧必须是空的——
+        绝不能残留上一个任务或上一次编辑的内容，那是假信息。
+        """
+        self.weight_editor.set_weights({})
+        self._apply_stage_require({})
+        self.min_useful.setValue(0)
+        self._filter_sets = []
+        self._update_set_summary()
+        self._refresh_main_boxes(set())
+        self._sync_job_name_edit()
+        self._rebuild_timer.stop()
+        self.rebuild_cards(None)
 
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
         snap = self._snapshot_slot()
@@ -1252,26 +1286,27 @@ class MainWindow(QMainWindow):
         self._commit_editor()
         self._load_job(self._jobs[row])
 
+    def _unique_job_name(self, base: str, exclude: TaskJob | None = None) -> str:
+        """取一个不重名的任务名：base 被占了就 base (2)、(3)…（exclude 用于改名时排除自己）。"""
+        used = {job.name for job in self._jobs if job.name and job is not exclude}
+        if base not in used:
+            return base
+        index = 2
+        while f"{base} ({index})" in used:
+            index += 1
+        return f"{base} ({index})"
+
     def _add_job(self) -> None:
-        job = self._job_from_editor()
+        """新建任务：建一个**空**任务并选中它，右侧随即清空等你编。
+
+        右侧是左侧选中任务的镜像，所以新建之后右侧必须是空的——不能把上一个
+        任务的内容顺过来当新任务，那是假信息。之后在右侧编，离开时自动写回它。
+        """
+        job = TaskJob(slot=self._active_slot, name=self._unique_job_name("任务"))
         self._jobs.append(job)
         self._editing_job_id = job.job_id
-        snap = self._snapshot_slot()
-        self._slot_plans[job.slot] = snap
-        # 新建任务后，存为使用的存档：把该方案实际用的权重+档位要求写回所选存档
-        name = self.archive_combo.currentText().strip()
-        if name:
-            data = self._load_archives()
-            data[name] = {
-                "weights": dict(snap.get("weights") or {}),
-                "stage_require": {
-                    origin: dict(table)
-                    for origin, table in (snap.get("stage_require") or {}).items()
-                },
-            }
-            self._write_archives(data)
-            self._refresh_archive_combo(name)
         self._refresh_chain_list(job.job_id)
+        self._clear_editor()
         self._focus_job_name()
 
     def _remove_job(self) -> None:
@@ -1281,7 +1316,15 @@ class MainWindow(QMainWindow):
         removed = self._jobs.pop(row)
         if self._editing_job_id == removed.job_id:
             self._editing_job_id = None
+            # 删掉正在编的那个，顺手选中原位置的邻居；一个都不剩就保持未选中
+            if self._jobs:
+                neighbour = self._jobs[min(row, len(self._jobs) - 1)]
+                self._editing_job_id = neighbour.job_id
+                self._load_job(neighbour)
         self._refresh_chain_list()
+        if self._editing_job_id is None:
+            # 链空了：右侧必须是空的，不能留着刚被删掉那个任务的内容
+            self._clear_editor()
 
     def _move_job(self, delta: int) -> None:
         row = self.chain_list.currentRow()
@@ -1473,22 +1516,38 @@ class MainWindow(QMainWindow):
         self._apply_stage_require(plan.get("stage_require") or {})
 
     def _on_slot_clicked(self, slot: int) -> None:
+        """换部位。
+
+        两种情形分开处理：
+        - 有选中任务：换部位就是**改这个任务的部位**，任务保持选中，右侧继续镜像它。
+          （原来会把任务取消选中，导致「换完部位任务就丢了、再点回来又是旧部位」，
+          等于没法给已选中的任务换部位。）
+        - 没选中任务：只是换个部位准备新建，右侧保持空。
+        """
         if self._loading or slot == self._active_slot:
             return
+        job = self._editing_job()
+        if job is None:
+            self._active_slot = slot
+            for name, radio in self.filter_slots.items():
+                radio.blockSignals(True)
+                radio.setChecked(name == slot)
+                radio.blockSignals(False)
+            self._clear_editor()
+            return
+        # 先把当前编辑器内容写回这个任务，再改部位
         self._commit_editor()
-        self._editing_job_id = None
+        # _commit_editor 会把 _jobs 里那一项换成新对象，得重新取一次引用，
+        # 否则改的是已经被替换掉的旧对象。
+        job = self._editing_job()
+        if job is None:
+            return
+        job.slot = slot
         self._active_slot = slot
-        plan = self._slot_plans.get(slot) or empty_slot_plan(slot)
-        self._filter_sets = list(plan.get("sets") or ())
-        self._update_set_summary()
-        self._apply_slot_widgets(plan)
-        accepted = plan.get("accepted")
-        self.rebuild_cards(None if accepted is None else tuple(accepted))
-        self.chain_list.blockSignals(True)
-        self.chain_list.clearSelection()
-        self.chain_list.blockSignals(False)
-        # 切部位等于取消选中任务：名字框跟着空掉并禁用
-        self._sync_job_name_edit()
+        self._load_job(job)
+        # 部位变了，主词条跟着变：清掉不属于新部位的选择，并同步回任务
+        job.mainstats = tuple(self._selected_mains())
+        self._refresh_chain_list(job.job_id)
 
     def _on_filter_changed(self) -> None:
         if self._loading:
@@ -1794,29 +1853,27 @@ class MainWindow(QMainWindow):
             self._slot_plans[first.slot] = plan
             accepted = first.accepted
         else:
+            # 任务链是空的：右侧保持空。不拿 preset 里的权重来填——那是档案里的
+            # 残留值，会在「没选中任何任务」时显示出来，属于假信息。
             self._active_slot = preset.filter_slot
-            self._filter_sets = list(preset.filter_sets)
-            self._slot_plans[preset.filter_slot] = {
-                "weights": dict(preset.weights),
-                "stage_require": {key: dict(table) for key, table in preset.stage_require.items()},
-                "accepted": preset.accepted,
-                "mainstats": tuple(preset.filter_mainstats),
-                "sets": tuple(preset.filter_sets),
-                "min_useful_types": preset.min_useful_types,
-            }
-            accepted = preset.accepted
+            self._filter_sets = []
+            accepted = None
         for slot, radio in self.filter_slots.items():
             radio.blockSignals(True)
             radio.setChecked(slot == self._active_slot)
             radio.blockSignals(False)
         self._update_set_summary()
-        self._apply_slot_widgets(self._slot_plans[self._active_slot])
+        if self._jobs:
+            self._apply_slot_widgets(self._slot_plans[self._active_slot])
         self._refresh_chain_list(self._editing_job_id)
         self._reset_saved_state()
         self.path_label.setText(self._path.name)
         self.path_label.setToolTip(str(self._path))
         self._loading = False
-        self.rebuild_cards(accepted)
+        if self._jobs:
+            self.rebuild_cards(accepted)
+        else:
+            self._clear_editor()
 
     def _schedule_rebuild(self) -> None:
         if self._loading or self._rebuilding:
@@ -1864,6 +1921,15 @@ class MainWindow(QMainWindow):
     def _rebuild_cards_inner(self, accepted: tuple[str, ...] | None = None) -> None:
         blocked = set(self._selected_mains())
         weights = {name: value for name, value in self.weight_editor.weights().items() if name not in blocked}
+        if not weights:
+            # 一个词条都没有就没有组合可言。注意 enumerate_all 在权重为空时仍会产出
+            # 「全废词条」的图案，照着建就会在右侧摆出几张看似真实的卡片——那是假信息。
+            # 直接清空。新建任务后右侧必须是真的空，就是靠这里。
+            for section in self.sections.values():
+                section.set_cards([], lambda _pattern_id: False)
+            self.trial.set_name_choices([], blocked)
+            self._update_status()
+            return
         patterns = enumerate_all(weights, hide_junk_bonus=True)
         grouped: dict[tuple[str, int], list[Pattern]] = defaultdict(list)
         for pattern in patterns:
