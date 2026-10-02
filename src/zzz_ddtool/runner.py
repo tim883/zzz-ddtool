@@ -193,8 +193,12 @@ class Runner:
         self.log.info("bound game instance hwnd=%s pid=%s", self._hwnd, self._pid)
         return self._hwnd
 
-    def _grab(self, allow_esc: bool = True):
+    def _grab(self, allow_esc: bool = True, need_page: bool = True):
         image, method, hwnd = grab_game_image(self._hwnd)
+        if not need_page:
+            # 调用方只借这一帧图（在弹层里按坐标点击），不关心停在哪一页：跳过认页。
+            # 弹层不命中任何页模板，7 个模板逐个跑一遍要 1~5 秒，纯白等。
+            return image, "unknown", method, hwnd
         from zzz_ddtool.screen import classify_image
 
         page = classify_image(image)
@@ -1068,7 +1072,7 @@ class Runner:
                 self.log.warning("ocr retry %d: %s", attempt + 1, exc)
             if attempt + 1 < max(1, self.preset.ocr_retry):
                 time.sleep(0.1)
-                image = self._grab(allow_esc=False)[0]
+                image = self._grab(allow_esc=False, need_page=False)[0]
         self.trace.fail(page, "parse", f"重试耗尽：{reason}", image=image)
         raise RunnerError(f"{page} 识别失败：{reason}，停止任务链")
 
@@ -1159,7 +1163,7 @@ class Runner:
         attempts = max(1, self.preset.ocr_retry)
         image = None
         for attempt in range(attempts):
-            image, *_ = self._grab(allow_esc=False)
+            image, *_ = self._grab(allow_esc=False, need_page=False)
             for line in read_rect(image, self.ZOOM_LEVEL_AREA):
                 if "等级" in line.text.replace(" ", ""):
                     return line, image
@@ -1175,7 +1179,7 @@ class Runner:
         from zzz_ddtool.ocr import read_rect
 
         # 1) 详情页大按钮（0 级也显示「查看」）
-        image, *_ = self._grab(allow_esc=False)
+        image, *_ = self._grab(allow_esc=False, need_page=False)
         hit = None
         for text in ("查看", "强化"):
             for line in read_rect(image, self.UPGRADE_BTN_AREA):
@@ -1208,7 +1212,7 @@ class Runner:
             click_client(hwnd, ax, ay)
             for _wait in range(4):  # 弹层渲染可能慢，最多等 ~2.8s
                 time.sleep(0.7)
-                image, *_ = self._grab(allow_esc=False)
+                image, *_ = self._grab(allow_esc=False, need_page=False)
                 lines = read_rect(image, self.STAGE_ADD_AREA)
                 if any("阶段添加" in ln.text.replace(" ", "") for ln in lines):
                     stage_clicked = True
@@ -1237,7 +1241,7 @@ class Runner:
         等级停在下一档之前，正好走 _upgrade_loop 的期望等级校验。
         返回是否真的点出去了（槽号越界按最近的一档夹住）。
         """
-        image, *_ = self._grab(allow_esc=False)
+        image, *_ = self._grab(allow_esc=False, need_page=False)
         index = min(max(1, material_slot), len(UPGRADE_MATERIAL_SLOTS))
         mx, my = scale_point(*UPGRADE_MATERIAL_SLOTS[index - 1], image.width(), image.height())
         click_client(hwnd, mx, my)
@@ -1258,13 +1262,13 @@ class Runner:
                 return False
             time.sleep(0.6)
         else:
-            image, *_ = self._grab(allow_esc=False)
+            image, *_ = self._grab(allow_esc=False, need_page=False)
             if not self._click_text(
                 hwnd, read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add", image=image
             ):
                 return False
             time.sleep(0.6)
-        image, *_ = self._grab(allow_esc=False)
+        image, *_ = self._grab(allow_esc=False, need_page=False)
         if not self._click_text(
             hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step-upgrade-confirm", image=image
         ):
@@ -1306,7 +1310,7 @@ class Runner:
         expect_from = 0
         rechecks = 0
         while True:
-            image, *_ = self._grab(allow_esc=False)
+            image, *_ = self._grab(allow_esc=False, need_page=False)
             disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
             if self._detail_disc is not None:
                 disc = replace(
