@@ -413,6 +413,43 @@ def test_substat_choices_match_the_authoritative_dictionary() -> None:
     assert "穿透率" in MAINSTAT_NAMES
 
 
+def test_substat_pool_is_the_ten_rollable_ones() -> None:
+    """副词条池固定 10 种，钉死，别再往里加。
+
+    游戏里驱动盘的副词条只有这 10 种：
+    生命值 / 生命值% / 攻击力 / 攻击力% / 防御力 / 防御力% / 暴击率 / 暴击伤害 /
+    穿透值 / 异常精通。
+
+    曾经往这个池子里混进 4 个主属性：
+      * 「穿透率」是 5 号位主词条（副词条是「穿透值」）；
+      * 「冲击力」「异常掌控」「能量自动回复」是 6 号位主词条。
+    后果是界面下拉框里出现游戏里根本选不中的词条，选进去的组合永远命不中，
+    右上角还会多出一大堆假卡片（实测权重里混一条「穿透率」，卡片从 837 张涨到
+    2333 张，其中 1496 张把「穿透率」当成可能的副词条）。
+    """
+    from zzz_ddtool.gamedata import SLOT_MAINSTATS, SUBSTAT_NAMES
+
+    assert set(SUBSTAT_NAMES) == {
+        "生命值",
+        "生命值%",
+        "攻击力",
+        "攻击力%",
+        "防御力",
+        "防御力%",
+        "暴击率",
+        "暴击伤害",
+        "穿透值",
+        "异常精通",
+    }
+    assert len(SUBSTAT_NAMES) == len(set(SUBSTAT_NAMES))  # 不能有重复
+
+    for name in ("冲击力", "异常掌控", "能量自动回复"):
+        assert name not in SUBSTAT_NAMES, f"{name} 是 6 号位主词条，不是副词条"
+        assert name in SLOT_MAINSTATS[6]
+    assert "穿透率" not in SUBSTAT_NAMES
+    assert "穿透率" in SLOT_MAINSTATS[5]
+
+
 def test_penetration_names_are_not_swapped() -> None:
     """「穿透率」和「穿透值」这一对最容易搞混，单独钉死。
 
