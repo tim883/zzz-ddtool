@@ -3,6 +3,8 @@ import logging
 import threading
 import time
 
+import pytest
+
 from zzz_ddtool import overlay
 
 
@@ -13,6 +15,7 @@ def wait_until(predicate):
     assert predicate()
 
 
+@pytest.mark.window
 def test_native_overlay_pumps_on_owner_thread_and_reopens(monkeypatch):
     # 独立小窗口验证，不寻找或操作游戏，结束时销毁。
     monkeypatch.setattr(overlay, "_refresh_game_origin", lambda: True)
@@ -47,6 +50,7 @@ def test_game_overlay_receives_real_logs_and_ignores_own_errors(monkeypatch):
     assert "识别盘面成功" in received[0][-1]
 
 
+@pytest.mark.window
 def test_overlay_follows_without_new_logs_and_restores(monkeypatch):
     # 只移动本测试创建的独立窗口，不操作真实游戏。
     target = overlay.user32.CreateWindowExW(

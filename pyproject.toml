@@ -34,3 +34,9 @@ zzz_ddtool = ["assets/templates/**/*.png"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# 会创建真实桌面窗口的用例打 window 标记，默认排除：跑全量时不在桌面上弹
+# TOPMOST 半透明浮层（曾误盖住用户窗口）。验浮层时显式跑 pytest -m window。
+addopts = '-m "not window"'
+markers = [
+  "window: 会创建真实桌面窗口的用例，默认跳过以避免占用屏幕",
+]
