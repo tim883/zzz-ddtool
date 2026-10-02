@@ -69,6 +69,11 @@ def _get_engine():
                 "Det.model_type": ModelType.SMALL,
                 "Rec.model_type": ModelType.SMALL,
                 "Rec.ocr_version": OCRVersion.PPOCRV6,
+                # 检测前的缩放下限。默认 736 配 limit_type=min，会把「最短边不足 736」
+                # 的裁剪图等比放大：详情页等级区只有 150x47，最短边 47 → 撑成 736x2350
+                # 才进检测网络，一次识别要 1~2 秒。调到 160 后小区域快 4~9 倍；
+                # 最短边本来就 >= 160 的大区域（如扫屏 1270x940）原图不动，不受影响。
+                "Det.limit_side_len": 160,
             }
         )
         return _engine
@@ -114,9 +119,10 @@ def read_rect(image: QImage, rect: tuple[int, int, int, int]) -> list[OcrLine]:
         _log_rect(image, rect, 0, started)
         return []
 
-    bgr = qimage_to_bgr(image)
-    crop = bgr[top:bottom, left:right]
-    result = _get_engine()(crop)
+    # 先按矩形裁出子图再转 BGR：整图 1920x1080 转换约 12ms，裁完再转只要 0.02ms。
+    # 下面的 box 是 crop 局部坐标，仍按 + (left, top) 还原到全图。
+    crop = image.copy(left, top, right - left, bottom - top)
+    result = _get_engine()(qimage_to_bgr(crop))
     if result is None or not result.txts:
         _log_rect(image, rect, 0, started)
         return []

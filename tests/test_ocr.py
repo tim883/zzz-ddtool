@@ -107,9 +107,10 @@ def test_zoom_level_area_regression() -> None:
     assert not image.isNull()
     texts = [line.text.replace(" ", "") for line in read_rect(image, Runner.ZOOM_LEVEL_AREA)]
     assert any("等级" in text for text in texts), texts
-    # 顺带保证旧区在这个现场确实是坏的，否则这条回归就失去意义
-    old_texts = [line.text.replace(" ", "") for line in read_rect(image, (1100, 150, 1550, 300))]
-    assert not any("等级" in text for text in old_texts), old_texts
+    # 2026-10-02：原先这里还有一条反面对照——断言旧区 (1100,150,1550,300) 读不出「等级」，
+    # 用「旧区确实坏」来反证收紧有效。c 优化把 Det.limit_side_len 由 736 降到 160 后，
+    # 旧区在同一张图上也能读出「等级00」（实得 ['15','等级00','主属性']），对照前提不再成立，故删除。
+    # 本回归的有效断言就是上面那条：收紧后的 ZOOM_LEVEL_AREA 能稳定读到「等级」。
 
 
 def test_level_rejects_unrelated_numbers(monkeypatch) -> None:
