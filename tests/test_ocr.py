@@ -4,8 +4,10 @@ import pytest
 
 from PySide6.QtGui import QImage
 
+from zzz_ddtool.gamedata import SUBSTAT_NAMES
 from zzz_ddtool.models import Substat
 from zzz_ddtool.ocr import (
+    _SUBSTAT_OCR_FIXES,
     _best_match,
     _fix_percent,
     _parse_substat,
@@ -48,6 +50,64 @@ def test_parse_substat() -> None:
     assert _parse_substat("防御力+1", "9.6%") == Substat("防御力%", rolls=2)
     assert _parse_substat("昇常精通+1", "18") == Substat("异常精通", rolls=2)
     assert _parse_substat("生命值", "128") == Substat("生命值", rolls=1)
+
+
+def test_ocr_fixes_are_real_replacements() -> None:
+    """兜底表里每条都必须真的「改写」点什么：错字不能等于正确名。
+
+    踩过坑：表里有一条「攻击 → 攻击」，左右同字，replace 之后原样返回，永远不生效
+    ——看着像在纠错，实际是死代码。
+    """
+    noop = [wrong for wrong, right in _SUBSTAT_OCR_FIXES.items() if wrong == right]
+    assert noop == [], f"这些条目是自我替换，永远不会生效：{noop}"
+
+    # 逐条确认替换确实改变了含错字的输入
+    for wrong, right in _SUBSTAT_OCR_FIXES.items():
+        assert f"{wrong}xx".replace(wrong, right) != f"{wrong}xx"
+
+
+def test_ocr_fixes_only_target_substats() -> None:
+    """纠正目标必须能**落到某个副词条上**（是某个副词条名的子串）。
+
+    判据不能写成「目标本身在词典里」：表里「防街 → 防御」「生俞 → 生命」纠正出的
+    是**词根**，词典里没有「防御」「生命」，靠 _best_match 的相似度补全成「防御力」
+    「生命值」。所以只要目标能落在某个副词条名上就算数。
+
+    这条挡的是曾犯的错：有条「昇常掌控 → 异常掌控」，异常掌控是 6 号位主属性，
+    纠正了也匹配不到任何副词条，纯空转。
+    """
+    bad = [
+        right
+        for right in _SUBSTAT_OCR_FIXES.values()
+        if not any(right in name for name in SUBSTAT_NAMES)
+    ]
+    assert bad == [], f"这些纠正目标落不到任何副词条上，纠正了也没用：{bad}"
+
+
+def test_ocr_fixes_resolve_to_the_right_substat() -> None:
+    """每条兜底都要真的救得回来：错字经纠正后认得出**正确**的副词条。
+
+    端到端走 _parse_substat，把「错字 → 解析结果」逐条钉死。数值那列用来区分
+    是否百分比（决定补不补 %），所以百分号分支也要各测一条。
+    """
+    expected = {
+        ("昇常精通", "18"): "异常精通",
+        ("穿透値", "9"): "穿透值",
+        ("防街", "18"): "防御力",
+        ("防街", "9.6%"): "防御力%",
+        ("生俞", "128"): "生命值",
+        ("生俞", "6%"): "生命值%",
+    }
+    for (wrong, value), right in expected.items():
+        assert _parse_substat(wrong, value) == Substat(right, rolls=1), (
+            f"{wrong!r} + {value!r} 应解析成 {right!r}"
+        )
+
+    # 表里的错字必须都被上面覆盖，新增条目时逼着同步补用例
+    covered = {wrong for wrong, _value in expected}
+    assert covered == set(_SUBSTAT_OCR_FIXES), (
+        f"兜底表有的错字没被用例覆盖：{set(_SUBSTAT_OCR_FIXES) - covered}"
+    )
 
 
 def test_read_level(sample_image: QImage) -> None:

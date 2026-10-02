@@ -151,6 +151,23 @@ def _fix_percent(text: str) -> str:
     return text
 
 
+# 常见 OCR 错字的兜底纠正表（错字 -> 正确名）。
+#
+# 两条硬要求：
+#   1. 只放**副词条**的错字。曾有一条「昇常掌控 → 异常掌控」：异常掌控是 6 号位主属性，
+#      不在副词条池里，纠正了也会在 _best_match 里被丢掉，纯空转，已删。
+#   2. 每条必须是**真替换**（错字 != 正确名）。曾有一条「攻击 → 攻击」：左右同字，
+#      replace 之后原样返回，永远不生效，已删 —— 它大概是想纠某个认错的「攻击」，
+#      但没写出具体错字，等于没写。
+# 守卫见 tests/test_ocr.py（会拦住自我替换与主属性名）。
+_SUBSTAT_OCR_FIXES = {
+    "昇常精通": "异常精通",
+    "穿透値": "穿透值",
+    "防街": "防御",
+    "生俞": "生命",
+}
+
+
 def _best_match(name: str, candidates: tuple[str, ...], cutoff: float = 0.6) -> str | None:
     best: str | None = None
     best_ratio = cutoff
@@ -195,18 +212,8 @@ def _parse_substat(name_text: str, value_text: str) -> Substat | None:
     if is_percent and not base_name.endswith("%"):
         base_name = base_name + "%"
 
-    # 一些常见 OCR 错字兜底。
-    #
-    # 只放**副词条**的错字。曾经这里有一条「昇常掌控 → 异常掌控」：异常掌控是 6 号位
-    # 主属性，不在副词条池里，纠正了也会在下方的 _best_match 里被丢掉，纯空转。
-    fixes = {
-        "昇常精通": "异常精通",
-        "穿透値": "穿透值",
-        "攻击": "攻击",
-        "防街": "防御",
-        "生俞": "生命",
-    }
-    for wrong, right in fixes.items():
+    # 常见 OCR 错字兜底（表在模块级，见 _SUBSTAT_OCR_FIXES）
+    for wrong, right in _SUBSTAT_OCR_FIXES.items():
         base_name = base_name.replace(wrong, right)
 
     matched = _best_match(base_name, _SUBSTAT_NAMES, cutoff=0.55)
