@@ -7,9 +7,29 @@ def set_icon_path(name: str):
     return assets_dir() / "sets" / f"{name}.png"
 
 
+def _fit_font(name: str, size: int):
+    """在 size×size 的块里放得下**完整**套装名的最大字号。
+
+    自上而下收缩（下限 6pt），保证 5~6 字的套装名也不会超出块宽被裁掉。
+    """
+    from PySide6.QtGui import QFont, QFontMetrics
+
+    limit = size - max(4, size // 10)
+    pt = max(10, size // 6)
+    while pt > 6:
+        font = QFont("Microsoft YaHei", pt)
+        font.setBold(True)
+        if QFontMetrics(font).horizontalAdvance(name) <= limit:
+            return font
+        pt -= 1
+    font = QFont("Microsoft YaHei", 6)
+    font.setBold(True)
+    return font
+
+
 def paint_set_icon(name: str, size: int = 72):
     from PySide6.QtCore import Qt
-    from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+    from PySide6.QtGui import QColor, QPainter, QPixmap
 
     path = set_icon_path(name)
     if path.is_file():
@@ -23,9 +43,7 @@ def paint_set_icon(name: str, size: int = 72):
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(QColor("#1a1a1a"))
-    font = QFont("Microsoft YaHei", max(10, size // 6))
-    font.setBold(True)
-    painter.setFont(font)
-    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, name[:2])
+    painter.setFont(_fit_font(name, size))
+    painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, name)
     painter.end()
     return pix
