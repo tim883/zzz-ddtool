@@ -41,6 +41,7 @@ from zzz_ddtool.navigation import (
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
 from zzz_ddtool.traversal import (
+    RESOLVED_STATUSES,
     AnchorObservation,
     CellStatus,
     GridCell,
@@ -338,13 +339,19 @@ class Runner:
                 self.log.info("cell %d 扫描跳过：%s（仍占全局格位）", index, reason)
             state.commit_prefix()
 
+            # 从 next_index 起按序号取候选：已确认跳过的格位直接越过（仍占格位、
+            # 不计数、不点击）；序号出现缺口说明前方有未解决格位（延期/视口外），
+            # 不能越过（spec §5.2、§6.1）。
             pending: list[GridCell] = []
+            ready_by_index = {cell.global_index: cell for cell in ready}
             expected = state.next_index
-            for cell in sorted(ready, key=lambda c: c.global_index):
-                if cell.global_index < expected:
+            while True:
+                cell = ready_by_index.get(expected)
+                if cell is None:
+                    break
+                if state.status_of(expected) in RESOLVED_STATUSES:
+                    expected += 1
                     continue
-                if cell.global_index != expected:
-                    break  # 前方有未解决格位（屏障），不能越过
                 pending.append(cell)
                 expected += 1
 

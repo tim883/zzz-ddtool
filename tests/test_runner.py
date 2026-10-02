@@ -238,6 +238,23 @@ def test_filtered_rows_keep_global_slots(offline_runner, monkeypatch):
     assert runner.processed_disc_count == 27
 
 
+def test_skipped_cells_are_never_collected_as_candidates(offline_runner, monkeypatch):
+    """扫描判定跳过的格位不能被收成待处理：越过跳过区、不点击、不计数。
+
+    2026-10-02 真机：next_index 落在待处理区内、后方还有跳过格位时，旧逻辑把
+    跳过格位一起收进 pending，白点白计数，提前吃掉 max_discs 配额（processed
+    虚高、next_index 直接跳到跳过区之后）。
+    """
+    runner = Runner(Preset(max_discs=100, accepted=()), hotkeys=False)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=4, filtered_rows=(1, 3)))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+    runner.run()
+    assert runner.outcome == "completed"
+    assert grid.visited == [(row, col) for row in (0, 2) for col in range(GRID_COLS)]
+    assert runner.processed_disc_count == 2 * GRID_COLS
+
+
 def test_empty_candidate_batch_still_advances(offline_runner, monkeypatch):
     # 候选全被跳过的批次不结束任务，继续向下推进直到出现候选。
     runner = Runner(Preset(max_discs=1, accepted=()), hotkeys=False)
