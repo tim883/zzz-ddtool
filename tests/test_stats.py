@@ -192,7 +192,8 @@ def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "本轮统计" in text
     assert "升到 3 级" in text
-    assert "筛选后共 3 个盘" in text
+    assert "筛选后合计 3 个盘" in text
+    assert "共计耗时 12 秒" in text
 
     target = st.write(tmp_path / "stats.json")
     assert target is not None and target.is_file()
@@ -203,3 +204,87 @@ def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None
     assert data["jobs"][0]["name"] == "任务1"
     # 不能留下 .tmp 尾巴
     assert not (tmp_path / "stats.tmp").exists()
+
+
+# ---------------------------------------------------------------- 人类可读报告
+
+
+def _sample() -> S.RunStats:
+    """一件升满 15 级的盘 + 一个任务，用来生成完整报告。"""
+    st = S.RunStats(tag="20261004-200000")
+    st.job_begin(1, "任务1", 1, ("折枝剑歌",), ())
+    st.scan(["c"] * 3, {0: "满级"}, 0, max_index=2)
+    slot = st.disc_begin("j1", 0, 0)
+    for frm, to in ((0, 3), (3, 6), (6, 9), (9, 12), (12, 15)):
+        st.disc_stage(slot, frm, to, float(to))
+    st.disc_end(slot, S.OUTCOME_UPGRADED, 15)
+    # 又一件「升过级但没到 15」的盘：用来把「成功 = 升满 15」和「强化过」两个口径卡开，
+    # 否则两件盘只放一件时两个数都是 1，改坏口径也测不出来。
+    short = st.disc_begin("j1", 1, 6)
+    st.disc_stage(short, 6, 9, 9.0)
+    st.disc_end(short, S.OUTCOME_UPGRADED, 9)
+    st.job_end(65.0, 1)
+    st.seconds = 194.0
+    return st
+
+
+def test_headline_counts_the_four_asked_numbers() -> None:
+    """一行摘要要能独立读懂：耗时 / 处理数 / 成功 / 弃置，四个都在。"""
+    head = _sample().headline()
+    assert "共计耗时 3 分 14 秒" in head
+    assert "处理了 2 个盘" in head
+    assert "成功（升满 15 级且判定保留）1 件" in head
+    assert "弃置（判定为弃置的盘；不等于实际打过弃置标记的数量）0 件" in head
+
+
+def test_report_fixes_all_five_stages_including_12() -> None:
+    """档位是 3/6/9/12/15 五档；某档没数据也要留一行，别让人以为漏了一档。"""
+    assert S.STAGE_LEVELS == (3, 6, 9, 12, 15)
+    text = S.RunStats(tag="t").report_text()  # 全空的报告也得列齐 5 档
+    for level in (3, 6, 9, 12, 15):
+        assert f"升到 {level} 级" in text
+
+
+def test_discard_label_count_can_differ_from_judged_discard() -> None:
+    """「弃置」报判定数；盘上已有标记时不会真打，所以实打数 ≤ 判定数。"""
+    st = S.RunStats(tag="t")
+    for index in (0, 1):
+        slot = st.disc_begin("j1", index, 0)
+        st.disc_end(slot, S.OUTCOME_DISCARDED, 3)
+    st.note_discard_label()  # 只有一件真把标记打上去了
+
+    data = st.summary()
+    assert data["outcomes"][S.OUTCOME_DISCARDED] == 2
+    assert data["discard_labels"] == 1
+    text = st.report_text()
+    assert "实际打上弃置标记：**1** 次" in text
+
+
+def test_report_text_is_human_markdown() -> None:
+    text = _sample().report_text()
+    assert text.startswith("# 运行结果统计 · 20261004-200000")
+    for section in (
+        "## 总览",
+        "## 逐任务",
+        "## 结果明细",
+        "## 最终等级分布",
+        "## 单件升级耗时（按到达档位）",
+        "## 说明",
+    ):
+        assert section in text
+    assert "会重叠，别相加" in text
+    assert "不等于实际打过弃置标记的数量" in text
+
+
+def test_report_survives_an_empty_run() -> None:
+    """一件盘都没处理的空转也得给出可读报告，不能崩。"""
+    text = S.RunStats(tag="t").report_text()
+    assert "处理了 0 个盘" in text
+    assert "（无：本轮没有走完流程的盘）" in text
+
+
+def test_write_report_writes_markdown_file(tmp_path) -> None:
+    target = _sample().write_report(tmp_path / "r.md")
+    assert target is not None and target.is_file()
+    assert "运行结果统计" in target.read_text(encoding="utf-8")
+    assert not (tmp_path / "r.tmp").exists()

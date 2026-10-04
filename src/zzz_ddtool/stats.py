@@ -21,9 +21,10 @@
 格位计数按**任务**分开算：每个任务有自己的筛选条件和独立序号空间，
 跨任务求和只会得到没有意义的数字。
 
-产物两处（收尾时一次性写出）：
+产物三处（收尾时一次性写出）：
     log/text/ddtool.log          一段中文摘要（给人看的，可 grep）
     log/stats/<tag>.json         结构化数据（给脚本/后续报表用）
+    log/stats/<tag>.md           人类可读报告；客户端的结果统计界面展示的就是它
 
 **为什么放 log/stats 而不是 captures/<tag>/**：截图目录按张数整轮回收，
 统计文件虽然不匹配 ``*.png`` 删不掉，但跟着截图走容易被误清理。
@@ -67,6 +68,32 @@ def outcome_for_action(action_value: str) -> str:
 
 def outcome_name(outcome: str) -> str:
     return OUTCOME_NAMES.get(outcome, outcome)
+
+
+# 驱动盘的升级档位就是这 5 个（models.next_stage_level / UPGRADE_STEP=3 / MAX_LEVEL=15）。
+# 报告里**固定列出全部 5 档**，某档没数据也留一行写 0 —— 否则读的人会以为漏了一档。
+STAGE_LEVELS = (3, 6, 9, 12, 15)
+
+# 结果口径的固定说法，摘要行和详细表都引用它，避免两处写岔。
+KEPT_NOTE = "升满 15 级且判定保留"
+DISCARD_NOTE = "判定为弃置的盘；不等于实际打过弃置标记的数量"
+
+
+def format_duration(seconds: float) -> str:
+    """秒 → 人读的时长。"""
+    total = int(round(max(0.0, float(seconds))))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {sec:02d} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes:02d} 分"
+
+
+def _cell(value: float) -> str:
+    """表格里的秒数：保留 1 位小数。"""
+    return f"{float(value):.1f}"
 
 
 # ---------------------------------------------------------------- 明细行
@@ -151,6 +178,9 @@ class RunStats:
         self.jobs: list[JobStat] = []
         self.discs: list[DiscStat] = []
         self.actions: list[StepSpan] = []
+        # 实际打上弃置标记的次数。和「判定为弃置」不是一个数：盘上已有标记、或标签
+        # 设置关闭时都不会真打，所以它 ≤ 判定弃置数。报告里两个都报，差异才解释得清。
+        self.discard_labels = 0
         self._open: dict[str, float] = {}
 
     # ------------------------------------------------------------ 打点接口
@@ -222,6 +252,10 @@ class RunStats:
         t0 = self._open.pop(f"disc{disc.index}", None)
         if t0 is not None:
             disc.seconds = time.monotonic() - t0
+
+    def note_discard_label(self) -> None:
+        """记一次「真的把弃置标记打上去了」。判定弃置但没打标记的不算。"""
+        self.discard_labels += 1
 
     def span(self, page: str, action: str, seconds: float, detail: str = "") -> None:
         """记一个长动作的真实耗时（切页、筛选、恢复视口…）。"""
@@ -345,6 +379,7 @@ class RunStats:
             },
             "outcomes": counts,
             "max_level_kept": max_level_kept,
+            "discard_labels": self.discard_labels,
             "unfinished": self.unfinished(),
             "level_distribution": self.level_distribution(),
             # 长动作：真实墙钟，大块时间都在这儿。
@@ -397,13 +432,12 @@ class RunStats:
         counts = data["outcomes"]
         totals = data["totals"]
         log.info("─" * 28 + " 本轮统计 " + "─" * 28)
+        log.info("%s", self.headline())
         log.info(
-            "任务 %d 个 · 用时 %.1fs · 筛选后共 %d 个盘（跳过 %d，实际处理 %d）",
+            "    （任务 %d 个 · 筛选后合计 %d 个盘 · 跳过 %d）",
             totals["jobs"],
-            data["seconds"],
             totals["slots"],
             totals["skipped"],
-            totals["processed"],
         )
         for job in data["jobs"]:
             log.info(
@@ -418,12 +452,19 @@ class RunStats:
                 job["seconds"],
             )
         log.info(
-            "结果：强化 %d 件（其中满级保留 %d 件）· 弃置 %d 件 · 跳过 %d 件 · 中断 %d 件",
-            counts[OUTCOME_UPGRADED],
+            "结果：成功 %d 件（%s）· 弃置 %d 件（%s）· 跳过 %d 件 · 中断 %d 件",
             data["max_level_kept"],
+            KEPT_NOTE,
             counts[OUTCOME_DISCARDED],
+            DISCARD_NOTE,
             counts[OUTCOME_SKIPPED],
             counts[OUTCOME_FAILED],
+        )
+        log.info(
+            "    实际打上弃置标记 %d 次（判定弃置 %d 件，两者本来就不等：盘上已有标记、"
+            "或标签设置关闭时不会真打）",
+            data["discard_labels"],
+            counts[OUTCOME_DISCARDED],
         )
         dist = data["level_distribution"]
         if dist:
@@ -433,7 +474,10 @@ class RunStats:
             )
         if data["unfinished"]:
             log.info("未走完流程：%d 件（中途中断，不计入等级分布）", data["unfinished"])
-        for level, stat in data["stage_seconds"].items():
+        for level in STAGE_LEVELS:
+            stat = data["stage_seconds"].get(str(level))
+            if not stat or not stat.get("n"):
+                continue
             log.info(
                 "升到 %s 级：%d 次，平均 %.1fs（%.1f~%.1f，中位 %.1f，波动 ±%.0f%%）",
                 level,
@@ -457,6 +501,157 @@ class RunStats:
         self._print_group(log, "长动作（真实耗时，大块时间都在这）", data["long_actions"])
         self._print_group(log, "步骤耗时（距上一步的间隔，看细节；会和上面重叠，别相加）", data["steps"])
         log.info("─" * 68)
+
+    # ------------------------------------------------------------ 人类可读报告
+
+    def headline(self) -> str:
+        """一行摘要：共计耗时、处理了几个盘、成功几件、弃置几件。
+
+        客户端的结果统计栏、报告文件的开头、文本日志都用这一句，三处口径不会写岔。
+        """
+        data = self.summary()
+        counts = data["outcomes"]
+        totals = data["totals"]
+        return (
+            f"共计耗时 {format_duration(data['seconds'])}，"
+            f"处理了 {totals['processed']} 个盘，"
+            f"成功（{KEPT_NOTE}）{data['max_level_kept']} 件，"
+            f"弃置（{DISCARD_NOTE}）{counts[OUTCOME_DISCARDED]} 件。"
+        )
+
+    @staticmethod
+    def _markdown_group(title: str, grouped: dict) -> list[str]:
+        if not grouped:
+            return []
+        out = [
+            f"## {title}",
+            "",
+            "| 动作 | 次数 | 合计 | 平均 | 最快 | 最慢 | 波动 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        ordered = sorted(grouped.items(), key=lambda kv: kv[1].get("total", 0.0), reverse=True)
+        for name, stat in ordered:
+            out.append(
+                f"| {name} | {stat['n']} | {_cell(stat['total'])}s | {_cell(stat['mean'])}s | "
+                f"{_cell(stat['min'])}s | {_cell(stat['max'])}s | ±{stat['spread'] * 100:.0f}% |"
+            )
+        out.append("")
+        return out
+
+    def report_text(self) -> str:
+        """Markdown 报告：写进 ``log/stats/<tag>.md``，客户端结果统计栏展示的也是它。"""
+        data = self.summary()
+        counts = data["outcomes"]
+        totals = data["totals"]
+        lines: list[str] = [
+            f"# 运行结果统计 · {data['tag']}",
+            "",
+            f"开始时间：{data['started_at']}",
+            "",
+            f"> **{self.headline()}**",
+            "",
+            "## 总览",
+            "",
+            "| 指标 | 值 |",
+            "| --- | --- |",
+            f"| 任务数 | {totals['jobs']} |",
+            f"| 筛选后合计 | {totals['slots']} 个盘 |",
+            f"| 跳过 | {totals['skipped']} 个 |",
+            f"| 处理 | {totals['processed']} 个 |",
+            f"| 成功（{KEPT_NOTE}） | {data['max_level_kept']} 件 |",
+            f"| 弃置（{DISCARD_NOTE}） | {counts[OUTCOME_DISCARDED]} 件 |",
+            f"| 总耗时 | {format_duration(data['seconds'])} |",
+            "",
+            "## 逐任务",
+            "",
+            "| # | 号位 | 套装 | 主词条 | 筛选后 | 跳过 | 处理 | 用时 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for job in data["jobs"]:
+            lines.append(
+                f"| {job['index']} | {job['slot']} 号位 | "
+                f"{'、'.join(job['sets']) or '不限'} | "
+                f"{'、'.join(job['mainstats']) or '不限'} | "
+                f"{job['slots']} | {job['skipped']} | {job['processed']} | "
+                f"{format_duration(job['seconds'])} |"
+            )
+        lines += [
+            "",
+            "## 结果明细",
+            "",
+            "| 结果 | 件数 | 口径 |",
+            "| --- | --- | --- |",
+            f"| 成功 | {data['max_level_kept']} | {KEPT_NOTE} |",
+            f"| 弃置 | {counts[OUTCOME_DISCARDED]} | {DISCARD_NOTE} |",
+            f"| 跳过 | {counts[OUTCOME_SKIPPED]} | 不满足条件，未改动 |",
+            f"| 中断 | {counts[OUTCOME_FAILED]} | 素材不足等中途停止 |",
+            f"| 未完成 | {data['unfinished']} | 未走完流程，不计入等级分布 |",
+            "",
+            f"- 本轮实际打上弃置标记：**{data['discard_labels']}** 次"
+            f"（和上面的「弃置」不是一个数）",
+            "",
+            "## 最终等级分布",
+            "",
+        ]
+        dist = data["level_distribution"]
+        if dist:
+            lines += ["| 等级 | 件数 |", "| --- | --- |"]
+            lines += [f"| {level} 级 | {n} |" for level, n in dist.items()]
+        else:
+            lines.append("（无：本轮没有走完流程的盘）")
+        lines += [
+            "",
+            "## 单件升级耗时（按到达档位）",
+            "",
+            "| 档位 | 次数 | 平均 | 最快 | 最慢 | 波动 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        stage = data["stage_seconds"]
+        for level in STAGE_LEVELS:
+            stat = stage.get(str(level))
+            if stat and stat.get("n"):
+                lines.append(
+                    f"| 升到 {level} 级 | {stat['n']} | {_cell(stat['mean'])}s | "
+                    f"{_cell(stat['min'])}s | {_cell(stat['max'])}s | ±{stat['spread'] * 100:.0f}% |"
+                )
+            else:
+                lines.append(f"| 升到 {level} 级 | 0 | — | — | — | — |")
+        lines.append("")
+        by_final = data["disc_seconds_by_final_level"]
+        if by_final:
+            lines += [
+                "## 整件盘耗时（按最终等级）",
+                "",
+                "| 最终等级 | 件数 | 平均 | 最快 | 最慢 | 波动 |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+            for level, stat in by_final.items():
+                lines.append(
+                    f"| {level} 级 | {stat['n']} | {_cell(stat['mean'])}s | "
+                    f"{_cell(stat['min'])}s | {_cell(stat['max'])}s | ±{stat['spread'] * 100:.0f}% |"
+                )
+            lines.append("")
+        lines += self._markdown_group("长动作耗时（真实墙钟，大块时间都在这）", data["long_actions"])
+        lines += self._markdown_group("步骤耗时（距上一步的间隔，粒度细）", data["steps"])
+        lines += [
+            "## 说明",
+            "",
+            "- 长动作与步骤耗时口径不同，**会重叠，别相加**。",
+            f"- 「成功」= {KEPT_NOTE}；「弃置」= {DISCARD_NOTE}。",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def write_report(self, path: Path) -> Path | None:
+        """写人类可读报告（Markdown）。"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(self.report_text(), encoding="utf-8")
+            temp.replace(path)
+            return path
+        except Exception:  # noqa: BLE001 - 统计写不出去不该影响任务
+            return None
 
     def write(self, path: Path) -> Path | None:
         try:

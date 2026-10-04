@@ -1282,3 +1282,26 @@ def test_read_layout_ignores_non_dict(qapp: QApplication, tmp_path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("[1, 2, 3]", encoding="utf-8")
     assert read_layout() == {}
+
+
+def test_run_status_swaps_to_result_stats_when_finished(qapp: QApplication, tmp_path) -> None:
+    """跑完：结果统计顶掉「运行状态/当前任务/已处理」三行；运行中收起详细区。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+
+    running = {"phase": "running", "processed": 1, "max_discs": 10, "message": "处理中"}
+    window._show_run_status(running)
+    assert "运行状态：running" in window.run_status_label.text()
+    assert window.run_stats_view.isHidden()
+
+    report = "# 运行结果统计 · t\n\n> **共计耗时 1 分 00 秒**\n\n## 总览\n"
+    window._show_run_status(
+        {"phase": "completed", "stats_report": report, "stats_headline": "共计耗时 1 分 00 秒"}
+    )
+    assert not window.run_stats_view.isHidden()
+    assert window.run_status_label.text() == "共计耗时 1 分 00 秒"
+    assert "总览" in window.run_stats_view.toPlainText()
+    assert window._shown_report == report
+
+    # 下一轮开始：详细区必须收起来，别把上一轮的报告留在屏上
+    window._show_run_status(running)
+    assert window.run_stats_view.isHidden()

@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QSplitter,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -1022,6 +1023,8 @@ class MainWindow(QMainWindow):
         self._controller = None
         self._close_after_run = False
         self._task_status = None
+        # 上次渲染过的结果统计报告，避免每秒刷新时反复重排（会丢滚动位置）。
+        self._shown_report: str | None = None
         from zzz_ddtool.capturebridge import install_capture_bridge
 
         install_capture_bridge()
@@ -1986,8 +1989,16 @@ class MainWindow(QMainWindow):
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
         self.status.setWordWrap(True)
+        # 结果统计详细区：跑完才展开，可滚动；运行期间不占位。
+        self.run_stats_view = QTextBrowser()
+        self.run_stats_view.setObjectName("stats")
+        self.run_stats_view.setOpenExternalLinks(False)
+        self.run_stats_view.setMinimumHeight(140)
+        self.run_stats_view.setMaximumHeight(260)
+        self.run_stats_view.setVisible(False)
         footer.addWidget(self.status)
         footer.addWidget(self.run_status_label)
+        footer.addWidget(self.run_stats_view)
         self._run_timer = QTimer(self)
         self._run_timer.setInterval(1000)
         self._run_timer.timeout.connect(self._refresh_run_status)
@@ -2067,7 +2078,30 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
 
+    def _show_stats_report(self, headline: str, report: str) -> None:
+        """跑完：状态栏换成结果统计——上面一行摘要，下面可滚动的详细报告。"""
+        self.run_status_label.setText(headline or "运行结束")
+        self.run_status_label.setWordWrap(True)
+        if report != self._shown_report:
+            self._shown_report = report
+            self.run_stats_view.setMarkdown(report)
+            self.run_stats_view.verticalScrollBar().setValue(0)
+        # 判据用 isHidden（显式隐藏标志）：isVisible 在窗口还没 show 时恒为 False。
+        if self.run_stats_view.isHidden():
+            self.run_stats_view.setVisible(True)
+
+    def _hide_stats_report(self) -> None:
+        """运行中/无统计：收起详细区，状态栏回到进度显示。"""
+        if not self.run_stats_view.isHidden():
+            self.run_stats_view.setVisible(False)
+        self._shown_report = None
+
     def _show_run_status(self, data: dict) -> None:
+        report = data.get("stats_report")
+        if report:
+            self._show_stats_report(data.get("stats_headline", ""), report)
+            return
+        self._hide_stats_report()
         row, col = data.get("global_row"), data.get("global_col")
         where = f"全局{row}行{col}列  " if row else ""
         viewport = data.get("viewport_top_row")

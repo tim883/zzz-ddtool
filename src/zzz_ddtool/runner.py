@@ -162,8 +162,14 @@ class Runner:
 
     _status_lines: list[str] = []
 
-    def _set_status(self, phase: str, message: str = "", cell: str = "") -> None:
-        """运行状态三处落点：run-status.json + 游戏画面悬浮层 + 日志。"""
+    def _set_status(
+        self, phase: str, message: str = "", cell: str = "", report: str = ""
+    ) -> None:
+        """运行状态三处落点：run-status.json + 游戏画面悬浮层 + 日志。
+
+        report：跑完后的结果统计（Markdown）。只在收尾那一次带上，界面据此把状态栏
+        换成结果统计；运行中的状态不带它，界面照旧显示进度。
+        """
         stamp = time.strftime("%H:%M:%S")
         line = " ".join(x for x in (stamp, cell, phase, message) if x)
         self._status_lines.append(line)
@@ -180,6 +186,9 @@ class Runner:
         }
         if self._state is not None:
             payload.update(self._state.status_payload())
+        if report:
+            payload["stats_report"] = report
+            payload["stats_headline"] = self.stats.headline()
         if self.on_status is not None:
             self.on_status(dict(payload))
         try:
@@ -348,17 +357,17 @@ class Runner:
             if self.hotkeys is not None:
                 self.hotkeys.close()
             self.trace.finish()
-            self._finish_stats(run_started)
-            self._set_status(self.outcome, self.end_reason)
+            report = self._finish_stats(run_started)
+            self._set_status(self.outcome, self.end_reason, report=report)
             logging.getLogger("zzz_ddtool").removeHandler(overlay_handler)
             overlay_handler.close()
         self.log.info("run %s processed=%d", self.outcome, self._processed)
         return list(self.results)
 
-    def _finish_stats(self, run_started: float) -> None:
-        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON。
+    def _finish_stats(self, run_started: float) -> str:
+        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 人类可读报告。
 
-        统计本身出问题不影响任务结果，所以整段兜住异常只记一条警告。
+        返回报告文本（Markdown）给界面展示。统计出问题不影响任务结果，只记一条警告。
         """
         try:
             self.stats.seconds = time.monotonic() - run_started
@@ -367,8 +376,17 @@ class Runner:
             target = self.stats.write(stats_dir() / f"{self.stats.tag}.json")
             if target is not None:
                 self.log.info("统计已写入 %s", target)
+            else:
+                self.log.warning("结构化统计写入失败（不影响本轮结果）")
+            report_path = self.stats.write_report(stats_dir() / f"{self.stats.tag}.md")
+            if report_path is not None:
+                self.log.info("人类可读报告已写入 %s", report_path)
+            else:
+                self.log.warning("人类可读报告写入失败（不影响本轮结果）")
+            return self.stats.report_text()
         except Exception:
             self.log.warning("运行统计生成失败（不影响本轮结果）", exc_info=True)
+            return ""
 
     def _valid_max_pages(self) -> bool:
         value = self.preset.max_pages
@@ -1278,6 +1296,9 @@ class Runner:
         press_key_once(hwnd, VK_R)
         time.sleep(0.5)
         self.log.info("discard label=%s (R)", value)
+        if value:
+            # 「判定为弃置」和「真打上标记」不是一个数，这里只数后者。
+            self.stats.note_discard_label()
         return True
 
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
