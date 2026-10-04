@@ -1297,10 +1297,6 @@ class MainWindow(QMainWindow):
         self._main_splitter.setHandleWidth(6)
         self._main_splitter.setSizes([500, 270])
         self._lower_height = 270
-        # 窗口能缩到的最矮高度。**只有下限、没有上限**：上限一设（日志封顶那会儿）
-        # 窗口的可拉伸范围会被两头夹到一百来像素，Windows 就把「拖边框」退化成
-        # 「移动窗口」了。下限的算法见 _update_window_min_height。
-        self._window_min_height = 0
         # 收起日志前下半块的高度：展开时按它还回来。None = 还没收起过。
         self._log_lower_height = None
         self._dragging_main_splitter = False
@@ -1368,7 +1364,7 @@ class MainWindow(QMainWindow):
             self._layout_timer.start(800)
 
     def _remember_lower_height(self, lower_height: int | None = None) -> None:
-        """记下红线以下那块的高度，拖红框时照它锁住；顺手刷新窗口的最小高度。
+        """记下红线以下那块的高度，拖红框时照它锁住。
 
         `lower_height` 只在刚改过分隔条、几何还没落定时显式传入（`sizes()` 有延迟，
         读早了会拿到旧值，拖红框时按错基准算出错误的窗口高度）。
@@ -1376,30 +1372,6 @@ class MainWindow(QMainWindow):
         if lower_height is None:
             lower_height = self._lower_pane.height()
         self._lower_height = lower_height
-        self._update_window_min_height()
-
-    def _update_window_min_height(self) -> None:
-        """算出窗口最矮能到多少，记在实例上。
-
-        缩窗口时 QSplitter 先抽下半块（stretch=1）；下半块一触到自己的最小高度，
-        它就转而抽上半块——三栏就被压扁了。所以下限顶在「下半块刚好让完」的位置：
-        再往下拖就弹回来，三栏永不被挤。
-
-        限值只在 resizeEvent 里当钳制用，**不调 setMinimumHeight**——把窗口钉住会让
-        Windows 把拖边框退化成移动窗口。这里只记数字，窗口对系统始终是"可自由拉伸"。
-        """
-        if not self._layout_ready:
-            return
-        floor = self._lower_pane.minimumSizeHint().height()
-        shrinkable = max(0, self._lower_pane.height() - floor)
-        self._window_min_height = max(0, self.height() - shrinkable)
-
-    def _clamp_window_min_height(self) -> bool:
-        """窗口被拖到下限以下就弹回来。返回是否真的弹过。"""
-        if self.height() >= self._window_min_height:
-            return False
-        self.resize(self.width(), self._window_min_height)
-        return True
 
     def eventFilter(self, obj, event) -> bool:  # noqa: ANN001
         """接管红框下边那条分隔条：自己按鼠标位移拖，不走 QSplitter 的夹取。
@@ -1420,9 +1392,6 @@ class MainWindow(QMainWindow):
                 return True
             if kind == QEvent.Type.MouseButtonRelease and self._red_drag_global_y is not None:
                 self._red_drag_global_y = None
-                # 松手后再量一次下半块：拖动期间窗口大小是我在补，没走过 resizeEvent
-                # 的记账，窗口最小高度还停在拖动前的旧值，下一次拖窗口边就会按错基准弹。
-                QTimer.singleShot(0, self._remember_lower_height)
                 self._queue_layout_save()
                 return True
         return super().eventFilter(obj, event)
@@ -1446,11 +1415,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
-        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记、也别钳。
+        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
         if self._layout_ready and not self._dragging_main_splitter:
-            # 拖窗口底边往上：缩到下限以下就弹回来（三栏永不被挤）。往下拉没有上限。
-            if self._clamp_window_min_height():
-                return  # 这次是被弹回来的，别再拿它当基准记账
             QTimer.singleShot(0, self._remember_lower_height)
         self._queue_layout_save()
 
