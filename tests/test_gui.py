@@ -769,7 +769,7 @@ def test_number_spinboxes_ignore_mouse_wheel(qapp: QApplication) -> None:
 
 
 def test_qualifying_ids_match_generate_plus_select_visible(qapp: QApplication, tmp_path) -> None:
-    """「全勾全部任务」的口径必须与「生成组合 + 全选当前可见」逐位一致。
+    """「全任务卡片全选」的口径必须与「生成组合 + 全选当前可见」逐位一致。
 
     纯函数 qualifying_pattern_ids 是那个按钮唯一的核心逻辑，这里把当前任务
     当成其中一个任务，拿界面真做出来的可见集合去对齐——口径一歪，按钮批量
@@ -818,6 +818,8 @@ def test_select_all_jobs_covers_every_task_and_spares_new_ones(qapp: QApplicatio
     }))
     assert window.select_all_jobs_btn.isEnabled()
 
+    # 按钮点击会先弹二次确认，测试里把它短路掉（确认弹窗本身另有守卫）
+    window._confirm_select_all_jobs = lambda: True  # type: ignore[method-assign]
     window.select_all_jobs_btn.click()
     wait_until(qapp, lambda: window._utility_thread is None)
 
@@ -843,6 +845,52 @@ def test_select_all_jobs_disabled_when_chain_empty(qapp: QApplication, tmp_path)
     assert not window.select_all_jobs_btn.isEnabled()
     window._select_all_jobs()
     assert "任务链是空的" in window.status.text()
+    window.close()
+
+
+def test_select_all_jobs_cancelled_changes_nothing(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """二次确认点取消 = 一个字都不改，也不该起后台线程。"""
+    from zzz_ddtool.config import preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({
+        "task_chain": [{"slot": 4, "weights": {"暴击率": 1.0}}],
+    }))
+    job = window._jobs[0]
+    assert job.accepted is None
+
+    asked: list[int] = []
+
+    def reject(self):  # noqa: ANN001
+        asked.append(len(self._jobs))
+        return False
+
+    monkeypatch.setattr(MainWindow, "_confirm_select_all_jobs", reject)
+    window._select_all_jobs()
+
+    assert asked == [1]  # 确实问了
+    assert job.accepted is None  # 但没有改
+    assert window._utility_thread is None  # 也没启动后台
+    assert "已取消" in window.status.text()
+    window.close()
+
+
+def test_select_all_jobs_button_renamed_and_hint_moved_to_dialog(qapp: QApplication, tmp_path) -> None:
+    """按钮改名 + 悬停提示撤掉，提示语搬进二次确认弹窗正文。"""
+    from PySide6.QtWidgets import QLabel
+
+    from zzz_ddtool.gui import SELECT_ALL_JOBS_HINT, ConfirmSelectAllDialog
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert window.select_all_jobs_btn.text() == "全任务卡片全选"
+    assert window.select_all_jobs_btn.toolTip() == ""
+
+    assert SELECT_ALL_JOBS_HINT.strip()
+    dialog = ConfirmSelectAllDialog(3, window)
+    texts = [label.text() for label in dialog.findChildren(QLabel)]
+    assert any(SELECT_ALL_JOBS_HINT == text for text in texts)
+    assert any("3 个任务" in text for text in texts)
+    dialog.close()
     window.close()
 
 

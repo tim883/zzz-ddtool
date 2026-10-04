@@ -769,7 +769,7 @@ class StageSection(QWidget):
     def resync_checks(self, is_checked) -> None:  # noqa: ANN001
         """按策略重铺全部勾选态：不重建卡片、不重置页码。
 
-        用在「名单变了、卡片本身没变」的场合——比如「全勾全部任务」批量写入后，
+        用在「名单变了、卡片本身没变」的场合——比如「全任务卡片全选」批量写入后，
         当前任务的 accepted 换了，权重和门槛没动，卡片不用重算，只把勾选反映出来。
         """
         self._checked = {pid for pid in self._ids if is_checked(pid)}
@@ -1075,6 +1075,43 @@ class SetPickerDialog(QDialog):
 
     def selected(self) -> list[str]:
         return [tile.name for tile in self._tiles if tile.name in self._picked]
+
+
+# 「全任务卡片全选」的提示语：原来挂在这颗按钮的悬停提示上，现在改成二次确认
+# 弹窗的正文——这个动作会覆盖全部任务现有的勾选，值得挡一下。
+SELECT_ALL_JOBS_HINT = (
+    "对任务链里的每个任务：按它自己的权重生成组合，"
+    "再把符合它自己本档要求的卡片全部勾上。\n"
+    "会覆盖这些任务现有的勾选；之后新建的任务不受影响。"
+)
+
+
+class ConfirmSelectAllDialog(QDialog):
+    """「全任务卡片全选」的二次确认：把原本的悬停提示写进弹窗正文。"""
+
+    def __init__(self, job_count: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("全任务卡片全选")
+        self.setMinimumWidth(430)
+
+        layout = QVBoxLayout(self)
+        lead = QLabel(f"将对任务链里现有的全部 {job_count} 个任务执行：")
+        lead.setWordWrap(True)
+        layout.addWidget(lead)
+
+        hint = QLabel(SELECT_ALL_JOBS_HINT)
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("全选")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 def qualifying_pattern_ids(
@@ -1939,17 +1976,25 @@ class MainWindow(QMainWindow):
         sets = tuple(self._filter_sets)
         self._apply_to_all("套装", lambda job: setattr(job, "sets", sets))
 
+    def _confirm_select_all_jobs(self) -> bool:
+        """二次确认。单独成方法，测试里覆盖掉它就不用真弹窗。"""
+        return ConfirmSelectAllDialog(len(self._jobs), self).exec() == QDialog.DialogCode.Accepted
+
     def _select_all_jobs(self) -> None:
         """跨全部任务：各自生成组合，再把符合本档要求的卡片全部勾上。
 
         口径 =「生成组合 + 全选当前可见」，逐个任务按**它自己的**权重和本档
         要求各跑一遍（部位不同，屏蔽的副词条也不同，不能共用当前界面那套）。
+        会覆盖这些任务现有的勾选，执行前先弹二次确认。
         一次性的：只处理此刻已有的任务；之后新建的任务依旧是空的（accepted
         为 None，运行时走分数判定），不受这次影响。
         """
         self._commit_editor()
         if not self._jobs:
-            self.status.setText("任务链是空的：先新建任务，再批量全勾。")
+            self.status.setText("任务链是空的：先新建任务，再批量全选。")
+            return
+        if not self._confirm_select_all_jobs():
+            self.status.setText("已取消：没有改动任何任务。")
             return
         # 快照成纯数据再进后台线程——那边不能碰界面控件。
         plans = [
@@ -2165,12 +2210,8 @@ class MainWindow(QMainWindow):
         self._task_controls.append(self.refresh_cards_btn)
         # 跨全部任务的批量全勾：每个任务按它自己的权重和本档要求各算一遍。
         # 会覆盖这些任务现有的勾选，所以进 _apply_buttons —— 任务链空了就置灰。
-        self.select_all_jobs_btn = QPushButton("全勾全部任务")
-        self.select_all_jobs_btn.setToolTip(
-            "对任务链里的每个任务：按它自己的权重生成组合，"
-            "再把符合它自己本档要求的卡片全部勾上。\n"
-            "会覆盖这些任务现有的勾选；之后新建的任务不受影响。"
-        )
+        # 提示语不挂悬停，改由点击后的二次确认弹窗承载（见 ConfirmSelectAllDialog）。
+        self.select_all_jobs_btn = QPushButton("全任务卡片全选")
         self.select_all_jobs_btn.clicked.connect(self._select_all_jobs)
         self._task_controls.append(self.select_all_jobs_btn)
         self._apply_buttons.append(self.select_all_jobs_btn)
