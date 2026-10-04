@@ -21,7 +21,7 @@ from zzz_ddtool.capture import find_game_hwnd, grab_game_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
-from zzz_ddtool.gamefilter import apply_game_filter
+from zzz_ddtool.gamefilter import apply_game_filter, reset_game_filter
 from zzz_ddtool.substatfilter import plan_substat_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import (
@@ -196,6 +196,13 @@ class Runner:
         self._hwnd = int(hwnd)
         self._pid = window_pid(self._hwnd)
         self.log.info("bound game instance hwnd=%s pid=%s", self._hwnd, self._pid)
+        # 游戏若以管理员运行而本工具是普通权限，UIPI 会静默拦掉全部输入，
+        # 现场表现是「导航转 8 圈失败」，极易被误当成识别/导航 bug。这里先拦。
+        from zzz_ddtool.wininput import input_blocked_reason
+
+        blocked = input_blocked_reason(self._hwnd)
+        if blocked:
+            raise RunnerError(blocked)
         return self._hwnd
 
     def _grab(self, allow_esc: bool = True, need_page: bool = True):
@@ -337,6 +344,10 @@ class Runner:
         except NavError as exc:
             self.trace.fail("unknown", "navigate", str(exc))
             raise RunnerError(f"导航失败：{exc}") from exc
+
+        # 滚轮协议必须在设置筛选之前备好：标定要选第 3 行的盘做锚点，而筛选会把列表
+        # 裁短（实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点，标定必失败。
+        self._ensure_profile(hwnd)
 
         image, page, method, _hwnd = self._grab()
         sub_preset = self._sub_preset(job)
@@ -506,13 +517,23 @@ class Runner:
 
     # ---------------------------------------------------------------- 导航准备
 
-    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile:
-        """置顶 → 复核原点布局 → 复用或标定协议 → 再次置顶（spec §5.1）。
+    def _ensure_profile(self, hwnd: int) -> None:
+        """备好滚轮协议（每次 run 只做一次）。
 
-        标定/检查结束必须再次置顶，才获取正式首批网格。
+        **必须在设置筛选之前调用**：标定要选第 3 行的盘做锚点，筛选会把列表裁短
+        （实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点，标定必失败。
+        标定只取决于网格布局、与列表内容无关，满屏时做最稳。
         """
+        if self._profile is not None:
+            return
+        # 标定要求列表满屏：上一轮可能残留筛选条件把列表裁短（实测只剩 16/3000，
+        # 第 3 行锚点落在空格上），所以先重置一次筛选。只做一次（首个任务）。
+        image, _method, _hwnd = grab_game_image(hwnd)
+        reset_game_filter(hwnd, image.width(), image.height())
+        self.trace.ok("drive_disc", "filter", "标定前重置筛选")
         env = probe_environment(hwnd)
-        reset_to_top(hwnd)
+        # 不在这里置顶：calibrate 内部每个候选都会自己 reset_to_top，而 measure_layout
+        # 只看网格几何、与列表滚到哪无关。
         image, _method, _hwnd = grab_game_image(hwnd)
         origin, pitch = measure_layout(image)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
@@ -536,6 +557,29 @@ class Runner:
                 except OSError as exc:
                     self.log.warning("导航缓存写入失败（%s），仅本轮使用", exc)
         # 每任务以本轮实测布局为准（缓存不决定原点，spec §5.1 第 168 行）
+        self._profile = replace(
+            profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y
+        )
+
+    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile:
+        """置顶 → 以本轮实测布局复核 → 再次置顶（spec §5.1）。
+
+        滚轮协议已由 `_ensure_profile` 在筛选前备好，这里只复核当次布局并再次置顶，
+        才获取正式首批网格。
+        """
+        reset_to_top(hwnd)
+        image, _method, _hwnd = grab_game_image(hwnd)
+        origin, pitch = measure_layout(image)
+        reason = check_layout_reference(origin, pitch, image.width(), image.height())
+        if reason:
+            self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)
+            raise RunnerError(f"网格布局不受支持：{reason}，停止任务链")
+        self._origin_center_y = float(origin)
+        self._row_pitch = float(pitch)
+
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("滚轮协议未就绪，停止任务链")
         profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
         self._profile = profile
         state.navigation_profile = profile.as_dict()
@@ -1114,6 +1158,33 @@ class Runner:
         self.trace.fail(page, "parse", f"重试耗尽：{reason}", image=image)
         raise RunnerError(f"{page} 识别失败：{reason}，停止任务链")
 
+    # 「材料返还」确认弹窗：盘升到满级时，多出来的强化素材会返还并弹一个确认框，
+    # 把强化页整个盖住，OCR 在等级/副属性几个区域全都读 0 行，误报「未识别出盘面」
+    # 打断整条任务链（2026-10-04 全链路实测：处理到第 4 件、12→15 满级后弹出）。
+    # 注意游戏文案是「返还」不是「退还」，标题 OCR 实测 (898,404,1021,442) score=1.00。
+    MATERIAL_REFUND_TITLE = "材料返还"
+
+    def _dismiss_material_refund(self, hwnd: int, image: QImage) -> bool:
+        """识别「材料返还」确认弹窗并点「确认」；没这个弹窗就返回 False。
+
+        只在盘面识别失败之后调用——全窗口 OCR 约 1.5s，正常路径不付这个代价。
+        「确认」按钮靠 OCR 找字点中心，不硬编坐标：弹窗高度随退还材料行数变。
+        """
+        from zzz_ddtool import ocr as _ocr
+
+        lines = _ocr.read_rect(image, (0, 0, image.width(), image.height()))
+        if not any(self.MATERIAL_REFUND_TITLE in line.text.replace(" ", "") for line in lines):
+            return False
+        for line in lines:
+            if "确认" in line.text.replace(" ", ""):
+                click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+                self.log.info("材料返还弹窗：已点「确认」")
+                self.trace.ok("upgrade", "refund", "材料返还弹窗已确认")
+                time.sleep(0.5)
+                return True
+        self.log.warning("检测到「材料返还」但没找到「确认」按钮，交回调用方报错")
+        return False
+
     # 详情页右下大按钮（查看/强化，永远存在），OCR 实测标定
     UPGRADE_BTN_AREA = (1550, 780, 1900, 880)
     # 缩放页「等级00」文字区，>> 箭头在它右侧约 110px（实拍：文字 right≈1305，箭头中心≈1416）
@@ -1356,7 +1427,15 @@ class Runner:
         rechecks = 0
         while True:
             image, *_ = self._grab(allow_esc=False, need_page=False)
-            disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
+            try:
+                disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
+            except RunnerError:
+                # 满级时游戏会弹「材料返还」确认框盖住强化页：先点掉它再重读一次；
+                # 不是这个弹窗就原样抛出（识别不出就是识别不出，不掩盖）。
+                if not self._dismiss_material_refund(hwnd, image):
+                    raise
+                image, *_ = self._grab(allow_esc=False, need_page=False)
+                disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
             if self._detail_disc is not None:
                 disc = replace(
                     disc,

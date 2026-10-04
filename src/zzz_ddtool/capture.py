@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import time
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +17,7 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
 DIB_RGB_COLORS = 0
 BI_RGB = 0
+SRCCOPY = 0x00CC0020
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -152,13 +152,57 @@ def _is_mostly_black(image) -> bool:
     return hits >= samples - 1
 
 
-def _print_window(hwnd: int):
+def _looks_like_blank(image) -> bool:
+    """近似纯色（空白图）检测。
+
+    PrintWindow 被拒时会抓到白底/空白的无效帧，它不是"全黑"，旧的黑图判据
+    拦不住，会被当成正常帧送进 OCR。真实游戏画面缩到 24×14 也有几十种颜色，
+    空白图只有寥寥数种；每通道 >>4 量化后超过 4 种即认为画面有内容。
+    """
+    width = image.width()
+    height = image.height()
+    if width < 8 or height < 8:
+        return True
+    small = image.scaled(24, 14)
+    kinds = set()
+    for y in range(small.height()):
+        for x in range(small.width()):
+            color = small.pixelColor(x, y)
+            kinds.add((color.red() >> 4, color.green() >> 4, color.blue() >> 4))
+            if len(kinds) > 4:
+                return False
+    return True
+
+
+def _looks_unusable(image) -> bool:
+    """黑图或空白图都算无效帧。"""
+    return _is_mostly_black(image) or _looks_like_blank(image)
+
+
+def _read_bitmap(mem_dc: int, bitmap: int, width: int, height: int):
     from PySide6.QtGui import QImage
 
-    width, height = client_size(hwnd)
-    if width < 8 or height < 8:
+    info = BITMAPINFO()
+    info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    info.bmiHeader.biWidth = width
+    info.bmiHeader.biHeight = -height
+    info.bmiHeader.biPlanes = 1
+    info.bmiHeader.biBitCount = 32
+    info.bmiHeader.biCompression = BI_RGB
+    buf = (ctypes.c_char * (width * height * 4))()
+    copied = gdi32.GetDIBits(
+        mem_dc, bitmap, 0, height, buf, ctypes.byref(info), DIB_RGB_COLORS
+    )
+    if copied != height:
         return None
+    return QImage(buf, width, height, width * 4, QImage.Format.Format_RGB32).copy()
 
+
+def _gdi_grab(width: int, height: int, paint):
+    """建一块兼容屏幕的 32 位位图，paint(mem_dc, screen_dc) 把内容画进去再读回。
+
+    PrintWindow 与 BitBlt 两种取图方式共用这段 DC-位图-回读样板。
+    """
     screen_dc = user32.GetDC(0)
     if not screen_dc:
         return None
@@ -174,36 +218,54 @@ def _print_window(hwnd: int):
 
     old = gdi32.SelectObject(mem_dc, bitmap)
     try:
-        ok = user32.PrintWindow(hwnd, mem_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT)
-        if not ok:
+        if not paint(mem_dc, screen_dc):
             return None
-
-        info = BITMAPINFO()
-        info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        info.bmiHeader.biWidth = width
-        info.bmiHeader.biHeight = -height
-        info.bmiHeader.biPlanes = 1
-        info.bmiHeader.biBitCount = 32
-        info.bmiHeader.biCompression = BI_RGB
-        buf = (ctypes.c_char * (width * height * 4))()
-        copied = gdi32.GetDIBits(
-            mem_dc,
-            bitmap,
-            0,
-            height,
-            buf,
-            ctypes.byref(info),
-            DIB_RGB_COLORS,
-        )
-        if copied != height:
-            return None
-        image = QImage(buf, width, height, width * 4, QImage.Format.Format_RGB32)
-        return image.copy()
+        return _read_bitmap(mem_dc, bitmap, width, height)
     finally:
         gdi32.SelectObject(mem_dc, old)
         gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(mem_dc)
         user32.ReleaseDC(0, screen_dc)
+
+
+def _print_window(hwnd: int):
+    width, height = client_size(hwnd)
+    if width < 8 or height < 8:
+        return None
+
+    def paint(mem_dc, _screen_dc):
+        return bool(user32.PrintWindow(hwnd, mem_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT))
+
+    return _gdi_grab(width, height, paint)
+
+
+def _client_screen_rect(hwnd: int):
+    """客户区在屏幕上的矩形 (x, y, w, h)；取不到返回 None。"""
+    width, height = client_size(hwnd)
+    if width < 8 or height < 8:
+        return None
+    point = wintypes.POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(point)):
+        return None
+    return point.x, point.y, width, height
+
+
+def _bitblt_screen(hwnd: int):
+    """从屏幕 DC 拷贝客户区。
+
+    不打开目标进程，天然不受 UIPI 限制——游戏提权运行时 PrintWindow 会被
+    ERROR_ACCESS_DENIED(5) 拒绝，这条路仍可用。前提：窗口可见且在最前
+    （_restore_window 负责），否则拷到的是遮挡窗口的像素。
+    """
+    rect = _client_screen_rect(hwnd)
+    if rect is None:
+        return None
+    x, y, width, height = rect
+
+    def paint(mem_dc, screen_dc):
+        return bool(gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY))
+
+    return _gdi_grab(width, height, paint)
 
 
 def _grab_screen_region(hwnd: int):
@@ -225,29 +287,73 @@ def _grab_screen_region(hwnd: int):
 
 
 def _restore_window(hwnd: int) -> None:
-    """游戏窗口最小化时先恢复并提到前台，否则 PrintWindow 截不到（客户区 0×0）。"""
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        time.sleep(0.4)
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.25)
+    """截图前把游戏恢复并提到前台。
+
+    BitBlt 屏幕路径要求窗口可见且在最前。裸 SetForegroundWindow 在新 Windows
+    上会被前台锁拒绝（返回 0），画面就落到别的窗口上——复用 wininput 的强激活
+    （AttachThreadInput + 解锁前台 + Alt 兜底），与点击前用的是同一套。
+    """
+    from zzz_ddtool.wininput import InputError, focus_window, is_foreground
+
+    if is_foreground(hwnd):
+        return
+    try:
+        focus_window(hwnd)
+    except InputError as exc:
+        raise CaptureError(str(exc)) from exc
+
+
+_overlay_hooks = None
+
+
+def set_overlay_hooks(hide, restore) -> None:
+    """注册悬浮层的隐藏/恢复回调（由 overlay 模块在窗口建好后调用）。
+
+    改用屏幕 BitBlt 截屏后，工具自己的悬浮日志窗会被一起截进画面、污染 OCR。
+    Win10 2004+ / Win11 上浮层用 WDA_EXCLUDEFROMCAPTURE 排除在捕获外（hide 直接
+    返回 False，画面不闪）；老系统上 hide 才真正把浮层藏起来。分层上 capture
+    不认识 overlay，只持有回调。
+    """
+    global _overlay_hooks
+    _overlay_hooks = (hide, restore)
+
+
+def _suspend_overlay() -> bool:
+    if _overlay_hooks is None:
+        return False
+    try:
+        return bool(_overlay_hooks[0]())
+    except Exception:
+        return False
+
+
+def _resume_overlay(hidden: bool) -> None:
+    if _overlay_hooks is None:
+        return
+    try:
+        _overlay_hooks[1](hidden)
+    except Exception:
+        pass
 
 
 def grab_game_image(hwnd: int | None = None):
-    from PySide6.QtWidgets import QApplication
-
-    global _qt_app
-    if QApplication.instance() is None:
-        _qt_app = QApplication([])  # CLI 保持强引用，避免被回收
     target = hwnd if hwnd is not None else find_game_hwnd()
     _restore_window(target)
-    image = _print_window(target)
-    method = "printwindow"
-    if image is None or _is_mostly_black(image):
-        image = _grab_screen_region(target)
-        method = "grabwindow"
-        if _is_mostly_black(image):
-            raise CaptureError("窗口截到的是黑图。改成窗口化再试。")
+    overlay_hidden = _suspend_overlay()
+    try:
+        image = _print_window(target)
+        method = "printwindow"
+        if image is None or _looks_unusable(image):
+            # 提权运行的游戏会把 PrintWindow 拒成 ERROR_ACCESS_DENIED；
+            # 屏幕 BitBlt 不打开目标进程，可兜底。窗口已由 _restore_window 提到最前。
+            image = _bitblt_screen(target)
+            method = "bitblt"
+            if image is None or _looks_unusable(image):
+                raise CaptureError(
+                    "窗口截到的是黑图/空白图。确认游戏窗口化、可见、没有被别的窗口挡住。"
+                )
+    finally:
+        _resume_overlay(overlay_hidden)
     get_logger("zzz_ddtool.capture").debug(
         "截屏 %s %dx%d hwnd=%s", method, image.width(), image.height(), target
     )

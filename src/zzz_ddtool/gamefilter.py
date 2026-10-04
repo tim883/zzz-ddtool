@@ -17,7 +17,16 @@ from zzz_ddtool.layout import (
 )
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.ocr import read_rect
-from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key, wheel_client
+from zzz_ddtool.wininput import (
+    VK_ESCAPE,
+    click_client,
+    client_to_screen,
+    focus_window,
+    press_key,
+    send_wheel_event,
+    user32,
+    wheel_client,
+)
 
 # 筛选面板里「套装 → 点击选择」条的搜索区（面板右半屏）
 FILTER_SETS_BAR = (1300, 260, 1860, 380)
@@ -36,6 +45,15 @@ MAINSTAT_TITLE = "主属性词条"
 SUBSTAT_TITLE = "副属性词条"
 # 把面板滚到主属性区的尝试上限（真机实测 3~4 次滚轮即到底）
 _MAX_PANEL_SCROLLS = 8
+# 面板最下方有一条固定高度的「点击无效带」：落在其中的点击游戏完全不响应（真机实测，
+# 非本工具的坐标 bug）。实测边界（2026-10-04）：按钮中心 y=942 点不动、y=901 能点，
+# 副属性「展开」按钮中心 y=916 点不动——即中心 y≳910 一律无效。
+# 所以面板内任何要点的东西，其底边低于 height-160 时，必须**先滚动把它顶上来再点**，
+# 而不是点了没反应再补救（那样必然失败）。
+_PANEL_CLICK_BOTTOM_GAP = 160
+# 面板一次滑到底连发的滚轮事件条数。真机实测一格约 41px、内容比视口高出约 300px，
+# 8 条足够到底（到顶后会停住，多发无害）。宁可一次发到位，也不要「滚一格→抓图→再滚」。
+_PANEL_SCROLL_NOTCHES = 8
 # 主属性名与词条名的相似度下限，低于它宁可中断也不猜（手册 01 底线）
 _MATCH_CUTOFF = 0.75
 
@@ -327,6 +345,22 @@ def _click_reset(hwnd: int, width: int, height: int) -> None:
     raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
 
 
+def reset_game_filter(hwnd: int, width: int, height: int) -> None:
+    """打开筛选面板 → 点「重置」→ Esc 关闭。
+
+    给滚轮标定用：标定要选第 3 行的盘做锚点，残留的筛选会把列表裁短（实测只剩
+    16/3000），锚点落在空格子上就选不中。标定要求列表满屏，所以先清一次。
+    """
+    fx, fy = scale_point(*FILTER_BTN, width, height)
+    _refuse_dismantle(fx, fy, width, height)
+    click_client(hwnd, fx, fy)
+    time.sleep(0.55)
+    _click_reset(hwnd, width, height)
+    time.sleep(0.45)
+    press_key(hwnd, VK_ESCAPE)
+    time.sleep(0.4)
+
+
 def apply_game_filter(
     hwnd: int,
     width: int,
@@ -382,6 +416,33 @@ def _panel_lines(image: QImage) -> list:
     ]
 
 
+def _read_panel() -> tuple[QImage, list]:
+    """抓一帧并解析出面板行，返回 (image, lines)。"""
+    image, _ = _grab()
+    return image, _panel_lines(image)
+
+
+def _click_line(hwnd: int, line) -> None:
+    click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+
+
+def _scroll_panel_to_bottom(hwnd: int, width: int, height: int) -> None:
+    """一次把筛选面板滑到底：连发滚轮事件，中途不抓图、不重复定位光标。
+
+    面板内容比视口高，底部还有一条「点击无效带」。与其「滚一格 → 抓图 → 还不行 →
+    再滚一格」（每格约 41px，要两三格才够，而每次都要一次全屏 OCR ≈1s），不如一次
+    连发到底：到底后布局固定，按钮与后续选项都落在可点区，下一次 OCR 就能直接定位点击。
+    """
+    sx, sy = client_to_screen(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+    focus_window(hwnd)
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.05)
+    for _ in range(_PANEL_SCROLL_NOTCHES):
+        send_wheel_event(-3)
+        time.sleep(0.06)
+    time.sleep(0.25)
+
+
 def _option_selected(image: QImage, line) -> bool:
     """游戏已选按钮为蓝色。采样文字周围背景，避免把白色文字当选中态。"""
     pad = max(4, round(14 * image.width() / 1920))
@@ -396,34 +457,55 @@ def _option_selected(image: QImage, line) -> bool:
     return blue / max(1, samples) > 0.15
 
 
-def _open_substat_section(hwnd: int, width: int, height: int) -> None:
-    """保留已选主属性并收起其内容，再滚动展开副属性区。"""
-    for _round in range(_MAX_PANEL_SCROLLS + 1):
-        image, _ = _grab()
-        lines = _panel_lines(image)
-        main_y = _title_y(lines, MAINSTAT_TITLE)
-        main_toggle = _toggle_below(lines, main_y) if main_y is not None else None
-        if main_toggle is not None and "收起" in main_toggle.text and (main_toggle.top - main_y) < height / 8:
-            click_client(hwnd, (main_toggle.left + main_toggle.right) // 2, (main_toggle.top + main_toggle.bottom) // 2)
-            time.sleep(0.35)
-            continue
+def _open_substat_section(hwnd: int, width: int, height: int) -> tuple[QImage, list]:
+    """收起主属性区并展开副属性区，返回「已确认展开」那一帧的 (image, lines)。
+
+    面板内容比视口高，底部还有一条「点击无效带」，副属性「点击展开」按钮默认正好压在
+    带上，此时点击**必然**不生效（坐标没错，是游戏不响应）。所以这里**不逐步滚**：
+    需要展开时，先把面板一次滑到底（`_scroll_panel_to_bottom`），再定位点击；到底后
+    布局固定，一次 OCR 就够。返回的帧与 `apply_substat_filter` 的起始状态相同、中间
+    无点击，直接复用可省一次全屏 OCR（约 1s）。
+    """
+    log = get_logger("zzz_ddtool.gamefilter")
+    image, lines = _read_panel()
+
+    # 1) 主属性区若展开，先收起，腾出纵向空间（否则副属性区被挤到视口外）。
+    main_y = _title_y(lines, MAINSTAT_TITLE)
+    main_toggle = _toggle_below(lines, main_y) if main_y is not None else None
+    if main_toggle is not None and "收起" in main_toggle.text and (main_toggle.top - main_y) < height / 8:
+        _click_line(hwnd, main_toggle)
+        time.sleep(0.35)
+        image, lines = _read_panel()
+
+    # 2) 副属性区已展开就直接复用这一帧，不必再动。
+    title_y = _title_y(lines, SUBSTAT_TITLE)
+    toggle = _toggle_below(lines, title_y) if title_y is not None else None
+    near = toggle is not None and title_y is not None and (toggle.top - title_y) < height / 8
+    if near and "收起" in toggle.text:
+        return image, lines
+
+    # 3) 未展开：按钮若压在底部「点击无效带」上（或还没露出来），先一次滑到底，让按钮与
+    #    后续所有选项一起进入可点区，再定位点击；已经可点就别多滚。
+    if not near or toggle.bottom > height - _PANEL_CLICK_BOTTOM_GAP:
+        log.info("副属性「展开」未就位或压在底部无效带，一次滑到底后定位")
+        _scroll_panel_to_bottom(hwnd, width, height)
+        image, lines = _read_panel()
         title_y = _title_y(lines, SUBSTAT_TITLE)
         toggle = _toggle_below(lines, title_y) if title_y is not None else None
-        if toggle is not None and (toggle.top - title_y) < height / 8:
-            if "收起" in toggle.text:
-                return
-            click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
-            time.sleep(0.5)
-            after, _ = _grab()
-            after_lines = _panel_lines(after)
-            after_y = _title_y(after_lines, SUBSTAT_TITLE)
-            after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
-            if after_toggle is not None and "收起" in after_toggle.text:
-                return
-            raise FilterClickError("点击副属性「展开」后未确认展开，停止筛选")
-        wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
-        time.sleep(0.35)
-    raise FilterClickError("滚动后仍找不到副属性词条区或展开开关")
+        if toggle is None:
+            raise FilterClickError("滑到底后仍找不到副属性词条区的「点击展开」开关，停止筛选")
+        if "收起" in toggle.text:
+            return image, lines
+
+    _click_line(hwnd, toggle)
+    time.sleep(0.5)
+
+    after, after_lines = _read_panel()
+    after_y = _title_y(after_lines, SUBSTAT_TITLE)
+    after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
+    if after_toggle is None or "收起" not in after_toggle.text:
+        raise FilterClickError("点击副属性「展开」后未确认展开，停止筛选")
+    return after, after_lines
 
 
 def _count_value(text: str) -> int | None:
@@ -438,25 +520,34 @@ def apply_substat_filter(
     _validate_substat_filter(names, counts)
     if not names:
         return
-    _open_substat_section(hwnd, width, height)
+    log = get_logger("zzz_ddtool.gamefilter")
+    # _open_substat_section 返回「副属性区已展开」那一帧，状态与这里相同、中间无点击，
+    # 直接复用，省掉一次全屏 OCR（约 1s）。
+    frame = _open_substat_section(hwnd, width, height)
     pending: dict[str | int, bool] = {name: True for name in names}
     # 重置态可能预选所有数量：也明确取消最低数量以下的按钮。
     pending.update({count: count in counts for count in range(1, 5)})
     scrolls = 0
-    log = get_logger("zzz_ddtool.gamefilter")
     while pending:
-        image, _ = _grab()
-        lines = _panel_lines(image)
+        if frame is None:
+            frame = _read_panel()
+        image, lines = frame
+        frame = None
         title_y = _title_y(lines, SUBSTAT_TITLE)
         if title_y is not None:
             lines = [line for line in lines if line.top > title_y]
         found = False
+        need_scroll = False
         for line in lines:
             text = _normalize_stat(line.text.replace(" ", ""))
             key = next((name for name in names if _normalize_stat(name) == text), None)
             if key is None:
                 key = _count_value(text)
             if key not in pending:
+                continue
+            if line.bottom > height - _PANEL_CLICK_BOTTOM_GAP:
+                # 选项压在面板底部「点击无效带」上，点了必然没反应 → 先滚上来再点。
+                need_scroll = True
                 continue
             selected = pending[key]
             if _option_selected(image, line) != selected:
@@ -472,10 +563,14 @@ def apply_substat_filter(
             found = True
             log.info("substat filter %r selected=%s", key, selected)
             # 属性和数量按钮切换不改变面板布局，同一帧中可批量处理。
-        if found:
+        if found and not need_scroll:
             continue
         if scrolls >= _MAX_PANEL_SCROLLS:
+            if need_scroll:
+                raise FilterClickError(
+                    f"副属性筛选选项一直压在面板底部点击无效区，滑到底仍点不动：{list(pending)}"
+                )
             raise FilterClickError(f"副属性筛选找不到选项：{list(pending)}")
-        wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
-        time.sleep(0.35)
+        log.info("副属性选项未全部就位，一次滑到底（第%d次）", scrolls + 1)
+        _scroll_panel_to_bottom(hwnd, width, height)
         scrolls += 1

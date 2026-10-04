@@ -164,6 +164,7 @@ def offline_runner(monkeypatch):
         for name in (
             "goto_warehouse",
             "apply_game_filter",
+            "reset_game_filter",
             "click_client",
             "press_key",
             "press_key_once",
@@ -570,6 +571,71 @@ def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkey
     assert runner.processed_disc_count == 1
     # 仅任务开始时标定前后各置顶一次，恢复不再置顶。
     assert offline_runner["reset_to_top"].call_count == 2
+
+
+def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatch):
+    """滚轮标定必须发生在设置游戏筛选之前。
+
+    标定要选第 3 行的盘做锚点；筛选会把列表裁短（实测只剩 16/3000，第 3 行起全是
+    空格），锚点落在空格子上就选不中，标定必失败。标定与列表内容无关，应满屏时先做。
+    """
+    order = []
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    monkeypatch.setattr(Runner, "_ensure_profile", lambda self, hwnd: order.append("profile"))
+    monkeypatch.setattr(Runner, "_prepare_navigation", lambda self, hwnd, state: fake_profile())
+    offline_runner["apply_game_filter"].side_effect = lambda *a, **kw: order.append("filter")
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_upgrade_loop", Mock())
+    runner.run()
+    assert order[:2] == ["profile", "filter"], order
+
+
+def test_ensure_profile_resets_filter_before_calibrating(offline_runner, monkeypatch):
+    """标定前必须先重置筛选：残留筛选会裁短列表（实测 16/3000），第 3 行锚点落在
+    空格上就选不中，标定必失败。标定要求列表满屏。"""
+    calls = []
+    monkeypatch.setattr(runner_module, "reset_game_filter", lambda *a: calls.append("reset"))
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner._profile = None
+    runner._ensure_profile(1)
+    assert calls == ["reset"]
+    assert runner._profile is not None
+
+
+def test_dismiss_material_refund_only_clicks_confirm_when_popup_present(offline_runner, monkeypatch):
+    """满级弹「材料返还」时点「确认」；没这个弹窗时绝不能乱点。
+
+    这个弹窗会盖住强化页，让等级/副属性几个 OCR 区域全空；不处理就误报
+    「未识别出盘面」中断整条任务链（2026-10-04 全链路实测）。
+    """
+    from zzz_ddtool import ocr as ocr_module
+
+    clicks = []
+    monkeypatch.setattr(runner_module, "click_client", lambda hwnd, x, y: clicks.append((x, y)))
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+
+    def patch(texts):
+        monkeypatch.setattr(
+            ocr_module,
+            "read_rect",
+            lambda *a: [ocr_module.OcrLine(t, 1.0, 100, 200, 300, 240) for t in texts],
+        )
+
+    # 页面上有「确认」（别处的按钮）但没有「材料返还」标题 → 绝不能点
+    patch(["等级15", "攻击力", "暴击率", "确认"])
+    assert runner._dismiss_material_refund(1, image) is False
+    assert clicks == []
+
+    patch(["材料返还", "强化镀剂", "4", "确认"])
+    assert runner._dismiss_material_refund(1, image) is True
+    assert clicks == [(200, 220)]
+
+    clicks.clear()
+    patch(["材料返还", "强化镀剂"])
+    assert runner._dismiss_material_refund(1, image) is False
+    assert clicks == []
 
 
 def test_click_leaving_page_recovers_and_rescans(offline_runner, monkeypatch):

@@ -139,6 +139,121 @@ def test_level_cap_decides_rarity(monkeypatch) -> None:
         assert read_level_and_rarity(QImage()) == expected, text
 
 
+def test_upgrade_page_bare_level_number_does_not_crash(monkeypatch) -> None:
+    """强化页只读到纯数字（没有「等级」字样）时不能崩。
+
+    曾经这条兜底用的是 `re.fullmatch(r"\\s*(\\d+)\\s*")`——只有一个分组，走到
+    `m.group(2)` 直接 IndexError: no such group，全链路在强化页中断。
+    """
+    from zzz_ddtool import ocr
+
+    for text, expected in {"15": (15, None), "15/15": (15, "S"), "03/12": (3, "A")}.items():
+        monkeypatch.setattr(
+            ocr, "read_rect", lambda *args, t=text: [ocr.OcrLine(t, 1.0, 0, 0, 100, 20)]
+        )
+        assert read_level_and_rarity(QImage(), ocr.UPGRADE_LEVEL) == expected, text
+
+
+def test_upgrade_level_tries_narrow_area_before_full_bar(monkeypatch) -> None:
+    """强化页等级先读窄格；窄格命中就不再读整条（省一次识别）。"""
+    from zzz_ddtool import ocr
+
+    calls: list[tuple[int, int, int, int]] = []
+
+    def fake(image, rect):
+        calls.append(rect)
+        if rect == ocr.UPGRADE_LEVEL:
+            return [ocr.OcrLine("7", 1.0, 0, 0, 10, 10)]
+        return [ocr.OcrLine("0/1440", 1.0, 0, 0, 10, 10), ocr.OcrLine("3", 1.0, 0, 0, 10, 10)]
+
+    monkeypatch.setattr(ocr, "read_rect", fake)
+    assert read_level_and_rarity(QImage(), ocr.UPGRADE_LEVEL) == (7, None)
+    assert calls == [ocr.UPGRADE_LEVEL]
+
+
+def test_upgrade_level_falls_back_to_full_bar(monkeypatch) -> None:
+    """窄格读 0 行时退回整条等级条，仍要读出等级。
+
+    真机 2026-10-04 全链路第 13 件：升到 6 级后经验条绿填充盖住左侧等级格，
+    窄格连读三帧全 0 行 →「未识别出盘面」打断整条任务链。
+    """
+    from zzz_ddtool import ocr
+
+    def fake(image, rect):
+        if rect == ocr.UPGRADE_LEVEL:
+            return []
+        return [
+            ocr.OcrLine("320/2400", 1.0, 1220, 545, 1350, 580),
+            ocr.OcrLine("6", 1.0, 985, 546, 1010, 579),
+            ocr.OcrLine("6", 1.0, 1553, 544, 1584, 580),
+        ]
+
+    monkeypatch.setattr(ocr, "read_rect", fake)
+    assert read_level_and_rarity(QImage(), ocr.UPGRADE_LEVEL) == (6, None)
+
+
+def test_upgrade_full_bar_never_reads_exp_as_level(monkeypatch) -> None:
+    """整条等级条里的经验票「0/1440」不能被当成等级 0。
+
+    否则 3 级的盘被读成 0 级 → 该弃置的没弃、该停的继续强化，静默出错。
+    """
+    from zzz_ddtool import ocr
+
+    def fake(image, rect):
+        if rect == ocr.UPGRADE_LEVEL:
+            return []
+        return [
+            ocr.OcrLine("0/1440", 1.0, 1220, 545, 1350, 580),
+            ocr.OcrLine("3", 1.0, 984, 543, 1013, 582),
+        ]
+
+    monkeypatch.setattr(ocr, "read_rect", fake)
+    assert read_level_and_rarity(QImage(), ocr.UPGRADE_LEVEL) == (3, None)
+
+
+def test_upgrade_full_bar_without_digits_returns_none(monkeypatch) -> None:
+    """整条只读到「0/480」这种经验票（没有独立数字）时返回 None，不能硬凑一个 0。"""
+    from zzz_ddtool import ocr
+
+    def fake(image, rect):
+        if rect == ocr.UPGRADE_LEVEL:
+            return []
+        return [ocr.OcrLine("0/480", 1.0, 1220, 545, 1350, 580)]
+
+    monkeypatch.setattr(ocr, "read_rect", fake)
+    assert read_level_and_rarity(QImage(), ocr.UPGRADE_LEVEL) == (None, None)
+
+
+def test_upgrade_level_green_fill_replay() -> None:
+    """真机实拍：经验条绿填充盖住等级数字那一帧也要读出等级 6。
+
+    2026-10-04 全链路第 13 件失败现场。旧等级格 (940,525,1100,580) 在这张图上
+    直接读 0 行（检测不到），是那次 run 中断的直接原因。
+    """
+    from zzz_ddtool import ocr
+
+    image = QImage("tests/fixtures/upgrade-level-greenfilled.png")
+    assert not image.isNull()
+    level, _rarity = read_level_and_rarity(image, ocr.UPGRADE_LEVEL)
+    assert level == 6
+    disc = parse_disc_upgrade_page(image)
+    assert disc is not None and disc.level == 6
+
+
+def test_upgrade_level_digit_bottom_not_clipped() -> None:
+    """真机实拍：等级「9」的尾巴不能被裁掉读成「6」。
+
+    旧等级格底边 580 比数字底边（实拍 582）高 2px，把 9 裁成 6——**静默读错**，
+    比读不出更危险：会按错误的等级做弃置/强化判断。
+    """
+    from zzz_ddtool import ocr
+
+    image = QImage("tests/fixtures/upgrade-level-double-digit.png")
+    assert not image.isNull()
+    level, _rarity = read_level_and_rarity(image, ocr.UPGRADE_LEVEL)
+    assert level == 9
+
+
 def test_read_action_state_uses_words_only_present_when_active(monkeypatch) -> None:
     """锁定/弃置按「解除」「取消」判断，不硬匹配整串。
 

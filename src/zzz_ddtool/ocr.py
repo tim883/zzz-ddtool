@@ -22,6 +22,7 @@ from zzz_ddtool.layout import (
     SUB_STAT_SPLIT_X,
     SUB_STATS,
     UPGRADE_LEVEL,
+    UPGRADE_LEVEL_BAR,
     UPGRADE_SUB_SPLIT_X,
     UPGRADE_SUB_STATS,
     WAREHOUSE_DISC_LEVEL,
@@ -268,6 +269,27 @@ RARITY_BY_MAX_LEVEL: dict[int, str] = {15: "S", 12: "A", 9: "B"}
 
 # 「等级 03」后面可以跟「/ 15」；上限缺失时 rarity 为 None。
 _LEVEL_RE = re.compile(r"等级\s*(\d+)\s*(?:/\s*(\d+))?")
+# 强化页有时只识别到纯数字（没有「等级」字样）。必须和 _LEVEL_RE 一样带第 2 个
+# （可选上限）分组：否则下面 m.group(2) 会 IndexError: no such group（真崩过）。
+_UPGRADE_BARE_LEVEL_RE = re.compile(r"\s*(\d+)\s*(?:/\s*(\d+))?\s*")
+
+
+def _level_areas(area: tuple[int, int, int, int]):
+    """等级区候选，逐项给 (矩形, 该矩形要不要排除带「/」的经验票)。
+
+    强化页等级条从左到右是「当前等级 ┃ 经验 320/2400 ┃ 上限」，三者同一条带子：
+
+    * 主用贴住数字的窄格 `UPGRADE_LEVEL`——便宜，且不受经验条绿填充干扰；
+    * 窄格读不出（绿填充涨上来盖住数字，检测整格 0 行；真机 0127/0128 实拍，
+      2026-10-04 全链路第 13 件就断在这里）时退回整条 `UPGRADE_LEVEL_BAR`。
+      整条带上经验文字反而更稳，但要按 skip_slash 把经验票挑掉——它带「/」，
+      否则「0/1440」会被 `_UPGRADE_BARE_LEVEL_RE` 当成等级 0，把 3 级读成 0 级。
+
+    正常帧窄格一次命中，只有少数帧才多花一次识别。
+    """
+    if area == UPGRADE_LEVEL:
+        return ((UPGRADE_LEVEL, False), (UPGRADE_LEVEL_BAR, True))
+    return ((area, False),)
 
 
 def read_level_and_rarity(
@@ -277,19 +299,24 @@ def read_level_and_rarity(
 
     稀有度由等级上限推出（15→S、12→A、9→B）；上限读不出或不在已知档位时返回 None，
     调用方按「未知」处理、不据此跳过。等级与稀有度共用同一次识别，不额外加 OCR。
+
+    传 UPGRADE_LEVEL 时按 `_level_areas` 依次试窄格与整条（见该函数）。
     """
-    for line in read_rect(image, area):
-        m = _LEVEL_RE.search(line.text)
-        if m is None and area == UPGRADE_LEVEL:
-            m = re.fullmatch(r"\s*(\d+)\s*", line.text)
-        if m is None:
-            continue
-        level = int(m.group(1))
-        if not 0 <= level <= MAX_LEVEL:
-            continue
-        cap = m.group(2)
-        rarity = RARITY_BY_MAX_LEVEL.get(int(cap)) if cap else None
-        return level, rarity
+    for rect, skip_slash in _level_areas(area):
+        for line in read_rect(image, rect):
+            if skip_slash and "/" in line.text:
+                continue
+            m = _LEVEL_RE.search(line.text)
+            if m is None and area == UPGRADE_LEVEL:
+                m = _UPGRADE_BARE_LEVEL_RE.fullmatch(line.text)
+            if m is None:
+                continue
+            level = int(m.group(1))
+            if not 0 <= level <= MAX_LEVEL:
+                continue
+            cap = m.group(2)
+            rarity = RARITY_BY_MAX_LEVEL.get(int(cap)) if cap else None
+            return level, rarity
     return None, None
 
 

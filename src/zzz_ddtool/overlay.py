@@ -39,6 +39,8 @@ HWND_TOPMOST = -1
 SWP_FLAGS = 0x0001 | 0x0002 | 0x0010  # NOMOVE | NOSIZE | NOACTIVATE
 SW_SHOW = 5
 SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 WM_UPDATE = 0x8001
 WM_HIDE = 0x8002
 WM_TIMER = 0x0113
@@ -167,6 +169,8 @@ _init_lock = threading.Lock()
 _target_hwnd = None
 _last_geometry = None
 _wanted_visible = False
+_wda_active = False  # 浮层已设为「不参与屏幕捕获」（Win10 2004+ / Win11 支持）
+_capture_hidden = False  # 截图期间临时隐藏浮层（WDA 不可用时的兜底）
 
 
 def _make_font() -> int:
@@ -220,11 +224,15 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
         return 0
     if msg == WM_UPDATE:
         _wanted_visible = True
-        user32.ShowWindow(hwnd, 4 if _refresh_game_origin() else SW_HIDE)
+        if not _capture_hidden:
+            user32.ShowWindow(hwnd, 4 if _refresh_game_origin() else SW_HIDE)
         user32.InvalidateRect(hwnd, None, True)
         return 0
     if msg == WM_TIMER:
-        if _wanted_visible:
+        if _capture_hidden:
+            if user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, SW_HIDE)
+        elif _wanted_visible:
             visible = _refresh_game_origin()
             if bool(user32.IsWindowVisible(hwnd)) != visible:
                 user32.ShowWindow(hwnd, 4 if visible else SW_HIDE)  # 不激活、不抢焦点
@@ -248,7 +256,7 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
 
 
 def _window_loop() -> None:
-    global _hwnd, _proc_ref, _font, _target_hwnd, _last_geometry, _wanted_visible
+    global _hwnd, _proc_ref, _font, _target_hwnd, _last_geometry, _wanted_visible, _wda_active
     _proc_ref = WNDPROC(_wnd_proc)
     wc = WNDCLASSW()
     wc.lpfnWndProc = _proc_ref
@@ -277,9 +285,20 @@ def _window_loop() -> None:
         return
     _hwnd = hwnd
     user32.SetLayeredWindowAttributes(hwnd, 0, 220, 2)  # 深色半透明背景，保证文字可读
+    # 浮层不进入屏幕捕获：截图走屏幕 BitBlt 时会把它一起截进去，污染 OCR。
+    # 设为 excluded 后用户仍照常看到浮层，但截图里没有它（Win10 2004+ / Win11）。
+    # 老系统（Win10 2004 之前）不支持，置 _wda_active=False，改由截图侧临时隐藏兜底。
+    _wda_active = bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+    if not _wda_active:
+        from zzz_ddtool.logutil import get_logger
+
+        get_logger("zzz_ddtool.overlay").warning(
+            "系统不支持「排除屏幕捕获」（需 Win10 2004+），浮层改为截图时临时隐藏"
+        )
     user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_FLAGS)
     user32.SetTimer(hwnd, 1, FOLLOW_INTERVAL_MS, None)
 
+    _install_capture_hooks()
     _ready.set()
     try:
         msg = MSG()
@@ -366,6 +385,46 @@ def overlay_shutdown() -> None:
         user32.PostMessageW(_hwnd, WM_CLOSE, 0, 0)
     if _thread and _thread is not threading.current_thread():
         _thread.join(timeout=3)
+
+
+def _suspend_for_capture() -> bool:
+    """截图前调用，返回 True 表示「已临时隐藏，截完要恢复」。
+
+    WDA_EXCLUDEFROMCAPTURE 生效时浮层本来就不进截图，直接返回 False（不闪）。
+    老系统（Win10 2004 之前）不支持该特性，改为临时隐藏兜底。
+    """
+    global _capture_hidden
+    if _wda_active or not _hwnd:
+        return False
+    try:
+        _capture_hidden = True
+        user32.ShowWindow(_hwnd, SW_HIDE)
+        return True
+    except Exception:
+        _capture_hidden = False
+        return False
+
+
+def _resume_after_capture(hidden: bool) -> None:
+    global _capture_hidden
+    if not hidden:
+        return
+    _capture_hidden = False
+    try:
+        if _hwnd:
+            user32.ShowWindow(_hwnd, SW_SHOWNOACTIVATE)
+    except Exception:
+        pass
+
+
+def _install_capture_hooks() -> None:
+    """把「截图前藏 / 截图后恢复」注册给 capture，保证抓到的画面里没有浮层。"""
+    try:
+        from zzz_ddtool import capture
+
+        capture.set_overlay_hooks(_suspend_for_capture, _resume_after_capture)
+    except Exception:
+        pass
 
 
 class OverlayLogHandler(logging.Handler):

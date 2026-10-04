@@ -7,6 +7,7 @@ from random import randint, uniform
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+advapi32 = ctypes.windll.advapi32
 
 from zzz_ddtool.logutil import get_logger
 
@@ -113,6 +114,81 @@ def client_to_screen(hwnd: int, x: int, y: int) -> tuple[int, int]:
 
 def is_foreground(hwnd: int) -> bool:
     return int(user32.GetForegroundWindow()) == int(hwnd)
+
+
+class _SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+
+class _TOKEN_MANDATORY_LABEL(ctypes.Structure):
+    _fields_ = [("Label", _SID_AND_ATTRIBUTES)]
+
+
+_TOKEN_INTEGRITY_LEVEL = 25
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TOKEN_QUERY = 0x0008
+
+# ⚠️ 64 位下必须声明 argtypes/restype：SID 是 8 字节指针，不声明时 ctypes 会把传入的
+# 大整数指针按 32 位 int 转换 → OverflowError: int too long to convert。
+advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+
+
+def _integrity_level(pid: int) -> int:
+    """进程完整性级别（0x2000 Medium / 0x3000 High）；读不到返回 -1。
+
+    GetSidSubAuthority* 的 argtypes/restype 在模块级已声明（64 位 SID 指针不声明会溢出）。
+    """
+    process = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not process:
+        return -1
+    try:
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(process, _TOKEN_QUERY, ctypes.byref(token)):
+            return -1
+        try:
+            size = wintypes.DWORD()
+            advapi32.GetTokenInformation(token, _TOKEN_INTEGRITY_LEVEL, None, 0, ctypes.byref(size))
+            if not size.value:
+                return -1
+            buf = ctypes.create_string_buffer(size.value)
+            ok = advapi32.GetTokenInformation(
+                token, _TOKEN_INTEGRITY_LEVEL, buf, size.value, ctypes.byref(size)
+            )
+            if not ok:
+                return -1
+            label = ctypes.cast(buf, ctypes.POINTER(_TOKEN_MANDATORY_LABEL)).contents
+            count = advapi32.GetSidSubAuthorityCount(label.Label.Sid).contents.value
+            return int(advapi32.GetSidSubAuthority(label.Label.Sid, count - 1).contents.value)
+        finally:
+            kernel32.CloseHandle(token)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def input_blocked_reason(hwnd: int) -> str | None:
+    """目标窗口进程权限高于本进程时返回提示；能正常发输入则返回 None。
+
+    Windows 的 UIPI 只允许把合成输入发给「同级或更低」完整性级别的进程。
+    游戏若以管理员(High)运行、本工具是普通权限(Medium)，SendInput 与
+    PostMessage(WM_KEYDOWN/WM_LBUTTONDOWN) 都会被**静默丢弃**——SendInput
+    还会返回"成功"，现场表现就是「截图正常、认页正常，但按键/点击完全没反应」。
+    """
+    target = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(target))
+    game_il = _integrity_level(int(target.value))
+    self_il = _integrity_level(int(kernel32.GetCurrentProcessId()))
+    if game_il < 0 or self_il < 0:
+        return None  # 读不到就别拦，免得误伤
+    if game_il > self_il:
+        return (
+            f"游戏进程权限高于本工具（游戏 IL=0x{game_il:04X}，本工具 IL=0x{self_il:04X}），"
+            "Windows(UIPI) 会拦掉全部合成输入，按键和点击都发不出去。"
+            "请右键本工具选「以管理员身份运行」后再试。"
+        )
+    return None
 
 
 def focus_window(hwnd: int) -> None:
