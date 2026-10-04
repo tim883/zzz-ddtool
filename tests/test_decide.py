@@ -130,3 +130,19 @@ def test_second_pass_whitelist_overrides_min_useful() -> None:
     keep = "four:0:暴击伤害|暴击率|废词条|废词条"
     assert decide(disc, preset, accepted_ids={keep}).action is Action.UPGRADE
     assert decide(disc, preset, accepted_ids=set()).action is Action.MARK_DISCARD
+
+
+def test_require_s_rank_only_skips_confirmed_non_s() -> None:
+    """确认不是 S 才跳过；稀有度读不出（None）不跳过。
+
+    读不出就跳过会把好盘误丢，所以未知一律按不跳过处理（`Disc.rarity` 默认 None
+    就是为此）。这是 B2「恒默认 S」的反面：既不蒙 S，也不拿未知当非 S。
+    """
+    preset = _preset()
+    subs = (Substat("暴击率"), Substat("暴击伤害"), Substat("攻击力%"))
+
+    assert decide(Disc(level=0, substats=subs, rarity="A"), preset).reason == "not_s_rank"
+    assert decide(Disc(level=0, substats=subs, rarity="B"), preset).reason == "not_s_rank"
+    assert decide(Disc(level=0, substats=subs, rarity="S"), preset).reason != "not_s_rank"
+    assert decide(Disc(level=0, substats=subs, rarity=None), preset).reason != "not_s_rank"
+    assert decide(Disc(level=0, substats=subs, rarity="s"), preset).reason != "not_s_rank"

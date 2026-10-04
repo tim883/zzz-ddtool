@@ -38,7 +38,9 @@ class Substat:
 class Disc:
     level: int
     substats: tuple[Substat, ...]
-    rarity: str = "S"
+    # 由界面读出的稀有度（S/A/B）；读不出时为 None——**不假定是 S**。
+    # require_s_rank 只在确认「不是 S」时跳过，未知按不跳过处理（宁可不跳，不误跳好盘）。
+    rarity: str | None = None
     locked: bool = False
     equipped: bool = False
     discarded: bool = False

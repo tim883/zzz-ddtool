@@ -14,7 +14,9 @@ from zzz_ddtool.ocr import (
     _parse_value,
     parse_disc,
     parse_disc_upgrade_page,
+    read_action_state,
     read_level,
+    read_level_and_rarity,
     read_rect,
 )
 
@@ -115,6 +117,60 @@ def test_read_level(sample_image: QImage) -> None:
     assert read_level(sample_image) is not None
 
 
+def test_level_cap_decides_rarity(monkeypatch) -> None:
+    """稀有度按等级上限判定：15→S、12→A、9→B；上限缺失或不在档位就是未知。
+
+    仓库页实拍的等级行是「等级03/15」（score 1.0），分母就是上限，所以不用额外
+    OCR、也不用猜颜色。读不出上限时返回 None——**不假定 S**（B2 的根因就是恒默认 S）。
+    """
+    from zzz_ddtool import ocr
+
+    cases = {
+        "等级03/15": (3, "S"),
+        "等级0/12": (0, "A"),
+        "等级9/9": (9, "B"),
+        "等级5": (5, None),
+        "等级3/7": (3, None),
+    }
+    for text, expected in cases.items():
+        monkeypatch.setattr(
+            ocr, "read_rect", lambda *args, t=text: [ocr.OcrLine(t, 1.0, 0, 0, 100, 20)]
+        )
+        assert read_level_and_rarity(QImage()) == expected, text
+
+
+def test_read_action_state_uses_words_only_present_when_active(monkeypatch) -> None:
+    """锁定/弃置按「解除」「取消」判断，不硬匹配整串。
+
+    实拍仓库页 OCR 会把「T」和后面的词拆成两行（「T」「锁定」各一行），只匹配
+    「解除锁定」会漏掉已锁定的盘——这正是 B1 挂着的直接原因。未生效状态里不含
+    这两个词，所以放宽不会误判。
+    """
+    from zzz_ddtool import ocr
+
+    def patch(texts):
+        monkeypatch.setattr(
+            ocr, "read_rect", lambda *args: [ocr.OcrLine(t, 1.0, 0, 0, 100, 20) for t in texts]
+        )
+
+    patch(["R", "弃置", "T", "锁定", "UID: 32810691"])
+    assert read_action_state(QImage()) == {"locked": False, "discarded": False}
+
+    patch(["R", "取消弃置", "T", "解除锁定"])
+    assert read_action_state(QImage()) == {"locked": True, "discarded": True}
+
+    # 四个字被 OCR 拆开也要认出来
+    patch(["T", "解除", "R", "取消"])
+    assert read_action_state(QImage()) == {"locked": True, "discarded": True}
+
+
+def test_warehouse_action_row_replay() -> None:
+    """仓库页真图（未锁定、未弃置）重放：不能被判成已锁定/已弃置。"""
+    image = QImage("tests/fixtures/warehouse-detail.png")
+    assert not image.isNull()
+    assert read_action_state(image) == {"locked": False, "discarded": False}
+
+
 def test_parse_disc(sample_image: QImage) -> None:
     disc = parse_disc(sample_image)
     assert disc is not None
@@ -131,6 +187,8 @@ def test_warehouse_sidebar_regression() -> None:
     disc = parse_disc(image)
     assert disc is not None
     assert disc.level == 3
+    # 该图等级行是「等级03/15」，上限 15 → S；不再靠 models 里的默认值蒙。
+    assert disc.rarity == "S"
     assert disc.substats == tuple(Substat(name) for name in ("暴击伤害", "暴击率", "攻击力", "异常精通"))
 
 

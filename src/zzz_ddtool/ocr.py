@@ -29,7 +29,7 @@ from zzz_ddtool.layout import (
     scale_rect,
 )
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.models import Disc, Substat
+from zzz_ddtool.models import MAX_LEVEL, Disc, Substat
 from zzz_ddtool.gamedata import SUBSTAT_NAMES as _SUBSTAT_NAMES
 
 _engine = None
@@ -262,15 +262,40 @@ def _pair_substat_lines(lines: list[OcrLine], split_x: int) -> list[tuple[str, s
     return pairs
 
 
-def read_level(image: QImage, area: tuple[int, int, int, int] = DISC_LEVEL) -> int | None:
-    """读取等级数字（默认详情面板，可传强化页区域），返回 0~15 的数字。"""
+# 驱动盘稀有度按**等级上限**区分：S=15、A=12、B=9（游戏固定值）。
+# 详情面板那一行是「等级03 / 15」，分母就是上限——不用额外 OCR，也没有颜色阈值要标定。
+RARITY_BY_MAX_LEVEL: dict[int, str] = {15: "S", 12: "A", 9: "B"}
+
+# 「等级 03」后面可以跟「/ 15」；上限缺失时 rarity 为 None。
+_LEVEL_RE = re.compile(r"等级\s*(\d+)\s*(?:/\s*(\d+))?")
+
+
+def read_level_and_rarity(
+    image: QImage, area: tuple[int, int, int, int] = DISC_LEVEL
+) -> tuple[int | None, str | None]:
+    """一次读出等级和稀有度，返回 (等级, 稀有度)。
+
+    稀有度由等级上限推出（15→S、12→A、9→B）；上限读不出或不在已知档位时返回 None，
+    调用方按「未知」处理、不据此跳过。等级与稀有度共用同一次识别，不额外加 OCR。
+    """
     for line in read_rect(image, area):
-        m = re.search(r"等级\s*(\d+)", line.text)
+        m = _LEVEL_RE.search(line.text)
         if m is None and area == UPGRADE_LEVEL:
             m = re.fullmatch(r"\s*(\d+)\s*", line.text)
-        if m and 0 <= int(m.group(1)) <= 15:
-            return int(m.group(1))
-    return None
+        if m is None:
+            continue
+        level = int(m.group(1))
+        if not 0 <= level <= MAX_LEVEL:
+            continue
+        cap = m.group(2)
+        rarity = RARITY_BY_MAX_LEVEL.get(int(cap)) if cap else None
+        return level, rarity
+    return None, None
+
+
+def read_level(image: QImage, area: tuple[int, int, int, int] = DISC_LEVEL) -> int | None:
+    """读取等级数字（默认详情面板，可传强化页区域），返回 0~15 的数字。"""
+    return read_level_and_rarity(image, area)[0]
 
 
 def read_substats(
@@ -293,31 +318,35 @@ def read_substats(
 
 
 def read_action_state(image: QImage) -> dict[str, bool]:
-    """读取底部按钮文字，判断锁定/弃置状态。
+    """读取仓库页右下角的 R/T 提示文字，判断锁定/弃置状态。
 
-    '解除锁定' 表示当前已锁定；'锁定' 表示当前未锁定。
-    '弃置' 表示可弃置（未弃置）；已弃置时通常显示'取消弃置'。
+    未锁定显示「T 锁定」、已锁定显示「T 解除锁定」；未弃置显示「R 弃置」、
+    已弃置显示「R 取消弃置」。
+
+    按「解除」「取消」这类**只在已生效状态出现**的词判断，不硬匹配整串：
+    OCR 经常把「T」和后面的词拆成两行（实测「T」「锁定」各一行），
+    整串匹配「解除锁定」会漏。未生效状态里不含这两个词，所以不会误判。
     """
     state = {"locked": False, "discarded": False}
     for line in read_rect(image, ACTION_ROW):
         text = line.text
-        if "解除锁定" in text:
+        if "解除" in text:
             state["locked"] = True
-        elif "取消弃置" in text or text == "已弃置":
+        if "取消" in text or text == "已弃置":
             state["discarded"] = True
     return state
 
 
 def parse_disc(image: QImage) -> Disc | None:
-    """从驱动盘详情页截图解析出一个 Disc。
+    """从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
 
     失败返回 None，调用方应中断流程。
     """
     # 只有在等级标签成功匹配时才选择布局，避免把套装说明里的数字当等级。
-    level = read_level(image, WAREHOUSE_DISC_LEVEL)
+    level, rarity = read_level_and_rarity(image, WAREHOUSE_DISC_LEVEL)
     area = WAREHOUSE_SUB_STATS
     if level is None:
-        level = read_level(image)
+        level, rarity = read_level_and_rarity(image)
         area = SUB_STATS
     if level is None:
         return None
@@ -328,6 +357,7 @@ def parse_disc(image: QImage) -> Disc | None:
     return Disc(
         level=level,
         substats=substats,
+        rarity=rarity,
         locked=actions["locked"],
         discarded=actions["discarded"],
     )
@@ -337,12 +367,13 @@ def parse_disc_upgrade_page(image: QImage) -> Disc | None:
     """从强化页截图解析 Disc（强化页副属性/等级坐标）。
 
     强化页没有 R/T 按钮，弃置在详情页做；这里只读等级+副属性供 decide 判断
-    升级还是弃置。失败返回 None。
+    升级还是弃置。稀有度同理由等级上限推出，读不出就是 None（未知，不据此跳过）。
+    失败返回 None。
     """
-    level = read_level(image, UPGRADE_LEVEL)
+    level, rarity = read_level_and_rarity(image, UPGRADE_LEVEL)
     if level is None:
         return None
     substats = read_substats(image, UPGRADE_SUB_STATS, UPGRADE_SUB_SPLIT_X)
     if not substats:
         return None
-    return Disc(level=level, substats=substats, locked=False, discarded=False)
+    return Disc(level=level, substats=substats, rarity=rarity, locked=False, discarded=False)
