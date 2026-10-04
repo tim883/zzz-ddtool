@@ -36,14 +36,13 @@ def qapp() -> QApplication:
 
 
 @pytest.fixture(autouse=True)
-def isolated_archives(tmp_path, monkeypatch):
+def isolated_user_data(tmp_path, monkeypatch):
     from zzz_ddtool import paths
 
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
     monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
     monkeypatch.setattr(paths, "user_data_root", lambda: tmp_path / "application-root")
     monkeypatch.setattr(paths, "legacy_plan_dirs", lambda: (tmp_path / "legacy" / "data",))
-    monkeypatch.setattr(paths, "legacy_archives_file", lambda: tmp_path / "legacy" / "archives.json")
 
 
 def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
@@ -994,93 +993,103 @@ def test_loading_legacy_multi_mainstats_normalizes_unvisited_tasks(qapp, tmp_pat
     window.close()
 
 
-def test_archive_empty_name_prompts_and_crud_keeps_raw_prices(qapp, tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QInputDialog
-    from zzz_ddtool import paths
+def test_apply_buttons_disabled_without_tasks(qapp, tmp_path):
+    """任务链空了就没有可铺的对象，三个按钮一起置灰。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert not window.apply_weights_btn.isEnabled()
+    assert not window.apply_limit_btn.isEnabled()
+    assert not window.apply_sets_btn.isEnabled()
+    window._add_job()
+    assert window.apply_weights_btn.isEnabled()
+    assert window.apply_limit_btn.isEnabled()
+    assert window.apply_sets_btn.isEnabled()
+    window._remove_job()
+    assert not window.apply_weights_btn.isEnabled()
+    window.close()
 
-    archive_file = tmp_path / "user" / "archives.json"
-    monkeypatch.setattr(paths, "archives_file", lambda: archive_file)
-    monkeypatch.setattr(QInputDialog, "getText", lambda *args: ("通用配价", True))
+
+def test_apply_weights_to_all_tasks_is_one_shot(qapp, tmp_path):
+    """「应用于所有任务」只铺到此刻已存在的任务；之后新建的任务不受影响。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
-    window.weight_editor.set_weights({"暴击率": 2, "暴击伤害": 3})
-    window.filter_main_boxes["暴击伤害"].click()
-    window.sections[("three", 0)].require.setValue(2)
-    assert not window.archive_apply_btn.isEnabled()
-    window.archive_save_btn.click()
-    assert archive_file.exists()
-    assert window._load_archives()["通用配价"]["weights"]["暴击伤害"] == 3
-    assert window.archive_apply_btn.isEnabled()
-    window.weight_editor.set_weights({"攻击力%": 1})
-    window.sections[("three", 0)].require.setValue(9)
-    window._selection_seed = ()
-    window.archive_apply_btn.click()
-    assert window.weight_editor.weights() == {"暴击率": 2, "暴击伤害": 3}
-    assert window.sections[("three", 0)].require.value() == 2
-    assert window.collect_preset().accepted is None
-    assert window._preview_dirty
-    window.weight_editor.set_weights({"暴击率": 4})
-    window.archive_save_btn.click()
-    assert window._load_archives()["通用配价"]["weights"] == {"暴击率": 4}
-    window.archive_delete_btn.click()
-    assert window._load_archives() == {}
-    assert not window.archive_apply_btn.isEnabled()
+    window.weight_editor.set_weights({"暴击率": 1})
+    window._add_job()
+    window._on_slot_clicked(6)
+    window.weight_editor.set_weights({"攻击力%": 3})
+
+    window.apply_weights_btn.click()
+    qapp.processEvents()
+    assert [job.weights for job in window._jobs] == [{"攻击力%": 3.0}, {"攻击力%": 3.0}]
+    assert window.weight_editor.weights() == {"攻击力%": 3.0}
+
+    window._add_job()
+    qapp.processEvents()
+    assert window._jobs[-1].weights == {}, "新建的任务不能被之前的「应用全部」绑住"
     window.close()
 
 
-def test_archive_failure_does_not_destroy_existing_file(qapp, tmp_path, monkeypatch):
-    from zzz_ddtool import paths
-
-    archive_file = tmp_path / "archives.json"
-    monkeypatch.setattr(paths, "archives_file", lambda: archive_file)
-    archive_file.write_text("{broken", encoding="utf-8")
+def test_apply_limit_to_all_tasks_is_one_shot(qapp, tmp_path):
     window = MainWindow(config_path=tmp_path / "t.yaml")
-    window.archive_combo.setCurrentText("new")
-    window._save_archive()
-    assert archive_file.read_text(encoding="utf-8") == "{broken"
-    assert "失败" in window.archive_status.text()
-    archive_file.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(window, "_write_archives", lambda _data: (_ for _ in ()).throw(OSError("disk full")))
-    window._save_archive()
-    assert "disk full" in window.archive_status.text()
+    window._add_job()
+    window._add_job()
+    window.chain_list.setCurrentRow(0)
+    qapp.processEvents()
+    window.max_discs.setValue(7)
+
+    window.apply_limit_btn.click()
+    qapp.processEvents()
+    assert [job.max_discs for job in window._jobs] == [7, 7]
+
+    window._add_job()
+    assert window._jobs[-1].max_discs == 100
     window.close()
 
 
-def test_archive_migration_survives_exe_changes_and_keeps_legacy_file(qapp, tmp_path, monkeypatch):
-    import json
-    from zzz_ddtool import paths
-
-    legacy = tmp_path / "old-version" / "user" / "archives.json"
-    legacy.parent.mkdir(parents=True)
-    initial = {"original": {"weights": {"暴击率": 2}, "stage_require": {"three": {"0": 2}}}}
-    original_text = json.dumps(initial)
-    legacy.write_text(original_text, encoding="utf-8")
-    monkeypatch.setattr(paths, "legacy_archives_file", lambda: legacy)
+def test_apply_sets_to_all_tasks_is_one_shot(qapp, tmp_path):
     window = MainWindow(config_path=tmp_path / "t.yaml")
-    target = paths.archives_file()
-    assert target.exists() and window._load_archives() == initial
-    assert legacy.read_text(encoding="utf-8") == original_text
-    window._write_archives({"new": {"weights": {"暴击率": 3}}})
-    monkeypatch.setattr(paths, "base_dir", lambda: tmp_path / "new-version")
-    monkeypatch.setattr(paths, "legacy_archives_file", lambda: tmp_path / "new-version" / "user" / "archives.json")
-    assert paths.archives_file() == target
-    assert window._load_archives() == {"new": {"weights": {"暴击率": 3}}}
-    window._write_archives({})
-    monkeypatch.setattr(paths, "legacy_archives_file", lambda: legacy)
-    assert window._load_archives() == {}  # 删除完后不能从旧文件重新恢复。
+    window._add_job()
+    window._filter_sets = ["折枝剑歌"]
+    window._update_set_summary()
+    window._add_job()
+    assert window._filter_sets == []
+    window.chain_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert window._filter_sets == ["折枝剑歌"]
+
+    window.apply_sets_btn.click()
+    qapp.processEvents()
+    assert [job.sets for job in window._jobs] == [("折枝剑歌",), ("折枝剑歌",)]
+
+    window._add_job()
+    assert window._jobs[-1].sets == ()
     window.close()
 
 
-def test_applying_archive_without_task_creates_a_task(qapp, tmp_path, monkeypatch):
-    from zzz_ddtool import paths
+def test_game_filter_is_inline_and_slots_123_have_no_mainstat_choice(qapp, tmp_path):
+    """游戏内筛选拆成面板上两块：套装另开弹窗，部位/主词条不再进弹窗。
 
-    monkeypatch.setattr(paths, "archives_file", lambda: tmp_path / "archives.json")
+    1/2/3 号位主词条固定，界面上不给单选项；4/5/6 才出本部位能出的主词条。
+    """
+    from PySide6.QtWidgets import QDialog
+
     window = MainWindow(config_path=tmp_path / "t.yaml")
-    window._write_archives({"saved": {"weights": {"暴击率": 2}}})
-    window._refresh_archive_combo("saved")
-    window.archive_apply_btn.click()
-    assert len(window._jobs) == 1
-    assert window.collect_preset().task_chain[0].weights == {"暴击率": 2}
+    assert not hasattr(window, "_filter_dialog")
+    # 控件挂在主窗口里，不在任何弹窗里
+    assert window.filter_slots[4].window() is window
+    assert window.main_host.window() is window
+    assert not isinstance(window.main_host.parentWidget(), QDialog)
+
+    for slot in (1, 2, 3):
+        window._on_slot_clicked(slot)
+        qapp.processEvents()
+        assert window.filter_main_boxes == {}, f"{slot} 号位不该有主词条可选项"
+        assert "固定" in window.main_hint.text()
+
+    window._on_slot_clicked(5)
+    qapp.processEvents()
+    assert "穿透率" in window.filter_main_boxes
+    assert "暴击伤害" not in window.filter_main_boxes
+    assert "可选主词条" in window.main_hint.text()
     window.close()
 
 
@@ -1234,6 +1243,7 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     assert saved["geometry"]
     assert len(saved["config_splitter"]) == 3
     assert len(saved["main_splitter"]) == 2
+    saved_main = list(saved["main_splitter"])
 
     reopened = MainWindow(config_path=tmp_path / "t.yaml")
     reopened.show()
@@ -1242,9 +1252,11 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     sizes = reopened._config_splitter.sizes()
     # 出厂默认是 [240, 340, 740]（中间最窄）。恢复成功才会是中间最宽。
     assert sizes[1] > sizes[2]
-    # 下半区默认 [430, 310]（占四成）；恢复成功才会变成占一半以上
+    # 下面那块的比例照原样恢复（默认 [500, 270]，拖过之后不该回到默认）
     main_sizes = reopened._main_splitter.sizes()
-    assert main_sizes[1] > sum(main_sizes) * 0.5
+    saved_ratio = saved_main[1] / sum(saved_main)
+    assert abs(main_sizes[1] / sum(main_sizes) - saved_ratio) < 0.1
+    assert saved_ratio > 0.5
     reopened.close()
 
 
@@ -1327,40 +1339,59 @@ def test_run_log_title_row_has_collapse_toggle(qapp: QApplication, tmp_path) -> 
     window.close()
 
 
-def test_vertical_splitter_grows_run_log(qapp: QApplication, tmp_path) -> None:
-    """三栏和底下那块（操作栏 + 日志）之间有一根竖分隔条。
+def test_red_line_splitter_grows_upper_block_only(qapp: QApplication, tmp_path) -> None:
+    """红线那条拉伸：只改红框（三栏 + 操作栏）的高度。
 
-    拖它只改下半区高度：日志跟着长，操作栏和窗口本身都不动。
+    下面那块（状态行 + 日志）高度锁住不动，只是被顶着上下移动；
+    窗口最底下那条边才改下面那块——也就是日志窗的高度。
     """
     window = MainWindow(config_path=tmp_path / "t.yaml")
-    window.resize(1320, 820)
+    window.resize(1320, 900)
     window.show()
     qapp.processEvents()
 
     splitter = window._main_splitter
     assert splitter.count() == 2
     upper, lower = splitter.widget(0), splitter.widget(1)
-    # 上半是三栏，下半装着操作栏和日志面板
+    # 红框 = 三栏 + 操作栏；下面那块 = 状态行 + 日志面板
     assert upper.isAncestorOf(window._config_splitter)
-    assert lower.isAncestorOf(window.start_btn)
+    assert upper.isAncestorOf(window.start_btn)
+    assert lower.isAncestorOf(window.run_status_label)
     assert lower.isAncestorOf(window.run_log)
 
-    footer = window.start_btn.parentWidget()
     window_height = window.height()
     upper_before = upper.height()
     log_before = window.run_log.height()
-    footer_height = footer.height()
 
-    # 把分隔条往上拖：下半区变大
-    total = splitter.height()
-    splitter.setSizes([total // 4, total - total // 4])
+    # 模拟把红线往下拖 120px：上半 +120、下半 -120
+    splitter.setSizes([upper_before + 120, lower.height() - 120])
+    qapp.processEvents()
+    window._on_main_splitter_moved(splitter.handle(1).y(), 1)
     qapp.processEvents()
 
-    assert upper.height() < upper_before
+    # 红框长高了，窗口跟着长高
+    assert upper.height() > upper_before
+    assert window.height() > window_height
+    # 下面那块高度锁住，只被顶下去了
+    assert abs(window.run_log.height() - log_before) <= 4
+    window.close()
+
+
+def test_window_resize_only_grows_lower_block(qapp: QApplication, tmp_path) -> None:
+    """窗口最底下那条边：拉高窗口只让日志窗变高，红框（三栏 + 操作栏）高度不动。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 820)
+    window.show()
+    qapp.processEvents()
+
+    upper_before = window._main_splitter.widget(0).height()
+    log_before = window.run_log.height()
+
+    window.resize(1320, 1000)
+    qapp.processEvents()
+
     assert window.run_log.height() > log_before
-    # 操作栏高度固定，窗口本身也没被撑大
-    assert footer.height() == footer_height
-    assert window.height() == window_height
+    assert window._main_splitter.widget(0).height() == upper_before
     window.close()
 
 

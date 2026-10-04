@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
-    QInputDialog,
     QStackedWidget,
     QHBoxLayout,
     QLabel,
@@ -97,7 +96,8 @@ KNOWN_SUBSTATS = tuple(
     + [name for name in SUBSTAT_NAMES if name not in _SUBSTAT_ORDER]
 )
 
-# 游戏内筛选-主词条按槽位固定三列网格，每页尺寸一致，切部位不抖动
+# 游戏内筛选-主词条按槽位固定网格，每页尺寸一致，切部位不抖动。
+# 左栏窄，排两列：5 号位那 9 个选项在三列里会被挤掉半边。
 _MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
     4: ("生命值%", "攻击力%", "防御力%", "暴击率", "暴击伤害", "异常精通"),
     5: (
@@ -113,7 +113,9 @@ _MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
     ),
     6: ("生命值%", "攻击力%", "防御力%", "能量自动回复", "冲击力", "异常掌控"),
 }
-_MAINSTAT_COLS = 3
+_MAINSTAT_COLS = 2
+# 各部位的主词条页取同一个高度：最高的是 5 号位（1 个「不限」+ 9 个选项 = 5 行）。
+_MAINSTAT_PAGE_HEIGHT = 132
 
 STYLESHEET = """
 QMainWindow, QWidget#root, QScrollArea, QScrollArea > QWidget > QWidget {
@@ -122,6 +124,7 @@ QMainWindow, QWidget#root, QScrollArea, QScrollArea > QWidget > QWidget {
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
 }
 QLabel { color: #1a1a1a; }
+QLabel#rowLabel { color: #605e5c; }
 QLabel#hint { color: #605e5c; }
 QLabel#saveStateIdle { color: #8a8a8a; }
 QLabel#saveState { color: #107c10; font-weight: 700; }
@@ -220,6 +223,7 @@ QFrame#logPanel {
     border-radius: 8px;
 }
 QLabel#panelTitle { color: #605e5c; }
+QFrame#filterSplit { background: #e6e6e6; border: none; }
 QToolButton#logToggle {
     border: none;
     background: transparent;
@@ -238,8 +242,12 @@ QListWidget {
 QListWidget::item { padding: 8px 6px; }
 QListWidget::item:selected { background: #e8f3fc; color: #0078d7; }
 QSplitter::handle { background: #e1e1e1; width: 6px; }
-QSplitter#mainSplitter::handle:vertical { height: 8px; background: #dcdcdc; }
-QSplitter#mainSplitter::handle:vertical:hover { background: #bdbdbd; }
+QSplitter#mainSplitter::handle:vertical {
+    height: 6px;
+    background: #f8f9fc;
+    border-top: 1px solid #e1e1e1;
+}
+QSplitter#mainSplitter::handle:vertical:hover { border-top: 1px solid #b0b0b0; }
 QScrollBar:vertical { background: #f8f9fc; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -549,6 +557,7 @@ class PatternCard(QFrame):
 class StageSection(QWidget):
     require_changed = Signal()
     selection_changed = Signal()
+    propagate_require = Signal()
     PAGE_SIZE = 24
 
     def __init__(
@@ -586,6 +595,14 @@ class StageSection(QWidget):
         require_label = QLabel("本档要求")
         require_label.setObjectName("hint")
 
+        self.propagate_btn: QPushButton | None = None
+        if checkpoint == 0:
+            self.propagate_btn = QPushButton("递增下发")
+            self.propagate_btn.setToolTip(
+                "以 +0 的本档要求为 x，把 +3/+6/+9/+12/+15 的本档要求依次设为 x+1 ~ x+5。"
+            )
+            self.propagate_btn.clicked.connect(self.propagate_require.emit)
+
         bar = QFrame()
         bar.setObjectName("stageBar")
         header = QHBoxLayout(bar)
@@ -593,6 +610,8 @@ class StageSection(QWidget):
         header.addWidget(level)
         header.addWidget(require_label)
         header.addWidget(self.require)
+        if self.propagate_btn is not None:
+            header.addWidget(self.propagate_btn)
         header.addStretch()
         header.addWidget(self.count_label)
 
@@ -1036,6 +1055,8 @@ class MainWindow(QMainWindow):
         self._slot_plans: dict[int, dict] = {slot: empty_slot_plan(slot) for slot in SLOTS}
         self._jobs: list[TaskJob] = []
         self._editing_job_id: str | None = None
+        # 「应用于所有任务」那几个按钮：任务链为空时没有可铺的对象，统一禁用。
+        self._apply_buttons: list[QPushButton] = []
         self._run_thread = None
         self._controller = None
         self._close_after_run = False
@@ -1063,17 +1084,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([240, 340, 740])
+        splitter.setSizes([240, 360, 720])
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
 
-        # 上半：三栏。先装进普通容器，竖直分隔条才能整块拖。
+        # 红框：三栏 + 操作栏，算一整块。拖红框下边那条线就只改它的高度。
         upper = QWidget()
         upper.setObjectName("upperPane")
         upper_layout = QVBoxLayout(upper)
         upper_layout.setContentsMargins(0, 0, 0, 0)
-        upper_layout.setSpacing(0)
-        upper_layout.addWidget(splitter)
+        upper_layout.setSpacing(10)
+        upper_layout.addWidget(splitter, 1)
+        upper_layout.addWidget(self._build_action_bar(), 0)
 
         # 底部操作栏里的 _refresh_run_status() 会读它，得先有。
         self._log_tail = None
@@ -1115,26 +1137,28 @@ class MainWindow(QMainWindow):
         self.run_log.setMinimumHeight(60)
         log_layout.addWidget(self.run_log)
 
-        # 下半：操作栏 + 运行日志。竖分隔条只动这一整块，拖高拖矮只影响它。
+        # 下面那块：状态行 + 运行日志。自身高度不吃窗口拉伸，只被红框顶着上下移动。
         lower = QWidget()
         lower.setObjectName("lowerPane")
         lower_layout = QVBoxLayout(lower)
         lower_layout.setContentsMargins(0, 0, 0, 0)
-        lower_layout.setSpacing(10)
-        lower_layout.addWidget(self._build_bottom(), 0)
-        # 下半区多出来的高度全给日志面板，操作栏保持原样不被抻高。
+        lower_layout.setSpacing(6)
+        lower_layout.addWidget(self._build_status_bar(), 0)
         lower_layout.addWidget(log_box, 1)
 
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.setObjectName("mainSplitter")
         self._main_splitter.addWidget(upper)
         self._main_splitter.addWidget(lower)
-        self._main_splitter.setStretchFactor(0, 1)
-        self._main_splitter.setStretchFactor(1, 0)
+        # 窗口底边拉伸只多给下面那块（也就是日志窗）；红框自己不长高。
+        self._main_splitter.setStretchFactor(0, 0)
+        self._main_splitter.setStretchFactor(1, 1)
         self._main_splitter.setChildrenCollapsible(False)
-        self._main_splitter.setHandleWidth(8)
-        self._main_splitter.setSizes([430, 310])
-        self._main_splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
+        self._main_splitter.setHandleWidth(6)
+        self._main_splitter.setSizes([500, 270])
+        self._lower_height = 270
+        self._dragging_main_splitter = False
+        self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
         outer.addWidget(self._main_splitter, 1)
         self._refresh_run_status()
         self._load_path(self._path)
@@ -1165,6 +1189,8 @@ class MainWindow(QMainWindow):
         self._apply_sizes(self._main_splitter, data.get("main_splitter"))
         if data.get("on_top"):
             self.stay_on_top.setChecked(True)
+        # 布局落定后再记一次下面那块的高度——拖红框时照它锁。
+        QTimer.singleShot(0, self._remember_lower_height)
 
     def _persist_layout(self) -> None:
         """把当前布局写进 user/layout.json。写失败不影响使用。"""
@@ -1182,8 +1208,35 @@ class MainWindow(QMainWindow):
         if self._layout_ready and self.isVisible():
             self._layout_timer.start(800)
 
+    def _remember_lower_height(self) -> None:
+        """记下红线以下那块的高度，拖红框时照它锁住。"""
+        sizes = self._main_splitter.sizes()
+        if len(sizes) == 2:
+            self._lower_height = sizes[1]
+
+    def _on_main_splitter_moved(self, pos: int, index: int) -> None:  # noqa: ARG002
+        """拖红框下边那条线：只改红框（三栏 + 操作栏）的高度。
+
+        下面那块高度锁住不动，多出来的高度记到窗口头上——所以它只是被顶着上下移动，
+        自己不伸缩。窗口底边的拉伸才改下面那块（也就是日志窗）。
+        """
+        sizes = self._main_splitter.sizes()
+        if len(sizes) != 2:
+            return
+        delta = sizes[1] - self._lower_height
+        if delta:
+            self._dragging_main_splitter = True
+            try:
+                self.resize(self.width(), max(self.minimumHeight(), self.height() - delta))
+            finally:
+                self._dragging_main_splitter = False
+        self._queue_layout_save()
+
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
+        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
+        if self._layout_ready and not self._dragging_main_splitter:
+            QTimer.singleShot(0, self._remember_lower_height)
         self._queue_layout_save()
 
     def moveEvent(self, event) -> None:  # noqa: ANN001
@@ -1266,37 +1319,12 @@ class MainWindow(QMainWindow):
         self.weight_editor = WeightEditor()
         self.weight_editor.changed.connect(self._schedule_rebuild)
         weights_layout.addWidget(self.weight_editor)
+        self.apply_weights_btn = apply_weights = QPushButton("应用于所有任务")
+        apply_weights.setToolTip("把当前单价铺到任务链里已存在的每个任务；之后新建的任务不受影响。")
+        apply_weights.clicked.connect(self._apply_weights_to_all)
+        weights_layout.addWidget(apply_weights, 0, Qt.AlignmentFlag.AlignLeft)
+        self._apply_buttons.append(apply_weights)
         layout.addWidget(weights_box)
-
-        archive_box = QGroupBox("存档（权重+档位要求，各槽位共用）")
-        archive_layout = QVBoxLayout(archive_box)
-        archive_layout.setSpacing(4)
-        self.archive_combo = QComboBox()
-        self.archive_combo.setEditable(True)
-        self.archive_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.archive_combo.lineEdit().setPlaceholderText("选择或输入存档名称")
-        self._archive_names: set[str] = set()
-        self.archive_combo.currentTextChanged.connect(self._update_archive_buttons)
-        self.archive_apply_btn = apply_btn = QPushButton("套用")
-        apply_btn.clicked.connect(self._apply_archive)
-        self.archive_save_btn = save_btn = QPushButton("保存存档")
-        save_btn.clicked.connect(self._save_archive)
-        self.archive_delete_btn = del_btn = QPushButton("删除")
-        del_btn.clicked.connect(self._delete_archive)
-        arow1 = QHBoxLayout()
-        arow1.addWidget(self.archive_combo, 1)
-        arow1.addWidget(apply_btn)
-        arow2 = QHBoxLayout()
-        arow2.addWidget(save_btn)
-        arow2.addWidget(del_btn)
-        arow2.addStretch()
-        archive_layout.addLayout(arow1)
-        archive_layout.addLayout(arow2)
-        self.archive_status = QLabel()
-        self.archive_status.setWordWrap(True)
-        self.archive_status.setObjectName("hint")
-        archive_layout.addWidget(self.archive_status)
-        layout.addWidget(archive_box)
 
         flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
@@ -1319,51 +1347,98 @@ class MainWindow(QMainWindow):
         limit_row.addWidget(QLabel("个盘子"))
         limit_row.addStretch()
         task_limits.addLayout(limit_row)
+        self.apply_limit_btn = apply_limit = QPushButton("应用于所有任务")
+        apply_limit.setToolTip("把当前额度铺到任务链里已存在的每个任务；之后新建的任务不受影响。")
+        apply_limit.clicked.connect(self._apply_limit_to_all)
+        task_limits.addWidget(apply_limit, 0, Qt.AlignmentFlag.AlignLeft)
+        self._apply_buttons.append(apply_limit)
         layout.addWidget(task_box)
 
+        self._build_game_filter(layout)
+        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(panel)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(300)
+        scroll.setMaximumWidth(400)
+        return scroll
+
+    @staticmethod
+    def _row_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("rowLabel")
+        return label
+
+    def _build_game_filter(self, layout: QVBoxLayout) -> None:
+        """游戏内筛选：分两部分，都直接摆在面板上。
+
+        第一部分是套装，换套装仍然开弹窗挑；第二部分是部位与主词条——
+        1–6 号位不再进弹窗，4/5/6 有主词条可选，1/2/3 主词条固定，只显示提示。
+        """
+        game_box = QGroupBox("游戏内筛选（进仓库先重置再套用）")
+        game = QVBoxLayout(game_box)
+        game.setSpacing(4)
+
         self._filter_sets: list[str] = []
-        self._filter_dialog = QDialog(self)
-        self._filter_dialog.setWindowTitle("游戏内筛选（进仓库先重置再套用）")
-        self._filter_dialog.setMinimumWidth(420)
-        game_form = QFormLayout(self._filter_dialog)
+        set_row = QHBoxLayout()
+        set_row.setSpacing(4)
+        set_row.addWidget(self._row_label("套装"))
         self.set_summary = QLabel("未选")
         self.set_summary.setWordWrap(False)
         self.set_summary.setObjectName("hint")
-        pick_sets = QPushButton("选择套装")
-        pick_sets.clicked.connect(self._open_set_picker)
-        set_row = QHBoxLayout()
         set_row.addWidget(self.set_summary, 1)
+        pick_sets = QPushButton("选择套装")
+        pick_sets.setToolTip("打开套装列表勾选；一个都不勾＝不限套装。")
+        pick_sets.clicked.connect(self._open_set_picker)
         set_row.addWidget(pick_sets)
+        game.addLayout(set_row)
+        self.apply_sets_btn = apply_sets = QPushButton("应用于所有任务")
+        apply_sets.setToolTip("把当前套装铺到任务链里已存在的每个任务；之后新建的任务不受影响。")
+        apply_sets.clicked.connect(self._apply_sets_to_all)
+        game.addWidget(apply_sets, 0, Qt.AlignmentFlag.AlignLeft)
+        self._apply_buttons.append(apply_sets)
+
+        split = QFrame()
+        split.setObjectName("filterSplit")
+        split.setFixedHeight(1)
+        game.addWidget(split)
+
+        slot_row = QHBoxLayout()
+        slot_row.setSpacing(4)
+        slot_row.addWidget(self._row_label("部位"))
         self.filter_slots: dict[int, QRadioButton] = {}
-        self.slot_group = QButtonGroup(self._filter_dialog)
+        self.slot_group = QButtonGroup(game_box)
         self.slot_group.setExclusive(True)
-        slots_row = QHBoxLayout()
         for slot in SLOTS:
             radio = QRadioButton(str(slot))
             self.slot_group.addButton(radio, slot)
             self.filter_slots[slot] = radio
-            slots_row.addWidget(radio)
+            slot_row.addWidget(radio)
         self.filter_slots[4].setChecked(True)
         self.slot_group.idClicked.connect(self._on_slot_clicked)
-        slots_row.addStretch()
+        slot_row.addStretch()
+        game.addLayout(slot_row)
+
         self._main_boxes_by_slot: dict[int, dict[str, QRadioButton]] = {}
         self.filter_main_boxes: dict[str, QRadioButton] = {}
         self._main_groups: dict[int, QButtonGroup] = {}
         self._main_any_by_slot: dict[int, QRadioButton] = {}
         self.main_host = QStackedWidget()
         self.main_host.setObjectName("mainHost")
-        self.main_host.setFixedHeight(80)
+        self.main_host.setFixedHeight(_MAINSTAT_PAGE_HEIGHT)
         self._mainstat_pages: dict[int, QWidget] = {}
         for slot, names in _MAINSTAT_PAGES.items():
             boxes: dict[str, QRadioButton] = {}
             page = QWidget()
-            page.setFixedHeight(80)
+            page.setFixedHeight(_MAINSTAT_PAGE_HEIGHT)
             grid = QGridLayout(page)
             grid.setContentsMargins(0, 0, 0, 0)
-            grid.setSpacing(6)
+            grid.setSpacing(2)
             grid.setColumnStretch(0, 1)
             grid.setColumnStretch(1, 1)
-            grid.setColumnStretch(2, 1)
             group = QButtonGroup(page)
             self._main_groups[slot] = group
             any_main = QRadioButton("不限")
@@ -1382,50 +1457,27 @@ class MainWindow(QMainWindow):
             self._main_boxes_by_slot[slot] = boxes
             self.main_host.addWidget(page)
         empty_page = QWidget()
-        empty_page.setFixedHeight(80)
+        empty_page.setFixedHeight(_MAINSTAT_PAGE_HEIGHT)
         self.main_host.addWidget(empty_page)
+
+        main_row = QHBoxLayout()
+        main_row.setSpacing(4)
+        main_row.addWidget(self._row_label("主词条"))
+        main_row.addWidget(self.main_host, 1)
+        game.addLayout(main_row)
+
         self.main_hint = QLabel()
         self.main_hint.setObjectName("hint")
         self.main_hint.setWordWrap(True)
         self.main_hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.main_hint.setFixedHeight(48)
-        game_form.addRow("套装", set_row)
-        game_form.addRow("部位", slots_row)
-        game_form.addRow("主词条", self.main_host)
-        game_form.addRow("", self.main_hint)
-        done_row = QHBoxLayout()
-        done_row.addStretch()
-        done_btn = QPushButton("完成")
-        done_btn.clicked.connect(self._filter_dialog.accept)
-        done_row.addWidget(done_btn)
-        game_form.addRow("", done_row)
+        game.addWidget(self.main_hint)
 
-        game_box = QGroupBox("游戏内筛选（进仓库先重置再套用）")
-        game_row = QHBoxLayout(game_box)
-        self.filter_summary = QLabel("未设置")
-        self.filter_summary.setObjectName("hint")
-        self.filter_summary.hide()  # 长文本不再显示（顶出面板），只留选择按钮
-        pick_filter = QPushButton("选择…")
-        pick_filter.setFixedWidth(80)
-        pick_filter.setToolTip("套装、部位与主属性手动选择；副属性按右侧 0 级组合自动筛选，所有等级一起处理。")
-        pick_filter.clicked.connect(self._open_filter_dialog)
-        game_row.addWidget(pick_filter)
         substat_hint = QLabel("副词条：自动")
         substat_hint.setObjectName("hint")
         substat_hint.setToolTip("根据右侧初始 3 词、4 词的 0 级选择自动筛选；筛选数量从最低命中数选到 4。")
-        game_row.addWidget(substat_hint)
-        game_row.addStretch()
+        game.addWidget(substat_hint)
         layout.addWidget(game_box)
-        layout.addStretch()
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(panel)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(280)
-        scroll.setMaximumWidth(360)
-        return scroll
 
     def _build_chain(self) -> QWidget:
         panel = QWidget()
@@ -1509,6 +1561,7 @@ class MainWindow(QMainWindow):
                     break
         self.chain_list.blockSignals(False)
         self._sync_job_name_edit()
+        self._update_apply_buttons()
         self._update_status()
 
     def _editing_job(self) -> TaskJob | None:
@@ -1764,26 +1817,6 @@ class MainWindow(QMainWindow):
         width = max(self.set_summary.width(), 180)
         self.set_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
         self.set_summary.setToolTip(full)
-        self._update_filter_summary()
-
-    def _update_filter_summary(self) -> None:
-        parts = [f"{self._active_slot} 号位"]
-        if self._filter_sets:
-            parts.append("套装 " + "、".join(self._filter_sets))
-        else:
-            parts.append("套装不限")
-        mains = self._selected_mains()
-        if mains:
-            parts.append("主词条 " + "、".join(mains))
-        text = " · ".join(parts)
-        fm = QFontMetrics(self.filter_summary.font())
-        width = max(self.filter_summary.width(), 160)
-        self.filter_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
-        self.filter_summary.setToolTip(text)
-
-    def _open_filter_dialog(self) -> None:
-        self._update_set_summary()
-        self._filter_dialog.exec()
 
     def _open_set_picker(self) -> None:
         extra = [name for name in self._filter_sets if name not in SETS]
@@ -1793,6 +1826,39 @@ class MainWindow(QMainWindow):
         self._filter_sets = dialog.selected()
         self._mark_unsaved()
         self._update_set_summary()
+
+    def _update_apply_buttons(self) -> None:
+        """「应用于所有任务」得有任务可铺；任务链空了就置灰。"""
+        enabled = bool(self._jobs)
+        for button in self._apply_buttons:
+            button.setEnabled(enabled)
+
+    def _apply_to_all(self, label: str, mutate) -> None:  # noqa: ANN001
+        """把当前编辑器里的某项设置一次性铺到任务链里**已存在**的任务上。
+
+        只影响此刻已经有的任务：之后再新建的任务拿它自己的默认值，不会被这里绑住。
+        """
+        self._commit_editor()
+        if not self._jobs:
+            self.status.setText("任务链是空的：先新建任务，再应用。")
+            return
+        for job in self._jobs:
+            mutate(job)
+        self._mark_unsaved()
+        self._refresh_chain_list(self._editing_job_id)
+        self.status.setText(f"已把{label}应用到全部 {len(self._jobs)} 个任务。")
+
+    def _apply_weights_to_all(self) -> None:
+        weights = dict(self.weight_editor.weights())
+        self._apply_to_all("词条单价", lambda job: setattr(job, "weights", dict(weights)))
+
+    def _apply_limit_to_all(self) -> None:
+        limit = int(self.max_discs.value())
+        self._apply_to_all("处理额度", lambda job: setattr(job, "max_discs", limit))
+
+    def _apply_sets_to_all(self) -> None:
+        sets = tuple(self._filter_sets)
+        self._apply_to_all("套装", lambda job: setattr(job, "sets", sets))
 
     def _refresh_main_boxes(self, keep: set[str] | None = None) -> None:
         keep = set(keep if keep is not None else self._selected_mains())
@@ -1823,122 +1889,6 @@ class MainWindow(QMainWindow):
                 f"{self._active_slot} 号位主词条固定是{FIXED_MAINSTATS[self._active_slot]}，不用选。右侧只编这个部位的副词条。"
             )
 
-    def _load_archives(self) -> dict:
-        import json
-
-        from zzz_ddtool.paths import archives_file, legacy_archives_file
-
-        f = archives_file()
-        migrate = not f.exists()
-        source = legacy_archives_file() if migrate else f
-        if not source.exists():
-            return {}
-        data = json.loads(source.read_text(encoding="utf-8-sig"))
-        if not isinstance(data, dict) or any(not isinstance(item, dict) for item in data.values()):
-            raise ValueError("存档文件格式不正确")
-        if migrate:
-            self._write_archives(data)
-        return data
-
-    def _write_archives(self, data: dict) -> None:
-        import json
-
-        from zzz_ddtool.paths import archives_file
-
-        target = archives_file()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(target)
-
-    def _update_archive_buttons(self, _text: str = "") -> None:
-        exists = self.archive_combo.currentText().strip() in self._archive_names
-        self.archive_apply_btn.setEnabled(exists)
-        self.archive_delete_btn.setEnabled(exists)
-
-    def _archive_error(self, exc: Exception) -> None:
-        from zzz_ddtool.paths import archives_file
-
-        self.archive_status.setText(f"存档失败：{exc}")
-        self.archive_status.setToolTip(str(archives_file()))
-
-    def _refresh_archive_combo(self, select: str | None = None) -> None:
-        try:
-            names = sorted(self._load_archives())
-        except (OSError, ValueError) as exc:
-            self._archive_error(exc)
-            names = []
-        self._archive_names = set(names)
-        self.archive_combo.blockSignals(True)
-        self.archive_combo.clear()
-        self.archive_combo.addItems(names)
-        if select:
-            self.archive_combo.setCurrentText(select)
-        self.archive_combo.blockSignals(False)
-        self._update_archive_buttons()
-
-    def _save_archive(self) -> None:
-        name = self.archive_combo.currentText().strip()
-        if not name:
-            name, confirmed = QInputDialog.getText(self, "保存存档", "存档名称")
-            name = name.strip()
-            if not confirmed or not name:
-                return
-        snap = self._snapshot_slot()
-        try:
-            data = self._load_archives()
-            data[name] = {
-                "weights": dict(snap.get("weights") or {}),
-                "stage_require": {
-                    origin: dict(table)
-                    for origin, table in (snap.get("stage_require") or {}).items()
-                },
-            }
-            self._write_archives(data)
-        except (OSError, ValueError) as exc:
-            self._archive_error(exc)
-            return
-        self._refresh_archive_combo(name)
-        self.archive_status.setText(f"已保存「{name}」。")
-
-    def _apply_archive(self) -> None:
-        name = self.archive_combo.currentText().strip()
-        try:
-            data = self._load_archives().get(name)
-            if data is None:
-                raise ValueError(f"没有叫「{name}」的存档")
-            weights = {key: float(value) for key, value in dict(data.get("weights") or {}).items()}
-            stage_require = {
-                str(origin): {int(level): float(value) for level, value in dict(table).items()}
-                for origin, table in dict(data.get("stage_require") or {}).items()
-            }
-        except (OSError, ValueError, TypeError) as exc:
-            self._archive_error(exc)
-            return
-        if self._editing_job() is None:
-            self._add_job()
-        self.weight_editor.set_weights(weights)
-        self._apply_stage_require(stage_require)
-        self._selection_seed = None
-        self._schedule_rebuild()
-        self.archive_status.setText(f"已套用「{name}」到当前任务。")
-
-    def _delete_archive(self) -> None:
-        name = self.archive_combo.currentText().strip()
-        try:
-            data = self._load_archives()
-            if name not in data:
-                raise ValueError(f"没有叫「{name}」的存档")
-            del data[name]
-            self._write_archives(data)
-        except (OSError, ValueError) as exc:
-            self._archive_error(exc)
-            return
-        self._refresh_archive_combo()
-        self.archive_status.setText(f"已删除「{name}」。")
-
     def _snapshot_slot(self) -> dict:
         stage_require = {"three": {}, "four": {}}
         for (origin, checkpoint), section in self.sections.items():
@@ -1967,6 +1917,19 @@ class MainWindow(QMainWindow):
         self._refresh_main_boxes(set(plan.get("mainstats") or ()))
         self.weight_editor.set_weights(dict(plan.get("weights") or {}))
         self._apply_stage_require(plan.get("stage_require") or {})
+
+    def _propagate_require(self, section: StageSection) -> None:
+        """以 +0 档的本档要求 x 为基准，把同部位 +3~+15 依次设为 x+1 ~ x+5。
+
+        直接 setValue（不拦信号），每档照常刷新可见卡片并计入未保存状态，
+        与手动逐个改数值走完全相同的路径。
+        """
+        base = section.require.value()
+        for checkpoint in CHECKPOINTS:
+            if checkpoint <= 0:
+                continue
+            target = self.sections[(section.origin.value, checkpoint)]
+            target.require.setValue(base + checkpoint // 3)
 
     def _on_slot_clicked(self, slot: int) -> None:
         """换部位。
@@ -2005,7 +1968,6 @@ class MainWindow(QMainWindow):
     def _on_filter_changed(self) -> None:
         if self._loading:
             return
-        self._update_filter_summary()
         self._schedule_rebuild()
 
     def _origin_scroll(self, origin: Origin) -> dict[str, object]:
@@ -2016,6 +1978,7 @@ class MainWindow(QMainWindow):
             section = StageSection(origin, checkpoint, None)
             section.require_changed.connect(self._on_require_changed)
             section.selection_changed.connect(self._on_selection_changed)
+            section.propagate_require.connect(lambda sec=section: self._propagate_require(sec))
             self.sections[(origin.value, checkpoint)] = section
             box.addWidget(section)
         box.addStretch()
@@ -2025,7 +1988,11 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         return {"scroll": scroll, "inner": inner, "box": box}
 
-    def _build_bottom(self) -> QFrame:
+    def _build_action_bar(self) -> QFrame:
+        """操作栏：全选 / 生成组合 / 开始任务 …。
+
+        它属于红框内部——红框 = 三栏 + 这一行，拖红框下边那条线就是改红框的高度。
+        """
         bar = QFrame()
         bar.setObjectName("footer")
         footer = QVBoxLayout(bar)
@@ -2041,8 +2008,6 @@ class MainWindow(QMainWindow):
         self.start_btn.setObjectName("primary")
         self.start_btn.setToolTip("用当前配置开始处理；运行中游戏内按 F9 暂停 / F10 停止。")
         self.start_btn.clicked.connect(self._on_start_clicked)
-        self.status = QLabel()
-        self.status.setObjectName("status")
         self.refresh_cards_btn = QPushButton("生成组合")
         self.refresh_cards_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_cards_btn.clicked.connect(lambda: self.rebuild_cards())
@@ -2060,9 +2025,23 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop_run)
         row.addWidget(self.pause_btn)
         row.addWidget(self.stop_btn)
+        return bar
+
+    def _build_status_bar(self) -> QWidget:
+        """状态行：当前任务 / 运行状态 / 结果统计。
+
+        它在红线以下，和日志面板同属下面那块——高度不吃窗口拉伸，只被红框顶着走。
+        """
+        panel = QWidget()
+        panel.setObjectName("statusPanel")
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(2)
+        self.status = QLabel()
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
-        self.status.setWordWrap(True)
         # 结果统计：界面**不显示**详细日志正文，只给一行摘要 + 详细日志文件路径。
         self.run_stats_path_label = QLabel()
         self.run_stats_path_label.setObjectName("stats_path")
@@ -2074,16 +2053,15 @@ class MainWindow(QMainWindow):
         )
         self.run_stats_path_label.setOpenExternalLinks(True)
         self.run_stats_path_label.setVisible(False)
-        footer.addWidget(self.status)
-        footer.addWidget(self.run_status_label)
-        footer.addWidget(self.run_stats_path_label)
+        box.addWidget(self.status)
+        box.addWidget(self.run_status_label)
+        box.addWidget(self.run_stats_path_label)
         self._run_timer = QTimer(self)
         self._run_timer.setInterval(1000)
         self._run_timer.timeout.connect(self._refresh_run_status)
         self._run_timer.start()
         self._refresh_run_status()
-        self._refresh_archive_combo()
-        return bar
+        return panel
 
     def _on_start_clicked(self) -> None:
         """用当前 UI 配置在子线程启动 Runner；运行期间禁用按钮，结束自动恢复。"""

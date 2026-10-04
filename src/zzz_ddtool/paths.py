@@ -60,16 +60,6 @@ def assets_dir() -> Path:
     return Path(__file__).resolve().parent / "assets"
 
 
-def archives_file() -> Path:
-    """命名模板存档，保存在公共根目录的 user 中。"""
-    return user_dir() / "archives.json"
-
-
-def legacy_archives_file() -> Path:
-    """旧版存档位置，仅用于首次导入，导入后保留原文件。"""
-    return base_dir() / "user" / "archives.json"
-
-
 def last_config_file() -> Path:
     """记着「上次用的是哪份 yaml」，下次启动直接打开它。用户数据，更新永不碰。"""
     return user_dir() / "last-config.json"
