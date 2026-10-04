@@ -152,7 +152,6 @@ class JobStat:
     """
 
     index: int
-    name: str
     slot: int
     sets: tuple[str, ...]
     mainstats: tuple[str, ...]
@@ -185,11 +184,10 @@ class RunStats:
 
     # ------------------------------------------------------------ 打点接口
 
-    def job_begin(self, index: int, name: str, slot: int, sets, mainstats) -> None:
+    def job_begin(self, index: int, slot: int, sets, mainstats) -> None:
         self.jobs.append(
             JobStat(
                 index=index,
-                name=name or f"任务{index}",
                 slot=int(slot),
                 sets=tuple(str(s) for s in (sets or ())),
                 mainstats=tuple(str(s) for s in (mainstats or ())),
@@ -358,7 +356,6 @@ class RunStats:
             "jobs": [
                 {
                     "index": j.index,
-                    "name": j.name,
                     "slot": j.slot,
                     "sets": list(j.sets),
                     "mainstats": list(j.mainstats),

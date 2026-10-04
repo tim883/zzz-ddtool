@@ -98,11 +98,11 @@ def test_unfinished_disc_stays_out_of_level_distribution() -> None:
 def test_scan_counts_are_per_job_and_deduped() -> None:
     """格位计数按任务分开算：每个任务独立序号空间，跨任务求和没有意义。"""
     st = S.RunStats(tag="t")
-    st.job_begin(1, "任务1", 1, ("折枝剑歌",), ())
+    st.job_begin(1, 1, ("折枝剑歌",), ())
     st.scan(["c"] * 9, {0: "满级", 1: "满级"}, 1, max_index=8)
     st.scan(["c"] * 9, {0: "满级", 2: "已弃置"}, 2, max_index=8)
     st.job_end(10.0, 0)
-    st.job_begin(2, "任务2", 2, (), ())
+    st.job_begin(2, 2, (), ())
     st.scan(["c"] * 5, {0: "满级"}, 0, max_index=4)
     st.job_end(5.0, 0)
 
@@ -178,7 +178,7 @@ def test_spread_reports_fluctuation() -> None:
 
 def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None:
     st = S.RunStats(tag="20261004-120000")
-    st.job_begin(1, "任务1", 1, ("折枝剑歌",), ())
+    st.job_begin(1, 1, ("折枝剑歌",), ())
     st.scan(["c"] * 3, {0: "满级"}, 0, max_index=2)
     slot = st.disc_begin("j1", 0, 0)
     st.disc_stage(slot, 0, 3, 11.0)
@@ -201,7 +201,10 @@ def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None
     assert data["tag"] == "20261004-120000"
     assert data["outcomes"][S.OUTCOME_UPGRADED] == 1
     assert data["totals"]["processed"] == 1
-    assert data["jobs"][0]["name"] == "任务1"
+    assert data["jobs"][0]["slot"] == 1
+    assert data["jobs"][0]["sets"] == ["折枝剑歌"]
+    # 任务不再有名字字段：靠序号 + 部位 + 套装 + 主词条认
+    assert "name" not in data["jobs"][0]
     # 不能留下 .tmp 尾巴
     assert not (tmp_path / "stats.tmp").exists()
 
@@ -212,7 +215,7 @@ def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None
 def _sample() -> S.RunStats:
     """一件升满 15 级的盘 + 一个任务，用来生成完整报告。"""
     st = S.RunStats(tag="20261004-200000")
-    st.job_begin(1, "任务1", 1, ("折枝剑歌",), ())
+    st.job_begin(1, 1, ("折枝剑歌",), ())
     st.scan(["c"] * 3, {0: "满级"}, 0, max_index=2)
     slot = st.disc_begin("j1", 0, 0)
     for frm, to in ((0, 3), (3, 6), (6, 9), (9, 12), (12, 15)):

@@ -329,7 +329,6 @@ class Runner:
                 self._checkpoint()
                 self.stats.job_begin(
                     index,
-                    str(getattr(job, "name", "") or ""),
                     job.slot,
                     job.sets,
                     job.mainstats,
