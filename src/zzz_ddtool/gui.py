@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -117,6 +117,14 @@ _MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
 _MAINSTAT_COLS = 2
 # 各部位的主词条页取同一个高度：最高的是 5 号位（1 个「不限」+ 9 个选项 = 5 行）。
 _MAINSTAT_PAGE_HEIGHT = 132
+
+# 全局字体：字号必须**同时**写进样式表（见下面 STYLESHEET 末尾那条 QAbstractItemView）。
+# 列表类控件（任务链的 QListWidget、下拉框弹出的 QListView）只要被样式表命中，
+# Qt 就用**系统默认字体**（Windows 上是 9pt「微软雅黑 UI」）重算字号，
+# `apply_light_style` 里 app.setFont() 的 12pt 传不进去 —— 表现就是任务链、
+# 下拉列表的字比旁边同一排的标签小一圈。所以两处共用下面这两个常量，别各写各的。
+_UI_FONT_FAMILY = "Microsoft YaHei"
+_UI_FONT_PT = 12
 
 STYLESHEET = """
 QMainWindow, QWidget#root, QScrollArea, QScrollArea > QWidget > QWidget {
@@ -253,6 +261,15 @@ QScrollBar:vertical { background: #f8f9fc; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
+
+# item view 补字号：见 _UI_FONT_PT 上面的说明。少了这一条，任务链和所有下拉列表
+# 会退回系统默认的 9pt，比旁边的标签小一圈。QAbstractItemView 一并覆盖 QListView /
+# QListWidget / QTreeView / QTableView，以后再加列表控件也不会漏。
+# 字体链跟上面主规则保持一致，字号取 _UI_FONT_PT。
+STYLESHEET += (
+    '\nQAbstractItemView { font-family: "Microsoft YaHei", "Segoe UI", sans-serif;'
+    " font-size: %dpt; }\n" % _UI_FONT_PT
+)
 
 
 # 任务链条目里序号和正文之间的分隔符。序号和正文的「4号」都是数字，
@@ -1197,9 +1214,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
-        # 不允许把某一栏拖到 0 藏起来：拖到极限就停在该栏的最小宽（任务链 340 / 配置栏 300）
+        # 不允许把某一栏拖到 0 藏起来：拖到极限就停在该栏的最小宽（任务链 380 / 配置栏 300）
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([240, 360, 720])
+        splitter.setSizes([380, 360, 720])
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
 
@@ -1243,14 +1260,19 @@ class MainWindow(QMainWindow):
         log_head.addSpacing(28)
         log_head.addWidget(self.log_path)
         log_head.addStretch(1)
-        log_layout.addLayout(log_head)
+        # 标题行单独装一层，纵向不参与拉伸。否则收起日志后这块空出来的高度会顶到标签上，
+        # 标签被拉高、文字垂直居中，整行看着就像"飘"在空框正中间。
+        log_head_host = QWidget()
+        log_head_host.setLayout(log_head)
+        log_head_host.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        # 顶对齐：日志框比标题行高时，多出来的高度留在下面，别上下平分把标题挤到正中间。
+        log_layout.addWidget(log_head_host, 0, Qt.AlignmentFlag.AlignTop)
         self.run_log = QPlainTextEdit()
         self.run_log.setReadOnly(True)
         self.run_log.setMaximumBlockCount(300)
         self.run_log.setPlaceholderText("开始任务后，这里实时显示识别、判断、操作及失败原因。")
-        # 运行日志高度锁在 60~160：往下留一行能看，往上不让它无限霸占窗口。
-        self.run_log.setMinimumHeight(60)
-        self.run_log.setMaximumHeight(160)
+        # 日志高度不设上下限：拖窗口底边能自由拉高/压低，日志跟着长/短，
+        # 不再封顶（封顶会让拖到极限时 Windows 把"拖边框"退化成"移动窗口"）。
         log_layout.addWidget(self.run_log)
 
         # 下面那块：状态行 + 运行日志。自身高度不吃窗口拉伸，只被红框顶着上下移动。
@@ -1262,6 +1284,7 @@ class MainWindow(QMainWindow):
         lower_layout.addWidget(self._build_status_bar(), 0)
         lower_layout.addWidget(log_box, 1)
         self._lower_pane = lower
+        self.log_panel = log_box
 
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.setObjectName("mainSplitter")
@@ -1274,11 +1297,15 @@ class MainWindow(QMainWindow):
         self._main_splitter.setHandleWidth(6)
         self._main_splitter.setSizes([500, 270])
         self._lower_height = 270
-        # 窗口高度的上下限：只在 resizeEvent 里当钳制用，**不设成窗口的 min/max**。
-        self._window_min_height = 0
-        self._window_max_height = 16_777_215
+        # 收起日志前下半块的高度：展开时按它还回来。None = 还没收起过。
+        self._log_lower_height = None
         self._dragging_main_splitter = False
-        self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
+        # 红框下边那条分隔条由本窗口自己接管（见 eventFilter / _drag_red_line）。
+        self._red_handle = self._main_splitter.handle(1)
+        self._red_handle.installEventFilter(self)
+        self._red_drag_global_y: float | None = None
+        self._red_drag_upper = 0
+        self._red_drag_window_h = 0
         outer.addWidget(self._main_splitter, 1)
         self._refresh_run_status()
         self._load_path(self._path)
@@ -1305,12 +1332,20 @@ class MainWindow(QMainWindow):
         geometry = data.get("geometry")
         if isinstance(geometry, str) and geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
-        self._apply_sizes(self._config_splitter, data.get("config_splitter"))
-        self._apply_sizes(self._main_splitter, data.get("main_splitter"))
         if data.get("on_top"):
             self.stay_on_top.setChecked(True)
-        # 布局落定后再记一次下面那块的高度——拖红框时照它锁。
+        # 两条比例都延到窗口真正摆好之后再套。构造函数里窗口还没显示，分隔条宽度
+        # 还是出厂值，这会儿 setSizes 会被按错误的宽度归一化，比例就歪了
+        # （窗口被屏幕夹窄时尤其明显：中间栏本该最宽，结果比右栏还窄）。
+        saved = (data.get("config_splitter"), data.get("main_splitter"))
+        QTimer.singleShot(0, lambda: self._apply_saved_sizes(saved))
+        # 比例落定后再记一次下面那块的高度——拖红框时照它锁。
         QTimer.singleShot(0, self._remember_lower_height)
+
+    def _apply_saved_sizes(self, saved: tuple[object, object]) -> None:
+        """套用记录里的三栏 / 上下块比例。"""
+        self._apply_sizes(self._config_splitter, saved[0])
+        self._apply_sizes(self._main_splitter, saved[1])
 
     def _persist_layout(self) -> None:
         """把当前布局写进 user/layout.json。写失败不影响使用。"""
@@ -1328,71 +1363,61 @@ class MainWindow(QMainWindow):
         if self._layout_ready and self.isVisible():
             self._layout_timer.start(800)
 
-    def _remember_lower_height(self) -> None:
-        """记下红线以下那块的高度，拖红框时照它锁住；顺手刷新窗口的上下限。"""
-        sizes = self._main_splitter.sizes()
-        if len(sizes) == 2:
-            self._lower_height = sizes[1]
-        self._update_window_limits()
+    def _remember_lower_height(self, lower_height: int | None = None) -> None:
+        """记下红线以下那块的高度，拖红框时照它锁住。
 
-    def _update_window_limits(self) -> None:
-        """算出窗口最多能拖多高、最少能拖多矮，记在实例上。
-
-        **不调 setMinimumHeight/setMaximumHeight**：把窗口钉死成定长后，Windows 会把
-        「拖边框」退化成「移动窗口」——高度不变，整个窗口却跟着滑走。所以这里只记
-        数字，真正拦截放在 resizeEvent 里，窗口对系统始终是"可自由拉伸"的。
-
-        - 上限：日志窗离它的上限（160）还差多少，就给窗口留多少余量
-        - 下限：下面那块（状态行 + 日志）还愿意让出多少高度，窗口最多缩这么多
+        `lower_height` 只在刚改过分隔条、几何还没落定时显式传入（`sizes()` 有延迟，
+        读早了会拿到旧值，拖红框时按错基准算出错误的窗口高度）。
         """
-        if not self._layout_ready:
-            return
-        floor = self._lower_pane.minimumSizeHint().height()
-        shrinkable = max(0, self._lower_pane.height() - floor)
-        growable = 0
-        if self.run_log.isVisible():
-            growable = max(0, self.run_log.maximumHeight() - self.run_log.height())
-        self._window_min_height = max(0, self.height() - shrinkable)
-        self._window_max_height = self.height() + growable
+        if lower_height is None:
+            lower_height = self._lower_pane.height()
+        self._lower_height = lower_height
 
-    def _clamp_window_height(self) -> bool:
-        """把窗口高度拉回 [_window_min_height, _window_max_height] 之内。
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001
+        """接管红框下边那条分隔条：自己按鼠标位移拖，不走 QSplitter 的夹取。
 
-        返回是否真的改过——改过就说明这次是被钳回来的，别再重复调度后面的事。
+        QSplitter 会把分隔条夹在「下半块最小高度」处——下半块（状态行 + 日志）一旦
+        触到自己的最小高度，分隔条就再也拖不动，红框（三栏 + 操作栏）也就长不高了。
+        这里直接读鼠标位移，红框能一直往上长，窗口底边跟着往下走。
         """
-        target = min(max(self.height(), self._window_min_height), self._window_max_height)
-        if target == self.height():
-            return False
-        self.resize(self.width(), target)
-        return True
+        if obj is self._red_handle:
+            kind = event.type()
+            if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._red_drag_global_y = event.globalPosition().y()
+                self._red_drag_upper = self._main_splitter.widget(0).height()
+                self._red_drag_window_h = self.height()
+                return True
+            if kind == QEvent.Type.MouseMove and self._red_drag_global_y is not None:
+                self._drag_red_line(int(event.globalPosition().y() - self._red_drag_global_y))
+                return True
+            if kind == QEvent.Type.MouseButtonRelease and self._red_drag_global_y is not None:
+                self._red_drag_global_y = None
+                self._queue_layout_save()
+                return True
+        return super().eventFilter(obj, event)
 
-    def _on_main_splitter_moved(self, pos: int, index: int) -> None:  # noqa: ARG002
-        """拖红框下边那条线：只改红框（三栏 + 操作栏）的高度。
+    def _drag_red_line(self, dy: int) -> None:
+        """把红框按位移 `dy` 抬高（正）/压低（负）。
 
-        下面那块高度锁住不动，多出来的高度记到窗口头上——所以它只是被顶着上下移动，
-        自己不伸缩。窗口底边的拉伸才改下面那块（也就是日志窗）。
+        下半块高度锁死不动，所以红框长高多少，窗口就跟着长高多少——它只是被顶下去。
+        窗口最底下那条边才改下半块（也就是日志窗）。
         """
-        sizes = self._main_splitter.sizes()
-        if len(sizes) != 2:
-            return
-        delta = sizes[1] - self._lower_height
-        if delta:
-            self._dragging_main_splitter = True
-            try:
-                self.resize(self.width(), max(self._window_min_height, self.height() - delta))
-            finally:
-                self._dragging_main_splitter = False
-            self._update_window_limits()
-        self._queue_layout_save()
+        upper = self._main_splitter.widget(0)
+        wanted = max(max(0, upper.minimumSizeHint().height()), self._red_drag_upper + dy)
+        delta = wanted - self._red_drag_upper
+        self._dragging_main_splitter = True
+        try:
+            # 先长窗口，再摆比例：窗口不够高时 setSizes 会被夹，红框就顶不上去。
+            self.resize(self.width(), max(1, self._red_drag_window_h + delta))
+            self._main_splitter.setSizes([wanted, max(0, self._lower_height)])
+        finally:
+            self._dragging_main_splitter = False
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
-        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记、也别钳。
+        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
         if self._layout_ready and not self._dragging_main_splitter:
-            # 用户拖窗口边：超出上下限就弹回去。窗口本身不设 min/max，
-            # 所以系统始终按"拉伸"处理，不会退化成移动窗口。
-            if not self._clamp_window_height():
-                QTimer.singleShot(0, self._remember_lower_height)
+            QTimer.singleShot(0, self._remember_lower_height)
         self._queue_layout_save()
 
     def moveEvent(self, event) -> None:  # noqa: ANN001
@@ -1638,9 +1663,11 @@ class MainWindow(QMainWindow):
 
     def _build_chain(self) -> QWidget:
         panel = QWidget()
-        # 条目要放「序号 │ 4号 · 套装 · 主词条」，最长的一行（两个套装 + 长主词条）实测要 323px，
-        # 220–260 只能看到半截。放宽 + 里面少留白，配合省略号和悬停全文。
-        panel.setMinimumWidth(340)
+        # 条目要放「序号 │ 4号 · 套装 · 主词条」。正文可用宽 = 栏宽 − 序号列 − 竖线两侧 − 内边距，
+        # 12pt 下扣掉约 85px；实测「4号 · 双套装 · 暴击伤害」要 261px、「…· 能量自动回复」
+        # 要 293px，所以要 380 才两行都不收省略号（340 连常见的双套装行都差 6px）。
+        # 上限 420 兜住更长的组合，再长就靠省略号 + 悬停全文。
+        panel.setMinimumWidth(380)
         panel.setMaximumWidth(420)
         self.chain_panel = panel
         layout = QVBoxLayout(panel)
@@ -2432,10 +2459,42 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "检查更新", f"{detail}\n\n该版本未附带可下载的更新包。")
 
     def _toggle_run_log(self, expanded: bool) -> None:
-        """收起时只藏日志文本框，标题行留着——不然没地方再展开。"""
+        """收起/展开运行日志。
+
+        收起时日志区整个让位：日志框收掉、只留标题行，**窗口跟着变矮一截**（下面少掉一块），
+        展开时原样长回来。窗口上沿不动，只有底边升降。
+        """
         self.log_toggle.setText("▼" if expanded else "▶")
         self.log_toggle.setToolTip("收起运行日志" if expanded else "展开运行日志")
-        self.run_log.setVisible(expanded)
+
+        before = self._lower_pane.height()
+        if expanded:
+            self.run_log.setVisible(True)
+            self._lower_pane.layout().activate()
+            # 展开：把上次收起让出去的高度要回来，但不低于"日志框刚好放得下"的高度
+            hint = self._lower_pane.minimumSizeHint().height()
+            target = max(hint, self._log_lower_height or hint)
+        else:
+            # 日志框让出的高度 = 日志框本身 + 它与标题行之间的间距。
+            # 不从 minimumSizeHint 取：那个值有缓存，隐藏后未必立刻刷新。
+            freed = self.run_log.height() + self.log_panel.layout().spacing()
+            self._log_lower_height = before
+            self.run_log.setVisible(False)
+            self._lower_pane.layout().activate()
+            target = max(0, before - freed)
+
+        delta = target - before
+        if delta:
+            # 下半块变多少，窗口就变多少：上面（三栏）高度不动，只有底边升降。
+            # 自己改窗口大小，别让 resizeEvent 的钳制把它弹回原样。
+            self._dragging_main_splitter = True
+            try:
+                self.resize(self.width(), max(1, self.height() + delta))
+                total = sum(self._main_splitter.sizes())
+                self._main_splitter.setSizes([max(0, total - target), target])
+            finally:
+                self._dragging_main_splitter = False
+        self._remember_lower_height(target)
 
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
@@ -2970,7 +3029,7 @@ def apply_light_style(app: QApplication) -> None:
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#0078d7"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(palette)
-    font = QFont("Microsoft YaHei")
+    font = QFont(_UI_FONT_FAMILY, _UI_FONT_PT)
     if font.exactMatch():
         app.setFont(font)
     app.setStyleSheet(STYLESHEET)

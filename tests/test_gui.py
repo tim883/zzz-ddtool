@@ -11,6 +11,20 @@ from PySide6.QtWidgets import QApplication
 from zzz_ddtool.gui import MainWindow, WeightEditor, read_layout, write_layout
 from zzz_ddtool.models import Action, Disc, Substat
 
+# 离屏平台默认拿不到「微软雅黑」，字体退化成 Sans Serif —— 字宽跟真实界面差 30%
+# （同一串「4号 · 静听嘉音、折枝剑歌 · 暴击伤害」实测 336px vs 261px），
+# 按字体宽度做的断言会失真。把系统字体显式喂给 Qt，让离屏量出来的字宽跟真机一致。
+_REAL_FONT_CANDIDATES = (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyh.ttf")
+
+
+def _load_real_font() -> None:
+    from PySide6.QtGui import QFontDatabase
+
+    for path in _REAL_FONT_CANDIDATES:
+        if os.path.exists(path):
+            QFontDatabase.addApplicationFont(path)
+            return
+
 
 def wait_until(qapp, predicate, timeout=10):
     import time
@@ -32,6 +46,7 @@ def refresh_cards(window, qapp):
 @pytest.fixture(scope="module")
 def qapp() -> QApplication:
     app = QApplication.instance() or QApplication([])
+    _load_real_font()
     yield app
 
 
@@ -317,31 +332,51 @@ def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_p
 
 
 def test_chain_panel_is_wide_enough_for_label(qapp: QApplication, tmp_path) -> None:
-    """任务链栏要放得下常见的长标签（双套装 + 主词条，实测全行 291px）。
+    """任务链栏要放得下常见的长标签（双套装 + 主词条）。
 
-    最极端的一行（双套装 + 「能量自动回复」）拉满 420px 才全放下，默认靠省略号 +
-    悬停全文兜底，所以这里只保证常见长度不打折。
+    ⚠️ 两个坑都踩过，别再退回去：
+    1. 判据不能用「整行文本宽 ≤ viewport 宽」——那样算漏了序号列和竖线占的约 39px，
+       340px 栏宽下「4号 · 静听嘉音、折枝剑歌 · 暴击伤害」实际差 6px 被收成省略号，
+       守卫却照样绿。这里按 `_JobItemDelegate` 的真实公式算正文可用宽再比。
+    2. 光设 `window._filter_sets` 不会写进任务，条目还停在「4号 · 未选套装」——
+       旧用例就是这么空转的。要么直接改任务字段，要么调 `_commit_editor()`；
+       下面顺手断言一次文本，防止又悄悄变成空转。
     """
-    from PySide6.QtGui import QFontMetrics
+    from PySide6.QtGui import QFont, QFontMetrics
+
+    from zzz_ddtool.gui import _JOB_ITEM_SEP, _job_seq_width
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1400, 900)
     window.show()
     qapp.processEvents()
     window._add_job()
-    window.filter_slots[4].click()
-    window._filter_sets = ["静听嘉音", "折枝剑歌"]
-    window._update_set_summary()
-    window._refresh_main_boxes({"暴击伤害"})
+    job = window._jobs[0]
+    job.slot = 4
+    job.sets = ("静听嘉音", "折枝剑歌")
+    job.mainstats = ("暴击伤害",)
+    window._refresh_chain_list()
     qapp.processEvents()
 
-    assert window.chain_panel.minimumWidth() >= 340  # 220 时标签只看到半截
+    label = window.chain_list.item(0).text()
+    assert label == f"1 {_JOB_ITEM_SEP} 4号 · 静听嘉音、折枝剑歌 · 暴击伤害", label
+
+    assert window.chain_panel.minimumWidth() >= 380  # 340 时上面这行会被收省略号
     assert window.chain_panel.maximumWidth() >= 400  # 拉得动才能把极端长行也放全
 
-    text = window.chain_list.item(0).text()
-    need = QFontMetrics(window.chain_list.font()).horizontalAdvance(text)
-    room = window.chain_list.viewport().width()
-    assert need <= room, (text, need, room)
+    base = QFont(window.chain_list.font())
+    fm = QFontMetrics(base)
+    seq_font = QFont(base)
+    seq_font.setWeight(QFont.Weight.Medium)
+    fm_seq = QFontMetrics(seq_font)
+    room = window.chain_list.viewport().width() - 10  # 委托左右各留 5px
+    room -= _job_seq_width(fm_seq, "1")
+    room -= fm.horizontalAdvance(_JOB_ITEM_SEP) + 10
+
+    # 正文（去掉「序号 │ 」前缀）必须放得下
+    body = label.partition(_JOB_ITEM_SEP)[2].strip()
+    need = fm.horizontalAdvance(body)
+    assert need <= room, (body, need, room)
     window.close()
 
 
@@ -364,6 +399,47 @@ def test_job_seq_column_keeps_two_digits_width(qapp: QApplication) -> None:
     assert width("1") == width("99")
     assert width("100") > width("10")  # 三位数按实际宽度放宽，不截断
     qapp.processEvents()
+
+
+def test_item_views_keep_the_application_font(qapp: QApplication, tmp_path) -> None:
+    """列表类控件必须跟应用字体同号，不能退回系统默认的 9pt。
+
+    样式表只要命中了 item view（任务链的 QListWidget、下拉框弹出的 QListView），
+    Qt 就改用**系统默认字体**重算字号 —— `apply_light_style` 里 app.setFont() 的
+    12pt 传不进去，于是任务链、下拉列表的字比旁边同排的标签小一圈。
+    修法是样式表里给 QAbstractItemView 补一条字号。
+
+    ⚠️ 离屏平台测不出这个退化（离屏没有独立的系统默认字体，本来就不会掉到 9pt），
+    所以这里主要钉「样式表里的规则存在、并且跟 _UI_FONT_PT 同号」；真在 Windows
+    平台上跑时再补一条实际字号的断言。
+    """
+    import re
+
+    from zzz_ddtool.gui import STYLESHEET, _UI_FONT_FAMILY, _UI_FONT_PT
+
+    # 找「选择器里带 QAbstractItemView」的规则（`QComboBox QAbstractItemView` 那种
+    # 弹窗规则不算），至少要有一条把字号写死，否则真实平台上会掉回系统 9pt
+    rules = [
+        body
+        for selector, body in re.findall(r"([^{}]*)\{([^}]*)\}", STYLESHEET)
+        if selector.strip().split(",")[-1].strip() == "QAbstractItemView"
+    ]
+    assert rules, "样式表里没有给 QAbstractItemView 单独定字号的规则"
+    assert any(f"font-size: {_UI_FONT_PT}pt" in body for body in rules), rules
+    assert any(_UI_FONT_FAMILY in body for body in rules), rules
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1400, 900)
+    window.show()
+    qapp.processEvents()
+    window._add_job()
+    qapp.processEvents()
+
+    if qapp.platformName() != "offscreen":  # 真实平台上才有系统默认字体这回事
+        app_font = qapp.font()
+        assert window.chain_list.font().pointSize() == app_font.pointSize()
+        assert window.chain_list.font().family() == app_font.family()
+    window.close()
 
 
 def test_config_columns_cannot_be_collapsed(qapp: QApplication, tmp_path) -> None:
@@ -393,6 +469,48 @@ def test_config_columns_cannot_be_collapsed(qapp: QApplication, tmp_path) -> Non
     splitter.setSizes([0, 0, 0])
     qapp.processEvents()
     assert all(size > 0 for size in splitter.sizes()), splitter.sizes()
+    window.close()
+
+
+def test_collapsing_run_log_keeps_title_at_top(qapp: QApplication, tmp_path) -> None:
+    """收起运行日志：日志框收掉只留标题行，窗口跟着变矮一截。
+
+    曾经的毛病有两个：一是收起只隐藏日志文本框，日志框原地留个同样的空框，
+    空出来的高度全压在标题行上，标题被拉高、文字垂直居中，整行看着"飘"在
+    空框正中间；二是收起后窗口高度不变（该矮下来的一截没矮）。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1500, 800)
+    window.show()
+    qapp.processEvents()
+    window._add_job()
+    qapp.processEvents()
+
+    panel = window.log_panel
+    title = window.log_title
+    expanded_lower = window._lower_pane.height()
+    win_h = window.height()
+    log_h = window.run_log.height()
+
+    window.log_toggle.click()  # 收起
+    qapp.processEvents()
+
+    assert not window.run_log.isVisible()
+    # 只留标题行：日志框收到跟标题行一个量级，不再是个空框
+    assert panel.height() <= title.height() + 40, (panel.height(), title.height())
+    # 标题贴在框顶（有个 8px 内边距），不是飘到中间
+    assert title.mapTo(panel, title.rect().topLeft()).y() <= 12
+    # 窗口跟着变矮一截：让出的就是日志框那块高度，不是让给上面三栏
+    assert window.height() < win_h, (window.height(), win_h)
+    assert win_h - window.height() >= log_h, (win_h - window.height(), log_h)
+    # 收起后窗口还得能拖：日志和窗口都不设高度限值，不会被钳住
+    assert window.run_log.maximumHeight() == 16_777_215
+
+    window.log_toggle.click()  # 展开
+    qapp.processEvents()
+    assert window.run_log.isVisible()
+    assert window._lower_pane.height() == expanded_lower
+    assert window.height() == win_h  # 长回原来的高度
     window.close()
 
 
@@ -1551,12 +1669,22 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     assert len(saved["config_splitter"]) == 3
     assert len(saved["main_splitter"]) == 2
     saved_main = list(saved["main_splitter"])
+    print("PROBE saved_main", saved_main, "cfg", saved["config_splitter"])
 
     reopened = MainWindow(config_path=tmp_path / "t.yaml")
     reopened.show()
     qapp.processEvents()
     assert reopened.stay_on_top.isChecked()
+    # 离屏窗口很窄（不到 1100px），三栏会被各自的最小宽度顶住，比例根本体现不出来；
+    # 撑到跟保存时差不多的宽度，再套一次记录里的比例，才验得出"比例真的存下来了"。
+    reopened.resize(1500, 900)
+    opened_w = reopened._config_splitter.width()
+    reopened._apply_sizes(reopened._config_splitter, saved["config_splitter"])
+    reopened._apply_sizes(reopened._main_splitter, saved_main)
+    qapp.processEvents()
     sizes = reopened._config_splitter.sizes()
+    if reopened._config_splitter.width() < 1200:
+        pytest.skip(f"离屏窗口只有 {opened_w}px 宽，三栏全被最小宽度夹住，比例无从体现")
     # 出厂默认是 [240, 340, 740]（中间最窄）。恢复成功才会是中间最宽。
     assert sizes[1] > sizes[2]
     # 下面那块的比例照原样恢复（默认 [500, 270]，拖过之后不该回到默认）
@@ -1616,9 +1744,9 @@ def test_run_log_title_row_has_collapse_toggle(qapp: QApplication, tmp_path) -> 
     window.show()
     qapp.processEvents()
 
-    # 高度锁在 60~160：往下留一行能看，往上不让它无限霸占窗口
-    assert window.run_log.minimumHeight() == 60
-    assert window.run_log.maximumHeight() == 160
+    # 日志高度不设上下限：拖窗口底边能自由拉高/压低
+    assert window.run_log.minimumHeight() == 0
+    assert window.run_log.maximumHeight() == 16_777_215
 
     # 默认展开：倒三角朝下，日志框可见
     assert window.log_toggle.isChecked()
@@ -1670,10 +1798,10 @@ def test_red_line_splitter_grows_upper_block_only(qapp: QApplication, tmp_path) 
     upper_before = upper.height()
     log_before = window.run_log.height()
 
-    # 模拟把红线往下拖 120px：上半 +120、下半 -120
-    splitter.setSizes([upper_before + 120, lower.height() - 120])
-    qapp.processEvents()
-    window._on_main_splitter_moved(splitter.handle(1).y(), 1)
+    # 把红线往下拖 120px（= 红框抬高 120）
+    window._red_drag_upper = upper_before
+    window._red_drag_window_h = window_height
+    window._drag_red_line(120)
     qapp.processEvents()
 
     # 红框长高了，窗口跟着长高
@@ -1681,6 +1809,39 @@ def test_red_line_splitter_grows_upper_block_only(qapp: QApplication, tmp_path) 
     assert window.height() > window_height
     # 下面那块高度锁住，只被顶下去了
     assert abs(window.run_log.height() - log_before) <= 4
+    window.close()
+
+
+def test_red_line_can_still_grow_upper_at_lower_floor(qapp: QApplication, tmp_path) -> None:
+    """下半块已经缩到最小高度时，红框照样能往上长——不能卡住。
+
+    这是 QSplitter 的坑：它会把分隔条夹在「下半块最小高度」处，下半块触底后分隔条
+    就不动了，红框（三栏 + 操作栏）再也拉不高。所以分隔条的拖动由窗口自己接管。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper = window._main_splitter.widget(0)
+    lower = window._main_splitter.widget(1)
+
+    # 先把下半块压到它的最小高度（模拟日志窗已经缩到最矮）
+    window._main_splitter.setSizes([upper.height() + 400, 1])
+    qapp.processEvents()
+    floor = lower.height()
+    upper_before = upper.height()
+    win_before = window.height()
+
+    window._red_drag_upper = upper_before
+    window._red_drag_window_h = win_before
+    window._drag_red_line(150)
+    qapp.processEvents()
+
+    # 下半块还在最小高度，但红框实打实长高了、窗口也跟着长高
+    assert upper.height() >= upper_before + 140, (upper.height(), upper_before)
+    assert window.height() >= win_before + 140, (window.height(), win_before)
+    assert lower.height() <= floor + 4, (lower.height(), floor)
     window.close()
 
 
@@ -1701,72 +1862,73 @@ def test_window_resize_only_grows_lower_block(qapp: QApplication, tmp_path) -> N
     assert window._main_splitter.widget(0).height() == upper_before
 
 
-def test_window_shrink_stops_at_log_floor_never_squeezes_upper(qapp: QApplication, tmp_path) -> None:
-    """窗口底边向上缩：只缩日志窗；缩到日志最小高度后窗口就缩不动，三栏永不被挤压。"""
-    window = MainWindow(config_path=tmp_path / "t.yaml")
-    window.resize(1320, 900)
-    window.show()
-    qapp.processEvents()
+def test_window_shrink_takes_from_log_first_then_stops(qapp: QApplication, tmp_path) -> None:
+    """窗口底边向上缩：先缩日志窗；日志缩到最小后窗口就缩不动了。
 
-    upper = window._main_splitter.widget(0)
-    upper_before = upper.height()
-
-    # 一路向上缩，越过日志窗的最小高度
-    for h in (800, 750, 700, 650):
-        window.resize(1320, h)
-        qapp.processEvents()
-        assert upper.height() == upper_before, h
-        assert window.run_log.height() >= window.run_log.minimumHeight(), h
-
-    # 日志触底后再缩：窗口停在最矮处，三栏还是原样
-    floor_height = window.height()
-    window.resize(1320, 500)
-    qapp.processEvents()
-    assert window.height() == floor_height
-    assert upper.height() == upper_before
-    window.close()
-
-
-def test_window_grow_stops_at_log_ceiling(qapp: QApplication, tmp_path) -> None:
-    """窗口底边向下拉：日志涨到 160 就封顶，窗口不再被拉长，三栏也不跟着长。"""
-    window = MainWindow(config_path=tmp_path / "t.yaml")
-    window.resize(1320, 900)
-    window.show()
-    qapp.processEvents()
-
-    upper = window._main_splitter.widget(0)
-    upper_before = upper.height()
-    ceiling = window.run_log.maximumHeight()
-    # 900 高时日志已经顶到上限，窗口高度此刻就是最高点
-    top = window.height()
-    assert window.run_log.height() == ceiling
-
-    # 一路向下拉：窗口不长、日志不长、三栏不长
-    for h in (1000, 1100, 1400):
-        window.resize(1320, h)
-        qapp.processEvents()
-        assert window.height() == top, h
-        assert window.run_log.height() == ceiling, h
-        assert upper.height() == upper_before, h
-    window.close()
-
-
-def test_window_height_is_clamped_not_pinned(qapp: QApplication, tmp_path) -> None:
-    """窗口不给自己设最大高度——钉死成定长后，Windows 会把拖边框退化成移动窗口。
-
-    上下限只在 resizeEvent 里钳，所以窗口属性本身必须保持"可自由拉伸"（未设 max）。
+    日志窗不再有 60px 最小高度，缩到哪儿由上下两块的布局最小高度兜底——三栏（红框）
+    最多被压到自己的最小高度，不会被压没。
     """
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1320, 900)
     window.show()
     qapp.processEvents()
 
-    assert window.maximumHeight() == 16_777_215  # 没被 setMaximumHeight 钉住
-    # 但内部限值是真的——往上拉仍被钳回去
-    assert window._window_max_height == window.height()
+    upper = window._main_splitter.widget(0)
+    lower = window._main_splitter.widget(1)
+    upper_before = upper.height()
+
+    # 日志窗还有余量时，缩的全是日志，三栏纹丝不动
+    for h in (880, 850, 800):
+        window.resize(1320, h)
+        qapp.processEvents()
+        assert upper.height() == upper_before, h
+
+    # 一路缩到底：窗口停在布局最小高度，上下两块各自止步于自身最小高度
+    window.resize(1320, 300)
+    qapp.processEvents()
+    assert window.height() > 300  # 有布局最小高度兜底，缩不到 300
+    assert upper.height() >= upper.minimumSizeHint().height()
+    assert lower.height() >= lower.minimumSizeHint().height()
+    window.close()
+
+
+def test_window_grow_lets_log_grow_without_ceiling(qapp: QApplication, tmp_path) -> None:
+    """窗口底边向下拉：日志窗跟着长高、不封顶；三栏高度不动。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper = window._main_splitter.widget(0)
+    upper_before = upper.height()
+    log_before = window.run_log.height()
+
+    window.resize(1320, 1400)
+    qapp.processEvents()
+
+    assert window.run_log.height() > log_before  # 日志跟着长
+    assert window.run_log.height() > 160         # 不再封顶在 160
+    assert upper.height() == upper_before        # 三栏不长
+    window.close()
+
+
+def test_window_height_is_not_pinned_or_clamped(qapp: QApplication, tmp_path) -> None:
+    """窗口和日志都不设高度上限，拖边框能自由拉伸。
+
+    钉死成定长、或在 resizeEvent 里把高度钳回去，Windows 都会把"拖边框"退化成
+    "移动窗口"——所以高度一律不限制，交给用户拖。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    assert window.maximumHeight() == 16_777_215  # 窗口没被 setMaximumHeight 钉住
+    assert window.run_log.maximumHeight() == 16_777_215  # 日志也没封顶
+    # 往上拉不再被钳回去（旧版会弹回 900）
     window.resize(1320, 1500)
     qapp.processEvents()
-    assert window.height() == 900
+    assert window.height() == 1500
     window.close()
 
 
