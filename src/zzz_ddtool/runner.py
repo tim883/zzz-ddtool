@@ -46,6 +46,15 @@ from zzz_ddtool.navigation import (
     anchor_screen_rows,
 )
 from zzz_ddtool.ocr import OcrError, parse_disc
+from zzz_ddtool.paths import stats_dir
+from zzz_ddtool.stats import (
+    OUTCOME_DISCARDED,
+    OUTCOME_FAILED,
+    OUTCOME_SKIPPED,
+    OUTCOME_UPGRADED,
+    RunStats,
+    outcome_for_action,
+)
 from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
 from zzz_ddtool.traversal import (
     RESOLVED_STATUSES,
@@ -112,6 +121,8 @@ class Runner:
         self.material_slot = max(0, int(material_slot))
         self.log = get_logger("zzz_ddtool.runner")
         self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
+        # 运行统计：收尾时写成 log/stats/<tag>.json + 一段中文摘要进文本日志。
+        self.stats = RunStats(tag=self.trace.tag)
         self.results: list[RunResult] = []
         self._processed = 0
         self._job_started_at = 0
@@ -302,10 +313,26 @@ class Runner:
         self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), total_limit)
         self._set_status("run_start", f"jobs={len(jobs)}")
         self.trace.ok("unknown", "run", f"共 {len(jobs)} 个任务，各任务独立限额，合计最多处理 {total_limit} 个盘")
+        run_started = time.monotonic()
         try:
-            for job in jobs:
+            for index, job in enumerate(jobs, 1):
                 self._checkpoint()
-                self._run_job(job)
+                self.stats.job_begin(
+                    index,
+                    str(getattr(job, "name", "") or ""),
+                    job.slot,
+                    job.sets,
+                    job.mainstats,
+                )
+                job_started = time.monotonic()
+                try:
+                    self._run_job(job)
+                finally:
+                    # 进模型前就记上用量：任务中途抛错也要能看到它花了多久。
+                    self.stats.job_end(
+                        time.monotonic() - job_started,
+                        self._processed - self._job_started_at,
+                    )
             self.outcome = "completed"
             self.end_reason = f"已处理 {self._processed} 个盘"
         except RunnerStopped:
@@ -321,11 +348,27 @@ class Runner:
             if self.hotkeys is not None:
                 self.hotkeys.close()
             self.trace.finish()
+            self._finish_stats(run_started)
             self._set_status(self.outcome, self.end_reason)
             logging.getLogger("zzz_ddtool").removeHandler(overlay_handler)
             overlay_handler.close()
         self.log.info("run %s processed=%d", self.outcome, self._processed)
         return list(self.results)
+
+    def _finish_stats(self, run_started: float) -> None:
+        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON。
+
+        统计本身出问题不影响任务结果，所以整段兜住异常只记一条警告。
+        """
+        try:
+            self.stats.seconds = time.monotonic() - run_started
+            self.stats.absorb_steps(self.trace.spans)
+            self.stats.log_summary(self.log)
+            target = self.stats.write(stats_dir() / f"{self.stats.tag}.json")
+            if target is not None:
+                self.log.info("统计已写入 %s", target)
+        except Exception:
+            self.log.warning("运行统计生成失败（不影响本轮结果）", exc_info=True)
 
     def _valid_max_pages(self) -> bool:
         value = self.preset.max_pages
@@ -338,16 +381,20 @@ class Runner:
         self._job_max_discs = self._job_limit(job)
         self.log.info("job start slot=%d sets=%s mains=%s", job.slot, job.sets, job.mainstats)
         hwnd = self._bind_instance()
+        navigate_started = time.monotonic()
         try:
             goto_warehouse(hwnd)
             self.trace.ok("drive_disc", "navigate", "已到驱动盘仓库")
         except NavError as exc:
             self.trace.fail("unknown", "navigate", str(exc))
             raise RunnerError(f"导航失败：{exc}") from exc
+        finally:
+            self.stats.span("导航", "到驱动盘仓库", time.monotonic() - navigate_started)
 
         # 滚轮协议必须在设置筛选之前备好：标定要选第 3 行的盘做锚点，而筛选会把列表
         # 裁短（实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点，标定必失败。
-        self._ensure_profile(hwnd)
+        with self.stats.timed("导航", "滚轮协议准备"):
+            self._ensure_profile(hwnd)
 
         image, page, method, _hwnd = self._grab()
         sub_preset = self._sub_preset(job)
@@ -357,6 +404,7 @@ class Runner:
         extra_filter = {}
         if substat_filter.names:
             extra_filter = {"substats": substat_filter.names, "substat_counts": substat_filter.counts}
+        filter_started = time.monotonic()
         apply_game_filter(
             hwnd,
             image.width(),
@@ -366,6 +414,7 @@ class Runner:
             mainstats=job.mainstats,
             **extra_filter,
         )
+        self.stats.span("筛选", "设置游戏筛选", time.monotonic() - filter_started)
         self.trace.ok(
             "drive_disc",
             "filter",
@@ -389,7 +438,8 @@ class Runner:
         state.restore_request_limit_rows = max_restore_rows(self.preset.max_pages)
         self._state = state
 
-        profile = self._prepare_navigation(hwnd, state)
+        with self.stats.timed("导航", "切页置顶+布局复核"):
+            profile = self._prepare_navigation(hwnd, state)
         # 先起第 1 批，再摆起点：跳号启动要按新视口覆盖批次计数（见 _seed_start_index）。
         state.start_first_batch()
         if self.start_index > 0:
@@ -418,6 +468,12 @@ class Runner:
                 cells, problems, skips = self._scan_cells_with_retry(state)
             ready, deferred = split_stable_cells(
                 cells, at_top=state.at_top, at_bottom=state.at_bottom
+            )
+            self.stats.scan(
+                cells,
+                skips,
+                len(deferred),
+                max_index=max((cell.global_index for cell in cells), default=None),
             )
             for cell in deferred:
                 state.block(cell.global_index, CellStatus.DEFERRED)
@@ -586,7 +642,7 @@ class Runner:
         reset_to_top(hwnd)
         self.trace.ok(
             "drive_disc",
-            "calibrate",
+            "layout_check",
             f"原点 {self._origin_center_y:.1f} 行距 {self._row_pitch:.1f} "
             f"协议 {profile.events_per_row}事件/行@{profile.event_interval_ms}ms",
         )
@@ -865,6 +921,8 @@ class Runner:
             raise RunnerError(f"{cell_tag} 盘面识别失败")
         self._processed += 1
         self._detail_disc = disc
+        # 统计：从认出盘面这一刻起算这件盘的耗时（含进强化页、逐档升级、收尾）。
+        disc_slot = self.stats.disc_begin(job.job_id, cell.global_index, disc.level)
         self.trace.ok(
             "detail",
             "parse",
@@ -894,6 +952,7 @@ class Runner:
                 )
                 self._record(job, disc, decision)
                 time.sleep(0.3)
+                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
                 return "done"  # 没进强化页，画面未变，坐标仍然有效
             if disc.discarded:
                 self._set_discard_label(hwnd, discarded=True, value=False)
@@ -902,7 +961,14 @@ class Runner:
             state.begin_upgrade(cell.global_index)
             if self._enter_upgrade_page(hwnd):
                 self._upgrade_loop(
-                    hwnd, job, cell.global_index, cell_tag, sub_preset, accepted_ids, up_counts
+                    hwnd,
+                    job,
+                    cell.global_index,
+                    cell_tag,
+                    sub_preset,
+                    accepted_ids,
+                    up_counts,
+                    disc_slot,
                 )
             else:
                 raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
@@ -925,6 +991,9 @@ class Runner:
                 message = f"{where} 判为弃置，标签设置关闭，未打标签"
             self.trace.ok("detail", decision.action.value, message)
             self._set_status("action", decision.action.value, cell_tag)
+        self.stats.disc_end(
+            disc_slot, outcome_for_action(decision.action.value), disc.level, decision.score
+        )
         time.sleep(0.3)
         return "done"
 
@@ -1075,7 +1144,8 @@ class Runner:
         if profile is None:
             raise RunnerError("没有可用的滚轮协议，无法恢复位置")
 
-        reset_to_top(hwnd)
+        with self.stats.timed("导航", "恢复：切页置顶"):
+            reset_to_top(hwnd)
         image, _method, _hwnd = grab_game_image(hwnd)
         origin, pitch = measure_layout(image)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
@@ -1412,6 +1482,7 @@ class Runner:
         sub_preset: Preset,
         accepted_ids,
         up_counts: dict,
+        disc_slot: int = -1,
     ) -> None:
         """在强化页循环判断+升级，直到弃置/升满/跳过，最后回到网格。
 
@@ -1419,12 +1490,16 @@ class Runner:
         循环，判弃置才 Esc 回详情页按 R。不再每次升级完都 Esc 回网格全量重扫。
         每升一阶后复核等级有没有到下一档（3/6/9/12/15），到不了就是素材耗尽，
         报错停止整条任务链。
+
+        disc_slot：这件盘在 RunStats 里的下标，用来记各档升级耗时（-1 = 不统计）。
         """
         upgraded = 0
         # 上一轮点了「升级」后应到达的等级（None = 没在等复核）与累计重读次数。
         expect_level: int | None = None
         expect_from = 0
         rechecks = 0
+        # 本档开始时间：点「升级」那一刻起算，到下一轮确认等级到位为止。
+        stage_started: float | None = None
         while True:
             image, *_ = self._grab(allow_esc=False, need_page=False)
             try:
@@ -1450,6 +1525,11 @@ class Runner:
             # 成功收尾，把素材耗尽静默吞掉。读一次可能撞上强化动画，按 ocr_retry 重读。
             if expect_level is not None:
                 if disc.level >= expect_level:
+                    if stage_started is not None:
+                        self.stats.disc_stage(
+                            disc_slot, expect_from, disc.level, time.monotonic() - stage_started
+                        )
+                        stage_started = None
                     expect_level = None
                 elif rechecks < max(1, self.preset.ocr_retry) - 1:
                     rechecks += 1
@@ -1469,6 +1549,13 @@ class Runner:
                     )
                     self.log.error("cell %s %s", cell_tag, reason)
                     self.trace.fail("upgrade", "upgrade", reason, image=image)
+                    if stage_started is not None:
+                        # 素材不足也把这一档的实际升级耗时留下（到不了下一档也要看得见）。
+                        self.stats.disc_stage(
+                            disc_slot, expect_from, disc.level, time.monotonic() - stage_started
+                        )
+                        stage_started = None
+                    self.stats.disc_end(disc_slot, OUTCOME_FAILED, disc.level)
                     # 素材耗尽是正常业务收尾，不是异常画面：先把游戏退回仓库侧栏，
                     # 别把玩家卡在强化弹层里。回退本身失败也不该盖掉真正的原因。
                     try:
@@ -1481,6 +1568,7 @@ class Runner:
                 self._record(job, disc, decision)
                 self.log.warning("cell %s 强化页判断不确定 (%s)，停止任务链", cell_tag, decision.reason)
                 self.trace.fail("upgrade", "decide", f"判断不了：{decision.reason}，停止任务链", image=image)
+                self.stats.disc_end(disc_slot, OUTCOME_FAILED, disc.level, decision.score)
                 raise RunnerError(f"{cell_tag} 判断不确定：{decision.reason}，停止任务链")
             if decision.action == Action.UPGRADE:
                 if upgraded >= _MAX_STAGE_UPGRADES or disc.level >= MAX_LEVEL:
@@ -1493,6 +1581,7 @@ class Runner:
                         f"升到 {disc.level} 级"
                         + ("（已满级）" if disc.level >= MAX_LEVEL else "（到升阶上限）"),
                     )
+                    self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
                     self._esc_back_to_grid(hwnd)
                     return
                 if not self._upgrade_once(hwnd, self.material_slot):
@@ -1503,6 +1592,8 @@ class Runner:
                 expect_from = disc.level
                 expect_level = next_stage_level(disc.level)
                 rechecks = 0
+                # 本档计时从现在开始，到下一轮确认等级到位为止（含重读）。
+                stage_started = time.monotonic()
                 self.log.info(
                     "cell %s UPGRADE done, level %d -> 期望到 %d 级，强化页重判",
                     cell_tag,
@@ -1515,12 +1606,16 @@ class Runner:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)
                 self.trace.ok("upgrade", "decide", f"判为弃置：{decision.reason}")
                 self._record(job, disc, decision)
+                self.stats.disc_end(disc_slot, OUTCOME_DISCARDED, disc.level, decision.score)
                 self._discard_from_upgrade(hwnd)
                 return
             # SKIP：不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
             self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
             self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
             self._record(job, disc, decision)
+            self.stats.disc_end(
+                disc_slot, outcome_for_action(decision.action.value), disc.level, decision.score
+            )
             self._esc_back_to_grid(hwnd)
             return
 

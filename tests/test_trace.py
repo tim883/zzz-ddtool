@@ -111,3 +111,25 @@ def test_note_does_not_consume_a_step() -> None:
     before = trace.step
     trace.note("补充说明")
     assert trace.step == before
+
+
+def test_steps_record_elapsed_time_with_chinese_names(tmp_path: Path) -> None:
+    """每步都记耗时，名字跟日志里一致（统计直接按这个名字分组）。"""
+    trace = Trace(tag="tag-spans")
+    img = _FakeImage(tmp_path)
+    trace.ok("drive_disc", "scan", "第 1 批", image=img)
+    trace.ok("upgrade", "upgrade", "强化了一阶", image=img)
+
+    assert [s.page for s in trace.spans] == ["驱动盘仓库", "强化页"]
+    assert [s.action for s in trace.spans] == ["扫描列表", "强化"]
+    assert [s.detail for s in trace.spans] == ["第 1 批", "强化了一阶"]
+    assert all(s.seconds >= 0.0 for s in trace.spans)
+
+
+def test_decide_step_also_records_a_span(tmp_path: Path) -> None:
+    """判断不截图，但耗时还是要记——它也是链路里的一步。"""
+    trace = Trace(tag="tag-spans-decide")
+    trace.ok("detail", "decide", "继续强化")
+    assert len(trace.spans) == 1
+    assert trace.spans[0].action == "判断"
+    assert trace._shots == []

@@ -20,10 +20,17 @@
     - 这一步没做 OCR（点格子、按 R、Esc、滚轮）：现截一张。
       这类步骤正是坐标可能偏的地方，图是核对坐标的唯一依据。
 
-容量怎么控（截图 1.5MB 一张，不控会撑爆磁盘）：
-    纯按总张数。超了从最旧的轮次开始整轮删。
-    不做「失败永远保留」——排错靠 debug 重跑复现，不靠翻旧图回溯，
-    留着失败图只会把正常的挤掉。见 retain.py。
+    容量怎么控（截图 1.5MB 一张，不控会撑爆磁盘）：
+        纯按总张数。超了从最旧的轮次开始整轮删。
+        不做「失败永远保留」——排错靠 debug 重跑复现，不靠翻旧图回溯，
+        留着失败图只会把正常的挤掉。见 retain.py。
+
+耗时怎么量（给运行统计用）：
+    Trace 的接口是「干完了再记一笔」，没有显式的 begin，所以单步耗时用
+    **相邻两步的时间差**：这一步的日志刚写完，上一步的工作 + 这一步的工作都在
+    这段里。步骤之间没有空闲等待，这个差值就是这一步的开销（误差只来自上一步
+    存盘 PNG 的几十毫秒，会算到下一步头上）。
+    收集到的 StepSpan 由 Runner 在收尾时并进 RunStats。
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from pathlib import Path
 from zzz_ddtool.capture import grab_game_image
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.paths import captures_dir
+from zzz_ddtool.stats import StepSpan
 
 # 页面：程序内部标识 → 日志里给人看的中文
 PAGE_NAMES = {
@@ -63,6 +71,11 @@ ACTION_NAMES = {
     "esc": "返回",
     "enter_upgrade": "进强化页",
     "scroll": "翻页",
+    # 注意：「布局复核」不是滚轮标定。标定（navigation.calibrate）只在开局跑一次，
+    # 而且不写 trace；每个任务写的是「拿本轮实测布局复核原点」。以前这个词写成
+    # calibrate，日志里看着像每个任务都在标定，误导过审计。
+    "layout_check": "布局复核",
+    "layout": "网格布局",
 }
 
 def page_name(page: str) -> str:
@@ -84,6 +97,9 @@ class Trace:
         self.failed = False
         self._disc_no = 0  # 当前在处理第几个盘（0=还没进盘）
         self._shots: list[Path] = []  # 本轮存过的图，收尾时用来算数
+        # 步骤耗时：见模块头「耗时怎么量」。
+        self.spans: list[StepSpan] = []
+        self._last_step_at = time.monotonic()
 
     @property
     def dir(self) -> Path:
@@ -107,10 +123,25 @@ class Trace:
     def step_start(self, page: str, action: str) -> int:
         """开始一步，返回它的步骤号（用于把后续日志挂到同一步）。"""
         self._step += 1
+        now = time.monotonic()
+        self.spans.append(
+            StepSpan(
+                page=page_name(page),
+                action=action_name(action),
+                detail="",
+                seconds=now - self._last_step_at,
+            )
+        )
+        self._last_step_at = now
         get_logger("zzz_ddtool.trace").debug(
             "[%04d] %s · %s", self._step, page_name(page), action_name(action)
         )
         return self._step
+
+    def _close_span(self, detail: str = "") -> None:
+        """补上这一步的说明（耗时在 step_start 时已记）。"""
+        if self.spans:
+            self.spans[-1].detail = detail
 
     def ok(self, page: str, action: str, detail: str = "", image=None) -> None:
         """一步成功。
@@ -119,6 +150,7 @@ class Trace:
         没传说明这步没 OCR，现截一张——坐标偏移就靠这类图核对。
         """
         self.step_start(page, action)
+        self._close_span(detail)
         # 判断是纯计算，不碰屏幕，截图跟上一张一模一样，不截
         if action == "decide":
             message = f"{page_name(page)} · {action_name(action)} → 结论"
@@ -137,6 +169,7 @@ class Trace:
     def fail(self, page: str, action: str, reason: str = "", image=None) -> None:
         """一步失败。图必留，永远不被容量清理删掉。"""
         self.step_start(page, action)
+        self._close_span(reason)
         self.failed = True
         message = f"{page_name(page)} · {action_name(action)} → 失败"
         if reason:
@@ -151,6 +184,7 @@ class Trace:
     def warn(self, page: str, action: str, reason: str = "", image=None) -> None:
         """可疑但没中断。图必留。"""
         self.step_start(page, action)
+        self._close_span(reason)
         message = f"{page_name(page)} · {action_name(action)} → 注意"
         if reason:
             message += f"：{reason}"

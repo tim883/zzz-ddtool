@@ -541,7 +541,7 @@ def test_upgrade_saves_resume_point_before_entering_page(offline_runner, monkeyp
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
     seen: dict = {}
 
-    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts):
+    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts, disc_slot):
         seen["resume"] = state.resume_point
         seen["active"] = state.active_index
 
@@ -712,7 +712,7 @@ def test_run_preserves_empty_whitelist(offline_runner, monkeypatch, accepted, ex
     actions = []
     monkeypatch.setattr(runner, "_act", lambda hwnd, action, disc: actions.append(action))
 
-    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts):
+    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts, disc_slot):
         actions.append(decide(sample_disc(), preset, accepted_ids=accepted_ids).action)
 
     monkeypatch.setattr(runner, "_upgrade_loop", upgrade_loop)

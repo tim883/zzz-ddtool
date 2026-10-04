@@ -101,6 +101,11 @@ def status_file() -> Path:
     return log_dir() / "run-status.json"
 
 
+def stats_dir() -> Path:
+    """运行统计（一轮一个 json）。不放 captures 下，免得跟截图回收搅在一起。"""
+    return log_dir() / "stats"
+
+
 def debug_dir() -> Path:
     """调试用的零散截图（标定、探测等一次性产物）。"""
     return log_dir() / "debug"
