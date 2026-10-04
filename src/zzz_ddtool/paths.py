@@ -75,6 +75,11 @@ def last_config_file() -> Path:
     return user_dir() / "last-config.json"
 
 
+def layout_file() -> Path:
+    """界面布局记忆（窗口大小/位置、三栏比例、置顶）。用户数据，更新永不碰。"""
+    return user_dir() / "layout.json"
+
+
 def log_dir() -> Path:
     """所有运行时产出的根目录，第一层就叫 log。
 

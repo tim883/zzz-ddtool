@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QByteArray, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -308,6 +308,33 @@ def last_config_path() -> Path | None:
             remember_config_path(persistent)
         return persistent
     return None
+
+
+def read_layout() -> dict:
+    """读界面布局记忆。没记过、读坏、值不对，一律当空处理。"""
+    import json
+
+    from zzz_ddtool.paths import layout_file
+
+    try:
+        raw = json.loads(layout_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def write_layout(data: dict) -> None:
+    """写界面布局记忆。写失败不影响使用——顶多下次回到默认布局。"""
+    import json
+
+    from zzz_ddtool.paths import layout_file
+
+    target = layout_file()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def default_config_path() -> Path:
@@ -978,6 +1005,11 @@ class MainWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._install_preview_section)
+        # 布局记忆：拖动窗口/分隔条后延迟落盘，避免频繁写文件。
+        self._layout_ready = False
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self._persist_layout)
         self._closing = False
         self._exit_after_close: int | None = None
         self._utility_thread = None
@@ -1014,6 +1046,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
         splitter.setSizes([240, 340, 740])
+        # 拖完分隔条延迟记一次，下次启动照旧。
+        splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
         outer.addWidget(splitter, 1)
         outer.addWidget(self._build_bottom())
         log_box = QGroupBox("运行日志")
@@ -1037,6 +1071,47 @@ class MainWindow(QMainWindow):
         for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
             box.toggled.connect(self._mark_unsaved)
         self.max_discs.valueChanged.connect(self._mark_unsaved)
+        # 恢复上次的窗口大小/位置、三栏比例、置顶状态。放在最后：控件都建好了才动。
+        self._restore_layout()
+        self._layout_ready = True
+
+    def _restore_layout(self) -> None:
+        """恢复上次退出时的界面布局。没记录过就保持默认。"""
+        data = read_layout()
+        geometry = data.get("geometry")
+        if isinstance(geometry, str) and geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+        sizes = data.get("config_splitter")
+        if isinstance(sizes, list) and len(sizes) == len(self._config_splitter.sizes()):
+            try:
+                self._config_splitter.setSizes([max(1, int(value)) for value in sizes])
+            except (TypeError, ValueError):
+                pass
+        if data.get("on_top"):
+            self.stay_on_top.setChecked(True)
+
+    def _persist_layout(self) -> None:
+        """把当前布局写进 user/layout.json。写失败不影响使用。"""
+        if not self._layout_ready:
+            return
+        data = read_layout()
+        data["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        data["config_splitter"] = [int(value) for value in self._config_splitter.sizes()]
+        data["on_top"] = bool(self.stay_on_top.isChecked())
+        write_layout(data)
+
+    def _queue_layout_save(self) -> None:
+        """拖动中不写盘，停手后再落一次。"""
+        if self._layout_ready and self.isVisible():
+            self._layout_timer.start(800)
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._queue_layout_save()
+
+    def moveEvent(self, event) -> None:  # noqa: ANN001
+        super().moveEvent(event)
+        self._queue_layout_save()
 
     def _build_header(self) -> QHBoxLayout:
         titles = QVBoxLayout()
@@ -2439,7 +2514,10 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
         else:
             self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
-        self.show()
+        # setWindowFlags 会把窗口藏掉；只有本来就显示着才需要重新 show。
+        # 启动时恢复上一次的勾选状态也走这里，那会儿窗口还没显示，不能弹出来。
+        if self.isVisible():
+            self.show()
 
     def _start_utility(self, operation, on_success, message: str) -> None:  # noqa: ANN001
         if self._utility_thread is not None or self._run_thread is not None or self._closing:
@@ -2553,6 +2631,8 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._layout_timer.stop()
+        self._persist_layout()
         self._closing = True
         self._preview_request = None
         self._preview_install = []

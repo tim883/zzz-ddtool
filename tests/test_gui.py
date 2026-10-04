@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from zzz_ddtool.gui import MainWindow, WeightEditor
+from zzz_ddtool.gui import MainWindow, WeightEditor, read_layout, write_layout
 from zzz_ddtool.models import Action, Disc, Substat
 
 
@@ -1215,3 +1215,70 @@ def test_gui_preserves_global_label_policy_before_advanced_settings(qapp, tmp_pa
     assert not preset.labels.discard
     assert not preset.labels.save
     window.close()
+
+
+def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_path) -> None:
+    """窗口大小/三栏比例/置顶要记住：调完关掉再开，不能又回到默认那一坨。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.show()
+    qapp.processEvents()
+    window.resize(1500, 900)
+    window._config_splitter.setSizes([260, 900, 300])
+    window.stay_on_top.setChecked(True)
+    qapp.processEvents()
+    window.close()
+
+    saved = read_layout()
+    assert saved["on_top"] is True
+    assert saved["geometry"]
+    assert len(saved["config_splitter"]) == 3
+
+    reopened = MainWindow(config_path=tmp_path / "t.yaml")
+    reopened.show()
+    qapp.processEvents()
+    assert reopened.stay_on_top.isChecked()
+    sizes = reopened._config_splitter.sizes()
+    # 出厂默认是 [240, 340, 740]（中间最窄）。恢复成功才会是中间最宽。
+    assert sizes[1] > sizes[2]
+    reopened.close()
+
+
+def test_close_event_writes_layout_file(qapp: QApplication, tmp_path) -> None:
+    """关窗时必须落盘，否则重启就丢。"""
+    from zzz_ddtool import paths
+
+    target = paths.layout_file()
+    assert not target.exists()
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.show()
+    qapp.processEvents()
+    window.close()
+    assert target.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"config_splitter": "oops"},
+        {"config_splitter": [1, 2]},
+        {"config_splitter": [None, None, None]},
+        {"geometry": 123},
+        {"geometry": ""},
+        {"on_top": "yes"},
+    ],
+)
+def test_restore_layout_tolerates_broken_file(qapp: QApplication, tmp_path, payload: dict) -> None:
+    """layout.json 被手改坏了，界面也得能起来，不能崩在启动。"""
+    write_layout(payload)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.close()
+
+
+def test_read_layout_ignores_non_dict(qapp: QApplication, tmp_path) -> None:
+    from zzz_ddtool import paths
+
+    target = paths.layout_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("[1, 2, 3]", encoding="utf-8")
+    assert read_layout() == {}
