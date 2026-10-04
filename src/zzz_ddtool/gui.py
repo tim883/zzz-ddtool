@@ -7,6 +7,7 @@ Spin boxes keep the system arrows (not styled).
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -65,7 +66,7 @@ from zzz_ddtool.origin import Origin
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize,
-    enumerate_patterns, first_filter, score_slots, useful_ordered,
+    enumerate_filtered, enumerate_patterns, first_filter, score_slots, useful_ordered,
 )
 
 # 词条下拉的顺序偏好：常用的排前面（双爆最常用）。
@@ -690,6 +691,17 @@ class StageSection(QWidget):
     def visible_accepted(self) -> list[str]:
         return [self._ids[i] for i in self._visible_indices if self._ids[i] in self._checked]
 
+    def resync_checks(self, is_checked) -> None:  # noqa: ANN001
+        """按策略重铺全部勾选态：不重建卡片、不重置页码。
+
+        用在「名单变了、卡片本身没变」的场合——比如「全勾全部任务」批量写入后，
+        当前任务的 accepted 换了，权重和门槛没动，卡片不用重算，只把勾选反映出来。
+        """
+        self._checked = {pid for pid in self._ids if is_checked(pid)}
+        for card in self.cards:
+            card.set_checked_silent(card.pattern.pattern_id in self._checked)
+        self.selection_changed.emit()
+
     def _on_require(self, _value: float) -> None:
         self.apply_filter()
         self.require_changed.emit()
@@ -988,6 +1000,31 @@ class SetPickerDialog(QDialog):
 
     def selected(self) -> list[str]:
         return [tile.name for tile in self._tiles if tile.name in self._picked]
+
+
+def qualifying_pattern_ids(
+    slot: int,
+    mainstats: tuple[str, ...],
+    weights: Mapping[str, float],
+    stage_require: Mapping[str, Mapping[int, float]] | None = None,
+) -> tuple[str, ...]:
+    """一个任务「生成组合 + 全选当前可见」等价的可勾选图案全集。
+
+    口径与界面完全一致，只是按这个任务**自己的**配置跑一遍：
+      1. 部位/主词条屏蔽掉的副词条不参与（同 _effective_weights）；
+      2. 用剩下的权重穷举（等价于点「生成组合」）；
+      3. 再按每档要求过滤 score >= 本档要求（等价于「符合门槛」）。
+
+    没有正权重词条时返回空集——那种任务界面本来就不出卡。
+    """
+    blocked = blocked_substats(slot, mainstats)
+    effective = {name: value for name, value in weights.items() if name not in blocked}
+    if not useful_ordered(effective):
+        return ()
+    return tuple(
+        pattern.pattern_id
+        for pattern in enumerate_filtered(effective, stage_require=stage_require)
+    )
 
 
 class MainWindow(QMainWindow):
@@ -1787,6 +1824,76 @@ class MainWindow(QMainWindow):
         sets = tuple(self._filter_sets)
         self._apply_to_all("套装", lambda job: setattr(job, "sets", sets))
 
+    def _select_all_jobs(self) -> None:
+        """跨全部任务：各自生成组合，再把符合本档要求的卡片全部勾上。
+
+        口径 =「生成组合 + 全选当前可见」，逐个任务按**它自己的**权重和本档
+        要求各跑一遍（部位不同，屏蔽的副词条也不同，不能共用当前界面那套）。
+        一次性的：只处理此刻已有的任务；之后新建的任务依旧是空的（accepted
+        为 None，运行时走分数判定），不受这次影响。
+        """
+        self._commit_editor()
+        if not self._jobs:
+            self.status.setText("任务链是空的：先新建任务，再批量全勾。")
+            return
+        # 快照成纯数据再进后台线程——那边不能碰界面控件。
+        plans = [
+            (
+                job.job_id,
+                job.slot,
+                tuple(job.mainstats),
+                dict(job.weights),
+                {
+                    str(origin): dict(table)
+                    for origin, table in (job.stage_require or {}).items()
+                },
+            )
+            for job in self._jobs
+        ]
+        self._start_utility(
+            lambda: [
+                (job_id, qualifying_pattern_ids(slot, mains, weights, require))
+                for job_id, slot, mains, weights, require in plans
+            ],
+            self._apply_select_all,
+            "正在为全部任务生成组合并勾选合格卡片…",
+        )
+
+    def _apply_select_all(self, results) -> None:  # noqa: ANN001
+        by_id = {job.job_id: job for job in self._jobs}
+        applied = 0
+        skipped = 0
+        total = 0
+        for job_id, accepted in results:
+            job = by_id.get(job_id)
+            if job is None:
+                continue
+            if not accepted:
+                # 空集绝对不能写：accepted=[] 在运行时是「全部判弃置」，
+                # 不是「一张都不勾」。没设权重、或门槛高到没卡过，一律跳过。
+                skipped += 1
+                continue
+            job.accepted = tuple(accepted)
+            applied += 1
+            total += len(accepted)
+        self._mark_unsaved()
+        self._refresh_chain_list(self._editing_job_id)
+        current = self._editing_job()
+        if current is not None and current.accepted is not None:
+            # 当前任务的数据变了，界面得跟上：权重和门槛没动，卡片不用重算，
+            # 只把勾选态重铺一遍。
+            self._selection_seed = current.accepted
+            if not self._preview_dirty:
+                policy = self._card_check_policy()
+                for section in self.sections.values():
+                    section.resync_checks(policy)
+        note = f"已按各自门槛为 {applied} 个任务勾选，共 {total} 张卡片"
+        if skipped:
+            note += f"；{skipped} 个任务没有符合门槛的卡片，已跳过未改动"
+        if self._preview_dirty:
+            note += "（当前任务尚未生成组合）"
+        self.status.setText(note + "。")
+
     def _refresh_main_boxes(self, keep: set[str] | None = None) -> None:
         keep = set(keep if keep is not None else self._selected_mains())
         available = set(selectable_mainstats(self._selected_slots()))
@@ -1941,9 +2048,21 @@ class MainWindow(QMainWindow):
         self.refresh_cards_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_cards_btn.clicked.connect(lambda: self.rebuild_cards())
         self._task_controls.append(self.refresh_cards_btn)
+        # 跨全部任务的批量全勾：每个任务按它自己的权重和本档要求各算一遍。
+        # 会覆盖这些任务现有的勾选，所以进 _apply_buttons —— 任务链空了就置灰。
+        self.select_all_jobs_btn = QPushButton("全勾全部任务")
+        self.select_all_jobs_btn.setToolTip(
+            "对任务链里的每个任务：按它自己的权重生成组合，"
+            "再把符合它自己本档要求的卡片全部勾上。\n"
+            "会覆盖这些任务现有的勾选；之后新建的任务不受影响。"
+        )
+        self.select_all_jobs_btn.clicked.connect(self._select_all_jobs)
+        self._task_controls.append(self.select_all_jobs_btn)
+        self._apply_buttons.append(self.select_all_jobs_btn)
         row.addWidget(all_on)
         row.addWidget(all_off)
         row.addWidget(self.refresh_cards_btn)
+        row.addWidget(self.select_all_jobs_btn)
         row.addStretch()
         row.addWidget(self.start_btn)
         self.pause_btn = QPushButton("暂停 / F9")

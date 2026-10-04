@@ -679,6 +679,84 @@ def test_number_spinboxes_ignore_mouse_wheel(qapp: QApplication) -> None:
         assert isinstance(rolls, NoWheelSpinBox)
 
 
+def test_qualifying_ids_match_generate_plus_select_visible(qapp: QApplication, tmp_path) -> None:
+    """「全勾全部任务」的口径必须与「生成组合 + 全选当前可见」逐位一致。
+
+    纯函数 qualifying_pattern_ids 是那个按钮唯一的核心逻辑，这里把当前任务
+    当成其中一个任务，拿界面真做出来的可见集合去对齐——口径一歪，按钮批量
+    勾的东西就和用户手动点出来不是一回事了。
+    """
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 0.8, "攻击力%": 0.5})
+    # 只给部分档位填门槛，其余保持默认 0——两种情形都要对上
+    for checkpoint in (0, 3, 6):
+        window.sections[("three", checkpoint)].require.setValue(1.2)
+        window.sections[("four", checkpoint)].require.setValue(0.9)
+    refresh_cards(window, qapp)
+
+    job = window._editing_job()
+    # set_weights 屏蔽信号，任务节点还是空的——先让编辑器写回，再取任务的配置
+    window._commit_editor()
+    job = window._editing_job()
+    actual = set(qualifying_pattern_ids(job.slot, job.mainstats, job.weights, job.stage_require))
+    # 界面上「符合门槛」就是每个档位 section 的 _visible_indices（apply_filter 的产物）。
+    # _checked 不能拿来比：没有历史勾选时策略是「全选」，它不区分可见与否。
+    expected = {
+        section._ids[i]
+        for section in window.sections.values()
+        for i in section._visible_indices
+    }
+    assert actual == expected
+    assert actual
+    window.close()
+
+
+def test_select_all_jobs_covers_every_task_and_spares_new_ones(qapp: QApplication, tmp_path) -> None:
+    """按钮给每个任务按它自己的权重+门槛填 accepted，且不碰之后新建的任务。"""
+    from zzz_ddtool.config import preset_from_dict
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({
+        "task_chain": [
+            {"slot": 4, "weights": {"暴击率": 1.0}, "stage_require": {"four": {0: 1.0}}},
+            {"slot": 6, "weights": {"攻击力%": 1.0, "暴击伤害": 0.5}},
+            {"slot": 5, "weights": {}},  # 没设权重：界面本来就不出卡，必须跳过
+        ],
+    }))
+    assert window.select_all_jobs_btn.isEnabled()
+
+    window.select_all_jobs_btn.click()
+    wait_until(qapp, lambda: window._utility_thread is None)
+
+    first, second, third = window._jobs
+    assert first.accepted == qualifying_pattern_ids(4, (), {"暴击率": 1.0}, {"four": {0: 1.0}})
+    assert second.accepted == qualifying_pattern_ids(6, (), {"攻击力%": 1.0, "暴击伤害": 0.5}, {})
+    assert first.accepted and second.accepted
+    # 空集绝不能落地：accepted=[] 在运行时是「全部判弃置」，不是「一张不勾」
+    assert third.accepted is None
+    assert "已按各自门槛为 2 个任务勾选" in window.status.text()
+    assert "1 个任务没有符合门槛的卡片" in window.status.text()
+
+    # 之后新建的任务不受影响
+    window._add_job()
+    assert window._jobs[-1].accepted is None
+    window.close()
+
+
+def test_select_all_jobs_disabled_when_chain_empty(qapp: QApplication, tmp_path) -> None:
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert window._jobs == []
+    # 没有任务可勾，按钮置灰（禁用的按钮点不动，所以直接调方法验兜底提示）
+    assert not window.select_all_jobs_btn.isEnabled()
+    window._select_all_jobs()
+    assert "任务链是空的" in window.status.text()
+    window.close()
+
+
 def _card_fingerprint(window: MainWindow) -> dict:
     """把每张卡「显示出来的东西」和它携带的图案逐字核对后快照下来。
 
