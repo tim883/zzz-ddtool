@@ -22,6 +22,7 @@ from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter
+from zzz_ddtool.substatfilter import plan_substat_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import (
     GRID_COLS,
@@ -263,6 +264,7 @@ class Runner:
             skip_equipped=self.preset.skip_equipped,
             skip_discarded=self.preset.skip_discarded,
             accepted=job.accepted,
+            labels=self.preset.labels,
         )
 
     def run(self) -> list[RunResult]:
@@ -337,6 +339,13 @@ class Runner:
             raise RunnerError(f"导航失败：{exc}") from exc
 
         image, page, method, _hwnd = self._grab()
+        sub_preset = self._sub_preset(job)
+        substat_filter = plan_substat_filter(sub_preset)
+        self.log.info("自动筛选：%s", substat_filter.summary())
+        self._set_status("filter", substat_filter.summary())
+        extra_filter = {}
+        if substat_filter.names:
+            extra_filter = {"substats": substat_filter.names, "substat_counts": substat_filter.counts}
         apply_game_filter(
             hwnd,
             image.width(),
@@ -344,6 +353,7 @@ class Runner:
             slots=[job.slot],
             sets=job.sets,
             mainstats=job.mainstats,
+            **extra_filter,
         )
         self.trace.ok(
             "drive_disc",
@@ -352,16 +362,17 @@ class Runner:
             + (f" 套装 {'、'.join(job.sets)}" if job.sets else "")
             + (f" 主词条 {'、'.join(job.mainstats)}" if job.mainstats else ""),
         )
+        self.trace.ok("drive_disc", "filter", substat_filter.summary())
         time.sleep(0.3)
 
-        sub_preset = self._sub_preset(job)
         accepted_ids = None if job.accepted is None else set(job.accepted)
 
         # 每任务新建状态：不继承上一任务进度（spec §4.3、§6.1）
         state = TraversalState(
             job_id=job.job_id,
             filter_signature=make_filter_signature(
-                slot=job.slot, sets=job.sets, mainstats=job.mainstats
+                slot=job.slot, sets=job.sets, mainstats=job.mainstats,
+                tag=f"substats={','.join(substat_filter.names)};minimum={substat_filter.minimum}",
             ),
         )
         state.restore_request_limit_rows = max_restore_rows(self.preset.max_pages)
@@ -841,10 +852,7 @@ class Runner:
                 time.sleep(0.3)
                 return "done"  # 没进强化页，画面未变，坐标仍然有效
             if disc.discarded:
-                press_key_once(hwnd, VK_R)
-                time.sleep(0.5)
-                self.log.info("cell %s UPGRADE：摘除旧弃置标签 (R)", cell_tag)
-                self.trace.note("这个盘有弃置标记，先按 R 摘掉再强化")
+                self._set_discard_label(hwnd, discarded=True, value=False)
             # 进强化页前保存恢复点（spec §6.3.1）；连续升阶途中沿用同一恢复点，
             # 强化后的焦点不覆盖它。
             state.begin_upgrade(cell.global_index)
@@ -868,7 +876,10 @@ class Runner:
             self._record(job, disc, decision)
             self._act(hwnd, decision.action, disc)
             self.log.info("cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level)
-            self.trace.ok("detail", decision.action.value, f"{where} 已{trace_action(decision.action.value)}")
+            message = f"{where} 已{trace_action(decision.action.value)}"
+            if decision.action == Action.MARK_DISCARD and not self.preset.labels.discard:
+                message = f"{where} 判为弃置，标签设置关闭，未打标签"
+            self.trace.ok("detail", decision.action.value, message)
             self._set_status("action", decision.action.value, cell_tag)
         time.sleep(0.3)
         return "done"
@@ -1115,17 +1126,25 @@ class Runner:
     STAGE_ADD_AREA = (1150, 800, 1420, 940)
     UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
 
+    def _set_discard_label(self, hwnd: int, *, discarded: bool, value: bool) -> bool:
+        """所有弃置标签增删的统一入口；高级设置关闭时不发送标签按键。"""
+        if not self.preset.labels.allows("discard"):
+            self.log.info("弃置标签设置关闭：保留判断结果，不修改标签")
+            self.trace.note("标签设置关闭，不修改弃置标签")
+            return False
+        if discarded == value:
+            return False
+        press_key_once(hwnd, VK_R)
+        time.sleep(0.5)
+        self.log.info("discard label=%s (R)", value)
+        return True
+
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
         # UPGRADE 在 _process_cell 里内联处理（需要 rescan/计数联动），这里只管其余动作。
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
         # R 是开关：按之前必须看 disc.discarded，否则打标签会变成摘标签（反之亦然）。
         if action == Action.MARK_DISCARD:
-            if disc.discarded:
-                self.log.info("action=MARK_DISCARD：已带弃置标签，跳过按键")
-            else:
-                press_key_once(hwnd, VK_R)  # R 打弃置标签
-                time.sleep(0.5)
-                self.log.info("action=MARK_DISCARD (R)")
+            self._set_discard_label(hwnd, discarded=disc.discarded, value=True)
         elif action == Action.SKIP:
             self.log.info("action=SKIP")
         elif action == Action.STOP:
@@ -1309,10 +1328,9 @@ class Runner:
         """确认回到仓库侧边详情后按 R；侧边详情本来就是网格，不再 Esc。"""
         self._esc_back_to_grid(hwnd)
         self._checkpoint()
-        press_key_once(hwnd, VK_R)
-        time.sleep(0.5)
-        self.log.info("action=MARK_DISCARD (R) from upgrade page")
-        self.trace.ok("detail", "discard", "已按 R 打上弃置标记")
+        discarded = bool(self._detail_disc and self._detail_disc.discarded and not self.preset.labels.discard)
+        if self._set_discard_label(hwnd, discarded=discarded, value=True):
+            self.trace.ok("detail", "discard", "已按 R 打上弃置标记")
 
     def _upgrade_loop(
         self,
@@ -1345,7 +1363,7 @@ class Runner:
                     rarity=self._detail_disc.rarity,
                     locked=self._detail_disc.locked,
                     equipped=self._detail_disc.equipped,
-                    discarded=False,
+                    discarded=self._detail_disc.discarded and not self.preset.labels.discard,
                 )
             # 先复核上一轮升级有没有到位。素材不够吃满一档时游戏只加到部分经验、
             # 等级停在期望值之前（3/6/9/12/15 之前），必须当场停链；否则等级没变、

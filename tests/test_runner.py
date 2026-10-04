@@ -845,6 +845,39 @@ def test_return_from_warehouse_does_not_press_escape(offline_runner, monkeypatch
     offline_runner["press_key_once"].assert_called_once_with(1, runner_module.VK_R)
 
 
+def test_auto_substat_filter_is_applied_for_each_task(offline_runner, monkeypatch):
+    jobs = (
+        TaskJob(slot=4, weights={"暴击率": 1, "暴击伤害": 1}, stage_require={"three": {0: 2}, "four": {0: 2}}),
+        TaskJob(slot=5, weights={"穿透值": 1}, stage_require={"three": {0: 1}, "four": {0: 1}}),
+    )
+    runner = Runner(Preset(task_chain=jobs, max_discs=1), hotkeys=False)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_upgrade_loop", Mock())
+    monkeypatch.setattr(runner, "_restore_position", Mock())
+    runner.run()
+    assert runner.outcome == "completed"
+    filters = offline_runner["apply_game_filter"].call_args_list
+    assert set(filters[0].kwargs["substats"]) == {"暴击率", "暴击伤害"}
+    assert filters[0].kwargs["substat_counts"] == (2, 3, 4)
+    assert filters[1].kwargs["substats"] == ("穿透值",)
+    assert filters[1].kwargs["substat_counts"] == (1, 2, 3, 4)
+
+
+def test_disabled_labels_suppress_all_discard_changes_but_return_to_grid(offline_runner, monkeypatch):
+    from zzz_ddtool.config import LabelPolicy
+
+    runner = Runner(Preset(labels=LabelPolicy(discard=False, save=False)), hotkeys=False)
+    back = Mock()
+    monkeypatch.setattr(runner, "_esc_back_to_grid", back)
+    runner._act(1, Action.MARK_DISCARD, sample_disc())
+    runner._set_discard_label(1, discarded=True, value=False)
+    runner._discard_from_upgrade(1)
+    offline_runner["press_key_once"].assert_not_called()
+    back.assert_called_once_with(1)
+    assert runner._sub_preset(TaskJob(slot=4)).labels == runner.preset.labels
+
+
 def test_return_from_zoom_preview_escapes_then_r(offline_runner, monkeypatch):
     """强化页 Esc 一层后停在缩放预览层：认出来再 Esc 一次，不能当未知画面卡住。"""
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)

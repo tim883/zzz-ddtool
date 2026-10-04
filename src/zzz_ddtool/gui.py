@@ -1255,8 +1255,13 @@ class MainWindow(QMainWindow):
         self.filter_summary.hide()  # 长文本不再显示（顶出面板），只留选择按钮
         pick_filter = QPushButton("选择…")
         pick_filter.setFixedWidth(80)
+        pick_filter.setToolTip("套装、部位与主属性手动选择；副属性按右侧 0 级组合自动筛选，所有等级一起处理。")
         pick_filter.clicked.connect(self._open_filter_dialog)
         game_row.addWidget(pick_filter)
+        substat_hint = QLabel("副词条：自动")
+        substat_hint.setObjectName("hint")
+        substat_hint.setToolTip("根据右侧初始 3 词、4 词的 0 级选择自动筛选；筛选数量从最低命中数选到 4。")
+        game_row.addWidget(substat_hint)
         game_row.addStretch()
         layout.addWidget(game_box)
         layout.addStretch()
@@ -2130,6 +2135,7 @@ class MainWindow(QMainWindow):
 
     def _apply_preset(self, preset: Preset) -> None:
         self._loading = True
+        self._label_policy = preset.labels
         self.name_edit.setText(preset.name)
         self.require_s.setChecked(preset.require_s_rank)
         self.skip_locked.setChecked(preset.skip_locked)
@@ -2365,6 +2371,7 @@ class MainWindow(QMainWindow):
                 "stage_require": current.get("stage_require") or {"three": {}, "four": {}},
                 "min_useful_types": int(current.get("min_useful_types") or 0),
                 "run": {"max_discs": int(self.max_discs.value())},
+                "labels": {"discard": self._label_policy.discard, "save": self._label_policy.save},
                 "game_filter": {
                     "sets": list(self._filter_sets),
                     "slot": self._active_slot,

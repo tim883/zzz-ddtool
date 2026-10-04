@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from PySide6.QtGui import QImage
 
 from zzz_ddtool.capture import grab_game_image
+from zzz_ddtool.gamedata import SUBSTAT_NAMES
 from zzz_ddtool.layout import (
     DISMANTLE_FORBID,
     FILTER_BTN,
@@ -334,12 +335,15 @@ def apply_game_filter(
     slots: Sequence[int],
     sets: Sequence[str],
     mainstats: Sequence[str],
+    substats: Sequence[str] = (),
+    substat_counts: Sequence[int] = (),
 ) -> None:
-    """Open 驱动盘筛选, 重置, apply slots/sets/mainstats, Esc to close.
+    """打开并重置筛选，套用部位/套装/主副属性条件，最后 Esc 关闭。
 
     能按键就按键：关筛选用 Esc，不扫关闭按钮。
     分区/重置按钮靠 OCR 点文字中心，不用硬坐标（旧表偏到错误按钮上）。
     """
+    _validate_substat_filter(substats, substat_counts)
     log = get_logger("zzz_ddtool.gamefilter")
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
@@ -352,6 +356,126 @@ def apply_game_filter(
         time.sleep(0.12)
     if sets or mainstats:
         apply_sets_mainstats(hwnd, width, height, sets=sets, mainstats=mainstats)
+    if substats:
+        apply_substat_filter(hwnd, width, height, names=substats, counts=substat_counts)
     press_key(hwnd, VK_ESCAPE)
     time.sleep(0.35)
     log.info("game filter done slots=%s sets=%s mains=%s", list(slots), list(sets), list(mainstats))
+
+
+def _validate_substat_filter(names: Sequence[str], counts: Sequence[int]) -> None:
+    if not names and not counts:
+        return
+    if not names or len(set(names)) != len(names) or set(names) - set(SUBSTAT_NAMES):
+        raise FilterClickError("副属性筛选必须选择合法且不重复的副词条")
+    if not counts or tuple(counts) != tuple(range(min(counts), 5)) or min(counts) not in (1, 2, 3, 4):
+        raise FilterClickError("副属性命中数量必须从最低数量连续选到 4，避免强化后退出列表")
+
+
+def _panel_lines(image: QImage) -> list:
+    """仅右侧面板内容；排除详情、关闭按钮和底部重置/批量操作区。"""
+    left, top, right, bottom = scale_rect(1300, 100, 1880, 980, image.width(), image.height())
+    return [
+        line for line in read_rect(image, (1300, 100, 1880, 980))
+        if left <= (line.left + line.right) // 2 <= right
+        and top <= (line.top + line.bottom) // 2 <= bottom
+    ]
+
+
+def _option_selected(image: QImage, line) -> bool:
+    """游戏已选按钮为蓝色。采样文字周围背景，避免把白色文字当选中态。"""
+    pad = max(4, round(14 * image.width() / 1920))
+    left, right = max(0, line.left - pad), min(image.width() - 1, line.right + pad)
+    top, bottom = max(0, line.top), min(image.height() - 1, line.bottom)
+    blue = samples = 0
+    for y in range(top, bottom + 1, max(1, (bottom - top) // 6)):
+        for x in range(left, right + 1, max(1, (right - left) // 20)):
+            color = image.pixelColor(x, y)
+            blue += color.blue() > 110 and color.blue() > color.red() + 45 and color.green() > color.red() + 25
+            samples += 1
+    return blue / max(1, samples) > 0.15
+
+
+def _open_substat_section(hwnd: int, width: int, height: int) -> None:
+    """保留已选主属性并收起其内容，再滚动展开副属性区。"""
+    for _round in range(_MAX_PANEL_SCROLLS + 1):
+        image, _ = _grab()
+        lines = _panel_lines(image)
+        main_y = _title_y(lines, MAINSTAT_TITLE)
+        main_toggle = _toggle_below(lines, main_y) if main_y is not None else None
+        if main_toggle is not None and "收起" in main_toggle.text and (main_toggle.top - main_y) < height / 8:
+            click_client(hwnd, (main_toggle.left + main_toggle.right) // 2, (main_toggle.top + main_toggle.bottom) // 2)
+            time.sleep(0.35)
+            continue
+        title_y = _title_y(lines, SUBSTAT_TITLE)
+        toggle = _toggle_below(lines, title_y) if title_y is not None else None
+        if toggle is not None and (toggle.top - title_y) < height / 8:
+            if "收起" in toggle.text:
+                return
+            click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
+            time.sleep(0.5)
+            after, _ = _grab()
+            after_lines = _panel_lines(after)
+            after_y = _title_y(after_lines, SUBSTAT_TITLE)
+            after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
+            if after_toggle is not None and "收起" in after_toggle.text:
+                return
+            raise FilterClickError("点击副属性「展开」后未确认展开，停止筛选")
+        wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+        time.sleep(0.35)
+    raise FilterClickError("滚动后仍找不到副属性词条区或展开开关")
+
+
+def _count_value(text: str) -> int | None:
+    match = re.fullmatch(r"[\[【]?([1-4])[\]】]?(?:个|条|项)?", text.replace(" ", ""))
+    return int(match[1]) if match else None
+
+
+def apply_substat_filter(
+    hwnd: int, width: int, height: int, *, names: Sequence[str], counts: Sequence[int]
+) -> None:
+    """副属性与数量共享一组条件。逐项识别并复核蓝色选中态，不盲点开关。"""
+    _validate_substat_filter(names, counts)
+    if not names:
+        return
+    _open_substat_section(hwnd, width, height)
+    pending: dict[str | int, bool] = {name: True for name in names}
+    # 重置态可能预选所有数量：也明确取消最低数量以下的按钮。
+    pending.update({count: count in counts for count in range(1, 5)})
+    scrolls = 0
+    log = get_logger("zzz_ddtool.gamefilter")
+    while pending:
+        image, _ = _grab()
+        lines = _panel_lines(image)
+        title_y = _title_y(lines, SUBSTAT_TITLE)
+        if title_y is not None:
+            lines = [line for line in lines if line.top > title_y]
+        found = False
+        for line in lines:
+            text = _normalize_stat(line.text.replace(" ", ""))
+            key = next((name for name in names if _normalize_stat(name) == text), None)
+            if key is None:
+                key = _count_value(text)
+            if key not in pending:
+                continue
+            selected = pending[key]
+            if _option_selected(image, line) != selected:
+                x, y = (line.left + line.right) // 2, (line.top + line.bottom) // 2
+                _refuse_dismantle(x, y, width, height)
+                click_client(hwnd, x, y)
+                time.sleep(0.3)
+                after, _ = _grab()
+                if _option_selected(after, line) != selected:
+                    raise FilterClickError(f"副属性筛选选项 {key!r} 点击后未确认{'选中' if selected else '取消'}")
+                image = after
+            del pending[key]
+            found = True
+            log.info("substat filter %r selected=%s", key, selected)
+            # 属性和数量按钮切换不改变面板布局，同一帧中可批量处理。
+        if found:
+            continue
+        if scrolls >= _MAX_PANEL_SCROLLS:
+            raise FilterClickError(f"副属性筛选找不到选项：{list(pending)}")
+        wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+        time.sleep(0.35)
+        scrolls += 1

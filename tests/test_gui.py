@@ -1201,3 +1201,17 @@ def test_gui_disables_legacy_useful_quota_for_all_tasks(qapp, tmp_path):
     assert not hasattr(window, "min_useful")
     assert "最少有效种类" not in [label.text() for label in window.findChildren(QLabel)]
     window.close()
+
+
+def test_gui_preserves_global_label_policy_before_advanced_settings(qapp, tmp_path):
+    from zzz_ddtool.config import preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({
+        "labels": {"discard": False, "save": False},
+        "task_chain": [{"slot": 4, "weights": {"暴击率": 1}}],
+    }))
+    preset = window.collect_preset()
+    assert not preset.labels.discard
+    assert not preset.labels.save
+    window.close()

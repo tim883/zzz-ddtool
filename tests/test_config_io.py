@@ -80,3 +80,14 @@ def test_task_limits_roundtrip_and_legacy_fallback(tmp_path: Path) -> None:
 
     runner = SimpleNamespace(preset=loaded)
     assert [Runner._job_limit(runner, job) for job in loaded.task_chain] == [5, 12, 29]
+
+
+def test_global_label_policy_roundtrip_and_legacy_defaults(tmp_path):
+    assert preset_from_dict({}).labels.discard
+    assert preset_from_dict({}).labels.save
+    preset = preset_from_dict({"labels": {"discard": False, "save": False}})
+    path = tmp_path / "no-labels.yaml"
+    save_preset(path, preset)
+    loaded = load_preset(path)
+    assert not loaded.labels.allows("discard")
+    assert not loaded.labels.allows("save")

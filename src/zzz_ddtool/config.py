@@ -16,6 +16,18 @@ _SAFE_DUMPER = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
 
 
 @dataclass(frozen=True)
+class LabelPolicy:
+    """全局标签执行策略，预留高级设置入口；不影响判断和强化。"""
+    discard: bool = True
+    save: bool = True
+
+    def allows(self, label: str) -> bool:
+        if label not in ("discard", "save"):
+            raise ValueError(f"未知标签：{label}")
+        return getattr(self, label)
+
+
+@dataclass(frozen=True)
 class Preset:
     name: str = "default"
     weights: Mapping[str, float] = field(default_factory=dict)
@@ -36,6 +48,7 @@ class Preset:
     ocr_retry: int = 3
     accepted: tuple[str, ...] | None = None
     max_pages: int = 20
+    labels: LabelPolicy = field(default_factory=LabelPolicy)
 
     def useful_names(self) -> frozenset[str]:
         return frozenset(name for name, weight in self.effective_weights().items() if weight > 0)
@@ -82,6 +95,7 @@ def _parse_stage_require(data: dict[str, Any]) -> dict[str, dict[int, float]]:
 
 def preset_from_dict(data: dict[str, Any]) -> Preset:
     filters = data.get("filters") or {}
+    labels = data.get("labels") or {}
     weights = {str(k): float(v) for k, v in (data.get("weights") or {}).items()}
     stage_require = _parse_stage_require(data)
     raw_accepted = data.get("accepted", None)
@@ -127,6 +141,7 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
         task_chain=parse_task_chain(data.get("task_chain") or ()),
         ocr_retry=int(data.get("ocr_retry") or 3),
         accepted=active_accepted,
+        labels=LabelPolicy(discard=bool(labels.get("discard", True)), save=bool(labels.get("save", True))),
     )
 
 
@@ -166,6 +181,7 @@ def _parse_slot_plans(raw: Mapping[Any, Any]) -> dict[int, dict[str, Any]]:
 def preset_to_dict(preset: Preset) -> dict[str, Any]:
     data: dict[str, Any] = {
         "name": preset.name,
+        "labels": {"discard": preset.labels.discard, "save": preset.labels.save},
         "min_useful_types": preset.min_useful_types,
         "ocr_retry": preset.ocr_retry,
         "run": {"max_discs": preset.max_discs},
