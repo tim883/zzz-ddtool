@@ -6,7 +6,6 @@ Spin boxes keep the system arrows (not styled).
 
 from __future__ import annotations
 
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +19,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -41,7 +39,6 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStyle,
     QSplitter,
     QTabWidget,
@@ -65,6 +62,7 @@ from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
+from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize,
     enumerate_patterns, first_filter, score_slots, useful_ordered,
@@ -253,40 +251,6 @@ QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radi
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
-
-
-def _base_job_name(name: str) -> str:
-    """剥掉名字尾部的「(2)」这类自动编号，取基准名。
-
-    复制时用它算新名字：复制「紫手套 (2)」应该出「紫手套 (3)」，
-    而不是「紫手套 (2) (2)」。
-    """
-    return re.sub(r"\s*\(\d+\)\s*$", "", name).strip() or "任务"
-
-
-def _pencil_icon(size: int = 16):
-    """自绘铅笔图标：微软雅黑没有 U+270E，直接写字符会渲染成缺字方框。"""
-    from PySide6.QtCore import QPointF
-    from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap
-
-    pix = QPixmap(size, size)
-    pix.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor("#4a4a4a"))
-    pen.setWidthF(1.3)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    # 笔身（斜放）：左下一段到右上，两条边 + 两端封口
-    painter.drawLine(QPointF(4.6, 9.6), QPointF(11.2, 3.0))
-    painter.drawLine(QPointF(6.4, 11.4), QPointF(13.0, 4.8))
-    painter.drawLine(QPointF(4.6, 9.6), QPointF(6.4, 11.4))
-    painter.drawLine(QPointF(11.2, 3.0), QPointF(13.0, 4.8))
-    # 笔尖：收成左下角一点
-    painter.drawLine(QPointF(4.6, 9.6), QPointF(2.2, 13.0))
-    painter.drawLine(QPointF(6.4, 11.4), QPointF(2.2, 13.0))
-    painter.end()
-    return QIcon(pix)
 
 
 def remember_config_path(path: Path) -> None:
@@ -577,7 +541,7 @@ class StageSection(QWidget):
         self._visible_indices: list[int] = []
         self._page = 0
 
-        self.require = QDoubleSpinBox()
+        self.require = NoWheelDoubleSpinBox()
         self.require.setDecimals(1)
         self.require.setRange(0.0, 30.0)
         self.require.setSingleStep(0.1)
@@ -735,7 +699,7 @@ class WeightEditor(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._rows: list[tuple[QComboBox, QDoubleSpinBox, QWidget]] = []
+        self._rows: list[tuple[QComboBox, NoWheelDoubleSpinBox, QWidget]] = []
         self._last_weights: dict[str, float] = {}
         self._box = QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
@@ -803,7 +767,7 @@ class WeightEditor(QWidget):
         combo.setEditable(True)
         combo.addItems(self._choices())
         combo.setCurrentText(name)
-        spin = QDoubleSpinBox()
+        spin = NoWheelDoubleSpinBox()
         spin.setDecimals(1)
         spin.setRange(0.0, 20.0)
         spin.setSingleStep(0.1)
@@ -851,12 +815,12 @@ class WeightEditor(QWidget):
 class TrialPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.level = QSpinBox()
+        self.level = NoWheelSpinBox()
         self.level.setRange(0, 15)
         self.locked = QCheckBox("锁定")
         self.equipped = QCheckBox("已装备")
         self.discarded = QCheckBox("已有弃置标记")
-        self.rows: list[tuple[QComboBox, QSpinBox]] = []
+        self.rows: list[tuple[QComboBox, NoWheelSpinBox]] = []
 
         form = QFormLayout()
         form.addRow("等级", self.level)
@@ -872,7 +836,7 @@ class TrialPage(QWidget):
             combo.setEditable(True)
             combo.addItem("")
             combo.addItems(KNOWN_SUBSTATS)
-            rolls = QSpinBox()
+            rolls = NoWheelSpinBox()
             rolls.setRange(0, 5)
             rolls.setPrefix("+")
             row = QHBoxLayout()
@@ -1145,6 +1109,7 @@ class MainWindow(QMainWindow):
         lower_layout.setSpacing(6)
         lower_layout.addWidget(self._build_status_bar(), 0)
         lower_layout.addWidget(log_box, 1)
+        self._lower_pane = lower
 
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.setObjectName("mainSplitter")
@@ -1213,6 +1178,19 @@ class MainWindow(QMainWindow):
         sizes = self._main_splitter.sizes()
         if len(sizes) == 2:
             self._lower_height = sizes[1]
+        self._update_min_height()
+
+    def _update_min_height(self) -> None:
+        """窗口最小高度 = 当前高度 − 日志窗还能让出的量。
+
+        日志窗触底后再缩窗口，Qt 会转而去压上面三栏——这里把最小高度动态顶到
+        「三栏当前高度 + 日志窗最小高度」，日志一到底窗口就缩不动，三栏永不被挤压。
+        """
+        if not self._layout_ready:
+            return
+        floor = self._lower_pane.minimumSizeHint().height()
+        extra = max(0, self._lower_pane.height() - floor)
+        self.setMinimumHeight(max(0, self.height() - extra))
 
     def _on_main_splitter_moved(self, pos: int, index: int) -> None:  # noqa: ARG002
         """拖红框下边那条线：只改红框（三栏 + 操作栏）的高度。
@@ -1340,7 +1318,7 @@ class MainWindow(QMainWindow):
         task_limits = QVBoxLayout(task_box)
         limit_row = QHBoxLayout()
         limit_row.addWidget(QLabel("本次最多处理"))
-        self.max_discs = QSpinBox()
+        self.max_discs = NoWheelSpinBox()
         self.max_discs.setRange(1, 5000)
         self.max_discs.setValue(100)
         limit_row.addWidget(self.max_discs)
@@ -1490,27 +1468,14 @@ class MainWindow(QMainWindow):
         hint = QLabel("编完一个部位再新建。执行按从上到下的顺序。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        # 任务名字：选中节点后可改。名字只影响列表标签，不参与执行判断。
-        self.job_name_edit = QLineEdit()
-        self.job_name_edit.setPlaceholderText("任务名")
-        self.job_name_edit.setEnabled(False)
-        self.job_name_edit.editingFinished.connect(self._rename_job)
-        rename_btn = QPushButton()
-        rename_btn.setIcon(_pencil_icon())
-        rename_btn.setFixedWidth(30)
-        rename_btn.setToolTip("重命名当前任务")
-        rename_btn.clicked.connect(self._focus_job_name)
-        name_row = QHBoxLayout()
-        name_row.setSpacing(4)
-        name_row.addWidget(self.job_name_edit, 1)
-        name_row.addWidget(rename_btn)
+        # 没有任务名：列表里靠「序号 + 部位 · 套装 · 主词条」区分，不再单独起名。
         self.chain_list = QListWidget()
         self.chain_list.currentRowChanged.connect(self._on_chain_row)
         new_btn = QPushButton("新建任务")
         new_btn.setObjectName("primary")
         new_btn.clicked.connect(self._add_job)
         copy_btn = QPushButton("复制任务")
-        copy_btn.setToolTip("复制当前选中的任务，名字自动加编号")
+        copy_btn.setToolTip("复制当前选中的任务，内容一样，各走各的。")
         copy_btn.clicked.connect(self._copy_job)
         add_row = QHBoxLayout()
         add_row.setSpacing(4)
@@ -1527,7 +1492,6 @@ class MainWindow(QMainWindow):
         row.addWidget(down_btn)
         row.addWidget(del_btn)
         inner.addWidget(hint)
-        inner.addLayout(name_row)
         inner.addWidget(self.chain_list, 1)
         inner.addLayout(add_row)
         inner.addLayout(row)
@@ -1536,10 +1500,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _job_item_text(index: int, job: TaskJob) -> str:
-        """列表条目文本：两行——第一行名字，第二行内容摘要。没名字的老档案只有摘要一行，
-        免得两行一模一样。改实时写回后摘要会跟着变，所以抽出来给两处共用。"""
-        if job.name:
-            return f"{index + 1}. {job.name}\n      {job.title()}"
+        """列表条目文本：序号 + 内容摘要（部位 · 套装 · 主词条）。
+
+        没有任务名，这条摘要就是任务的唯一标识；改实时写回后摘要会跟着变，
+        所以抽出来给两处共用。
+        """
         return f"{index + 1}. {job.title()}"
 
     def _refresh_chain_list(self, select_id: str | None = None) -> None:
@@ -1560,7 +1525,6 @@ class MainWindow(QMainWindow):
                     self.chain_list.setCurrentRow(row)
                     break
         self.chain_list.blockSignals(False)
-        self._sync_job_name_edit()
         self._update_apply_buttons()
         self._update_status()
 
@@ -1573,50 +1537,11 @@ class MainWindow(QMainWindow):
                 return job
         return None
 
-    def _sync_job_name_edit(self) -> None:
-        """把名字文本框对齐到当前任务。没选中任务时清空并禁用。"""
-        job = self._editing_job()
-        self.job_name_edit.blockSignals(True)
-        if job is None:
-            self.job_name_edit.clear()
-            self.job_name_edit.setEnabled(False)
-        else:
-            self.job_name_edit.setText(job.name)
-            # 名字就是名字，不用摘要顶替（摘要已经显示在列表第二行）
-            self.job_name_edit.setPlaceholderText("任务名")
-            self.job_name_edit.setEnabled(True)
-        self.job_name_edit.blockSignals(False)
-
-    def _focus_job_name(self) -> None:
-        if not self.job_name_edit.isEnabled():
-            return
-        self.job_name_edit.setFocus()
-        self.job_name_edit.selectAll()
-
-    def _rename_job(self) -> None:
-        if self._loading:
-            return
-        job = self._editing_job()
-        if job is None:
-            return
-        name = self.job_name_edit.text().strip()
-        if not name:
-            # 名字不能空：空了列表就只剩摘要，认不出这是谁。回落一个不重名的默认名。
-            name = self._unique_job_name("任务", exclude=job)
-        elif name != job.name:
-            # 不能重名：跟别的任务撞了就自动编号
-            name = self._unique_job_name(name, exclude=job)
-        if name == job.name:
-            return
-        job.name = name
-        self._mark_unsaved()
-        self._refresh_chain_list(job.job_id)
-
     def _commit_editor(self) -> None:
         """把右侧编辑器当前状态写回。编辑器是唯一真相，只在「要离开它」的时候快照一次：
         切任务节点、切部位、落盘/试判/开始任务。这样就不需要「更新当前任务」按钮了。
 
-        有选中任务时写进那个任务节点（名字不在编辑器里，原样保留），顺带刷新它那行的摘要；
+        有选中任务时写进那个任务节点，顺带刷新它那行的摘要；
         没选中任务时只更新部位暂存，切回去时还能看到刚才编的内容。
         """
         if self._loading:
@@ -1626,7 +1551,6 @@ class MainWindow(QMainWindow):
             if job.job_id != self._editing_job_id:
                 continue
             fresh = self._job_from_editor(job.job_id)
-            fresh.name = job.name
             self._jobs[index] = fresh
             item = self.chain_list.item(index)
             if item is not None:
@@ -1646,7 +1570,6 @@ class MainWindow(QMainWindow):
         self._filter_sets = []
         self._update_set_summary()
         self._refresh_main_boxes(set())
-        self._sync_job_name_edit()
         self.rebuild_cards(None)
 
     def _job_from_editor(self, job_id: str | None = None) -> TaskJob:
@@ -1689,7 +1612,6 @@ class MainWindow(QMainWindow):
         self._slot_plans[job.slot] = plan
         self._apply_slot_widgets(plan)
         self._loading = False
-        self._sync_job_name_edit()
         self._selection_seed = job.accepted
         self._reset_preview()
 
@@ -1700,16 +1622,6 @@ class MainWindow(QMainWindow):
         self._commit_editor()
         self._load_job(self._jobs[row])
 
-    def _unique_job_name(self, base: str, exclude: TaskJob | None = None) -> str:
-        """取一个不重名的任务名：base 被占了就 base (2)、(3)…（exclude 用于改名时排除自己）。"""
-        used = {job.name for job in self._jobs if job.name and job is not exclude}
-        if base not in used:
-            return base
-        index = 2
-        while f"{base} ({index})" in used:
-            index += 1
-        return f"{base} ({index})"
-
     def _add_job(self) -> None:
         """新建任务：建一个**空**任务并选中它，右侧随即清空等你编。
 
@@ -1717,20 +1629,18 @@ class MainWindow(QMainWindow):
         任务的内容顺过来当新任务，那是假信息。之后在右侧编，离开时自动写回它。
         """
         self._commit_editor()
-        job = TaskJob(slot=self._active_slot, name=self._unique_job_name("任务"), max_discs=100)
+        job = TaskJob(slot=self._active_slot, max_discs=100)
         self._jobs.append(job)
         self._mark_unsaved()
         self._editing_job_id = job.job_id
         self._refresh_chain_list(job.job_id)
         self._clear_editor()
-        self._focus_job_name()
 
     def _copy_job(self) -> None:
-        """复制当前选中的任务：内容一模一样，新 id，名字加编号。
+        """复制当前选中的任务：内容一模一样，新 id。
 
-        「紫手套」复制出「紫手套 (2)」，再复制「紫手套 (2)」出「紫手套 (3)」——
-        所以先剥掉名字尾部的编号取基准名，再找下一个没用过的编号。
-        新任务插在原任务下面，并选中它。
+        新任务插在原任务下面，并选中它。没有名字可编号——两条一样的任务在列表里
+        都显示各自的部位 · 套装 · 主词条，改完内容自然就分开了。
         """
         job = self._editing_job()
         if job is None:
@@ -1747,7 +1657,6 @@ class MainWindow(QMainWindow):
         # to_dict/job_from_dict 会把原 id 一起带过来，必须换成新的：
         # 两个任务共用一个 job_id 会让「按 id 找当前任务」永远命中前一个。
         copied.job_id = new_job_id()
-        copied.name = self._unique_job_name(_base_job_name(job.name))
         row = self._jobs.index(job)
         self._jobs.insert(row + 1, copied)
         self._mark_unsaved()
@@ -1826,6 +1735,24 @@ class MainWindow(QMainWindow):
         self._filter_sets = dialog.selected()
         self._mark_unsaved()
         self._update_set_summary()
+        self._refresh_current_item_text()
+
+    def _refresh_current_item_text(self) -> None:
+        """把当前任务那行的标签刷成编辑器里的最新内容。
+
+        任务名删掉之后，列表标签就是这条任务的唯一标识，所以换套装、改主词条
+        得立刻跟手，不能等切走再刷新。
+        只改标签文本，**不动 `_jobs`**：真正的写回仍然只发生在 `_commit_editor`。
+        """
+        if self._loading or not self._editing_job_id:
+            return
+        for index, job in enumerate(self._jobs):
+            if job.job_id != self._editing_job_id:
+                continue
+            item = self.chain_list.item(index)
+            if item is not None:
+                item.setText(self._job_item_text(index, self._job_from_editor(job.job_id)))
+            return
 
     def _update_apply_buttons(self) -> None:
         """「应用于所有任务」得有任务可铺；任务链空了就置灰。"""
@@ -1968,6 +1895,8 @@ class MainWindow(QMainWindow):
     def _on_filter_changed(self) -> None:
         if self._loading:
             return
+        # 主词条进了任务标签，改完要先让列表那行跟上
+        self._refresh_current_item_text()
         self._schedule_rebuild()
 
     def _origin_scroll(self, origin: Origin) -> dict[str, object]:
@@ -2078,7 +2007,7 @@ class MainWindow(QMainWindow):
         for index, job in enumerate(preset.task_chain, start=1):
             blocked = blocked_substats(job.slot, job.mainstats)
             if not any(value > 0 and name in SUBSTAT_NAMES and name not in blocked for name, value in job.weights.items()):
-                QMessageBox.warning(self, "无法启动", f"第 {index} 个任务「{job.name}」没有可用的正权重副词条。")
+                QMessageBox.warning(self, "无法启动", f"第 {index} 个任务「{job.title()}」没有可用的正权重副词条。")
                 return
         try:
             save_preset(self._path, preset)

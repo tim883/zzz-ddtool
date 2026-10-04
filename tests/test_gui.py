@@ -91,7 +91,7 @@ def test_editor_empty_when_no_job_selected(qapp: QApplication, tmp_path) -> None
     window = MainWindow(config_path=tmp_path / "t.yaml")
     assert window._jobs == []
     assert window.weight_editor.weights() == {}
-    assert not window.job_name_edit.isEnabled()
+    assert window.chain_list.count() == 0  # 没有任务就没有条目，也没有可编的名字
     assert all(len(section.cards) == 0 for section in window.sections.values())
 
     # 新建一个任务、编点内容，再删掉它 → 右侧必须回到空
@@ -105,7 +105,7 @@ def test_editor_empty_when_no_job_selected(qapp: QApplication, tmp_path) -> None
     qapp.processEvents()
     assert window._jobs == []
     assert window.weight_editor.weights() == {}
-    assert not window.job_name_edit.isEnabled()
+    assert window.chain_list.count() == 0
     window.close()
 
 
@@ -209,12 +209,10 @@ def test_slot_switch_retargets_selected_job(qapp: QApplication, tmp_path) -> Non
     window.close()
 
 
-def test_copy_job_duplicates_content_and_numbers_name(qapp: QApplication, tmp_path) -> None:
-    """复制任务：内容一样、id 是新的、名字加编号，两份互不影响。"""
+def test_copy_job_duplicates_content(qapp: QApplication, tmp_path) -> None:
+    """复制任务：内容一样、id 是新的，两份互不影响。没有名字要编号。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
-    window.job_name_edit.setText("紫手套")
-    window.job_name_edit.editingFinished.emit()
     window.weight_editor.set_weights({"暴击率": 1.0})
     qapp.processEvents()
     source_id = window._jobs[0].job_id
@@ -223,15 +221,16 @@ def test_copy_job_duplicates_content_and_numbers_name(qapp: QApplication, tmp_pa
     qapp.processEvents()
     assert len(window._jobs) == 2
     copied = window._jobs[1]
-    assert copied.name == "紫手套 (2)"
     assert copied.job_id != source_id  # to_dict 会带旧 id，必须换掉
     assert copied.weights == window._jobs[0].weights
     assert window._editing_job_id == copied.job_id  # 复制后选中副本
+    # 两条内容一致，列表里显示一样——这是预期，改完就分开
+    assert window._jobs[0].title() == copied.title()
 
-    # 再复制一次：基于基准名编号，不能叠成「紫手套 (2) (2)」
+    # 再复制一次：照样只是内容副本
     window._copy_job()
     qapp.processEvents()
-    assert "紫手套 (3)" in [job.name for job in window._jobs]
+    assert len(window._jobs) == 3
 
     # 两份独立
     window.chain_list.setCurrentRow(0)
@@ -251,21 +250,60 @@ def test_copy_without_selection_does_nothing(qapp: QApplication, tmp_path) -> No
     window.close()
 
 
-def test_new_job_starts_empty_and_gets_unique_name(qapp: QApplication, tmp_path) -> None:
-    """新建任务 = 建一个空任务并选中它，右侧跟着空；名字自动去重。"""
+def test_new_job_starts_empty(qapp: QApplication, tmp_path) -> None:
+    """新建任务 = 建一个空任务并选中它，右侧跟着空。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
     first = window._jobs[-1]
-    assert first.name == "任务"
     assert window.weight_editor.weights() == {}
     assert window._editing_job_id == first.job_id
 
     window.weight_editor.set_weights({"暴击率": 1.0})
     window._add_job()
     second = window._jobs[-1]
-    assert second.name == "任务 (2)"  # 不重名
     assert second.weights == {}  # 新任务是空的，不会顺走上一个任务的内容
     assert window.weight_editor.weights() == {}  # 右侧跟着空
+    window.close()
+
+
+def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_path) -> None:
+    """列表标签只由「序号 + 部位 · 套装 · 主词条」拼出来，没有任务名这套东西。
+
+    老存档里残留的 name 字段一律忽略：写回去也不再落盘。
+    """
+    from zzz_ddtool.chain import parse_task_chain
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.filter_slots[4].click()
+    window._filter_sets = ["折枝剑歌"]
+    # 「选择套装」弹窗落定后就是这两步，跟真实路径一致
+    window._update_set_summary()
+    window._refresh_current_item_text()
+    qapp.processEvents()
+
+    # 勾主词条只走信号，标签也必须立刻跟上（列表标签是唯一标识）
+    window.filter_main_boxes["暴击伤害"].setChecked(True)
+    qapp.processEvents()
+
+    label = window.chain_list.item(0).text()
+    assert label == "1. 4号 · 折枝剑歌 · 暴击伤害"
+    assert "任务" not in label  # 没有默认名顶在前面
+    assert "\n" not in label
+
+    # 改部位 → 标签跟着变
+    window.filter_slots[5].click()
+    qapp.processEvents()
+    label = window.chain_list.item(0).text()
+    assert label.startswith("1. 5号 · 折枝剑歌")
+
+    # 存档里若还写着 name，载入后既不显示也不回写
+    jobs = parse_task_chain(
+        [{"slot": 2, "name": "我起的名字", "sets": ["折枝剑歌"], "mainstats": []}]
+    )
+    assert len(jobs) == 1
+    assert "name" not in jobs[0].to_dict()
+    assert MainWindow._job_item_text(0, jobs[0]) == "1. 2号 · 折枝剑歌"
     window.close()
 
 
@@ -585,6 +623,60 @@ def test_trial_name_choices_only_come_from_dictionary(qapp: QApplication) -> Non
         items = [combo.itemText(i) for i in range(combo.count())]
         assert "穿透率" not in items
         assert {name for name in items if name} == set(SUBSTAT_NAMES)
+
+
+def _wheel_event(widget) -> object:  # noqa: ANN001
+    """造一个「向上滚一格」的 QWheelEvent，直接喂给 widget.wheelEvent。"""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    pos = QPointF(widget.rect().center())
+    return QWheelEvent(
+        pos,
+        pos,
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+
+
+def test_number_spinboxes_ignore_mouse_wheel(qapp: QApplication) -> None:
+    """滚轮悬在数字框上不得改值（误触）。
+
+    两层守卫：
+    1. 行为层 —— NoWheel 系 spinbox 收到滚轮必须「不吃掉、不改值」，
+       事件 ignore() 后冒泡给父级滚动区，滚轮回到翻页；
+    2. 接线层 —— 界面上实际使用的数字框必须都是 NoWheel 系，
+       防止以后重构时改回裸 QDoubleSpinBox/QSpinBox 让误触复活。
+    """
+    from zzz_ddtool.gui import StageSection
+    from zzz_ddtool.origin import Origin
+    from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
+
+    for spin in (NoWheelDoubleSpinBox(), NoWheelSpinBox()):
+        spin.setRange(0, 10)
+        spin.setValue(3)
+        event = _wheel_event(spin)
+        spin.wheelEvent(event)
+        assert not event.isAccepted()
+        assert spin.value() == 3
+
+    editor = WeightEditor()
+    editor.set_weights({"攻击力": 1.0})
+    assert isinstance(editor._rows[0][1], NoWheelDoubleSpinBox)
+
+    assert isinstance(StageSection(Origin.THREE, 0, None).require, NoWheelDoubleSpinBox)
+    assert isinstance(StageSection(Origin.FOUR, 3, None).require, NoWheelDoubleSpinBox)
+
+    from zzz_ddtool.gui import TrialPage
+
+    trial = TrialPage()
+    assert isinstance(trial.level, NoWheelSpinBox)
+    for _combo, rolls in trial.rows:
+        assert isinstance(rolls, NoWheelSpinBox)
 
 
 def _card_fingerprint(window: MainWindow) -> dict:
@@ -1392,6 +1484,32 @@ def test_window_resize_only_grows_lower_block(qapp: QApplication, tmp_path) -> N
 
     assert window.run_log.height() > log_before
     assert window._main_splitter.widget(0).height() == upper_before
+
+
+def test_window_shrink_stops_at_log_floor_never_squeezes_upper(qapp: QApplication, tmp_path) -> None:
+    """窗口底边向上缩：只缩日志窗；缩到日志最小高度后窗口就缩不动，三栏永不被挤压。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper = window._main_splitter.widget(0)
+    upper_before = upper.height()
+
+    # 一路向上缩，越过日志窗的最小高度
+    for h in (800, 750, 700, 650):
+        window.resize(1320, h)
+        qapp.processEvents()
+        assert upper.height() == upper_before, h
+        assert window.run_log.height() >= window.run_log.minimumHeight(), h
+
+    # 日志触底后再缩：窗口停在最矮处，三栏还是原样
+    floor_height = window.height()
+    window.resize(1320, 500)
+    qapp.processEvents()
+    assert window.height() == floor_height
+    assert upper.height() == upper_before
+    window.close()
     window.close()
 
 

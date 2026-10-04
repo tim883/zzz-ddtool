@@ -24,12 +24,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from zzz_ddtool.retain import clear_captures, count_captures, get_max_files, retain_captures, set_max_files
+from zzz_ddtool.widgets import NoWheelSpinBox
 
 # 级别只影响日志写多少，不影响截图
 LEVELS: tuple[tuple[str, int], ...] = (
@@ -82,7 +82,7 @@ class LogSettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow("", note)
 
-        self.keep_spin = QSpinBox()
+        self.keep_spin = NoWheelSpinBox()
         self.keep_spin.setRange(20, 5000)
         self.keep_spin.setSingleStep(50)
         self.keep_spin.setSuffix(" 张")
