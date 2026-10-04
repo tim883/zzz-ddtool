@@ -1890,11 +1890,11 @@ def test_window_resize_only_grows_lower_block(qapp: QApplication, tmp_path) -> N
     assert window._main_splitter.widget(0).height() == upper_before
 
 
-def test_window_shrink_takes_from_log_first_then_stops(qapp: QApplication, tmp_path) -> None:
-    """窗口底边向上缩：先缩日志窗；日志缩到最小后窗口就缩不动了。
+def test_window_shrink_never_squeezes_the_three_columns(qapp: QApplication, tmp_path) -> None:
+    """窗口底边向上缩：缩的全是日志窗，缩到日志触底窗口就停住——三栏永不被挤。
 
-    日志窗不再有 60px 最小高度，缩到哪儿由上下两块的布局最小高度兜底——三栏（红框）
-    最多被压到自己的最小高度，不会被压没。
+    缩窗口时 QSplitter 先抽下半块（stretch=1）；下半块一触到自己的最小高度，它就
+    转而抽上半块，三栏就被压扁了。所以窗口下限顶在「下半块刚好让完」的位置。
     """
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1320, 900)
@@ -1904,19 +1904,24 @@ def test_window_shrink_takes_from_log_first_then_stops(qapp: QApplication, tmp_p
     upper = window._main_splitter.widget(0)
     lower = window._main_splitter.widget(1)
     upper_before = upper.height()
+    lower_floor = lower.minimumSizeHint().height()
 
     # 日志窗还有余量时，缩的全是日志，三栏纹丝不动
-    for h in (880, 850, 800):
+    for h in (880, 850, 800, 790, 780):
         window.resize(1320, h)
         qapp.processEvents()
         assert upper.height() == upper_before, h
 
-    # 一路缩到底：窗口停在布局最小高度，上下两块各自止步于自身最小高度
-    window.resize(1320, 300)
-    qapp.processEvents()
-    assert window.height() > 300  # 有布局最小高度兜底，缩不到 300
-    assert upper.height() >= upper.minimumSizeHint().height()
-    assert lower.height() >= lower.minimumSizeHint().height()
+    # 日志触底：窗口停在下限，再往上缩也缩不动了
+    assert lower.height() == lower_floor
+    floor_window = window.height()
+    assert floor_window == window._window_min_height
+    for h in (770, 700, 500, 300):
+        window.resize(1320, h)
+        qapp.processEvents()
+        assert window.height() == floor_window, h
+        assert upper.height() == upper_before, h
+        assert lower.height() <= lower_floor + 4, h
     window.close()
 
 
@@ -1940,23 +1945,35 @@ def test_window_grow_lets_log_grow_without_ceiling(qapp: QApplication, tmp_path)
     window.close()
 
 
-def test_window_height_is_not_pinned_or_clamped(qapp: QApplication, tmp_path) -> None:
-    """窗口和日志都不设高度上限，拖边框能自由拉伸。
+def test_window_height_only_has_a_floor_not_a_ceiling(qapp: QApplication, tmp_path) -> None:
+    """窗口**只有下限、没有上限**：往下随便拉，往上缩到下限就停。
 
-    钉死成定长、或在 resizeEvent 里把高度钳回去，Windows 都会把"拖边框"退化成
-    "移动窗口"——所以高度一律不限制，交给用户拖。
+    下限靠 resizeEvent 里的 `_clamp_window_min_height()` 弹回，**不调 setMinimumHeight**
+    ——窗口被 Qt 钉住后 Windows 会把「拖边框」退化成「移动窗口」。上限一旦设上
+    （早期日志封顶 160 那版），可拉伸范围被两头夹到一百来像素，两个方向都会滑。
     """
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1320, 900)
     window.show()
     qapp.processEvents()
 
-    assert window.maximumHeight() == 16_777_215  # 窗口没被 setMaximumHeight 钉住
-    assert window.run_log.maximumHeight() == 16_777_215  # 日志也没封顶
-    # 往上拉不再被钳回去（旧版会弹回 900）
+    assert window.maximumHeight() == 16_777_215   # 没被 setMaximumHeight 钉住
+    # 也没把下限写成 Qt 的最小尺寸：Qt 只知道布局的自然最小（676），我们的软下限
+    # （780）比它高，靠 resizeEvent 弹回，所以窗口对系统仍是"可自由拉伸"的。
+    assert window.minimumHeight() < window._window_min_height
+    assert window.run_log.maximumHeight() == 16_777_215  # 日志没封顶
+
+    # 往下拉：不限高
     window.resize(1320, 1500)
     qapp.processEvents()
     assert window.height() == 1500
+
+    # 往上缩：缩到下限就停，不会一路压扁三栏
+    upper_before = window._main_splitter.widget(0).height()
+    window.resize(1320, 300)
+    qapp.processEvents()
+    assert window.height() == window._window_min_height
+    assert window._main_splitter.widget(0).height() == upper_before
     window.close()
 
 
