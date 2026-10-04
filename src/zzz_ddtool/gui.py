@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QSplitter,
     QTabWidget,
-    QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -214,6 +214,21 @@ QFrame#footer {
     border: 1px solid #e1e1e1;
     border-radius: 8px;
 }
+QFrame#logPanel {
+    background: #ffffff;
+    border: 1px solid #e1e1e1;
+    border-radius: 8px;
+}
+QLabel#panelTitle { color: #605e5c; }
+QToolButton#logToggle {
+    border: none;
+    background: transparent;
+    color: #2b2b2b;
+    font-size: 15px;
+    font-weight: 700;
+    padding: 0;
+}
+QToolButton#logToggle:hover { background: #e6e6e6; border-radius: 3px; }
 QListWidget {
     background: #ffffff;
     border: 1px solid #e1e1e1;
@@ -223,6 +238,8 @@ QListWidget {
 QListWidget::item { padding: 8px 6px; }
 QListWidget::item:selected { background: #e8f3fc; color: #0078d7; }
 QSplitter::handle { background: #e1e1e1; width: 6px; }
+QSplitter#mainSplitter::handle:vertical { height: 8px; background: #dcdcdc; }
+QSplitter#mainSplitter::handle:vertical:hover { background: #bdbdbd; }
 QScrollBar:vertical { background: #f8f9fc; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -1023,8 +1040,6 @@ class MainWindow(QMainWindow):
         self._controller = None
         self._close_after_run = False
         self._task_status = None
-        # 上次渲染过的结果统计报告，避免每秒刷新时反复重排（会丢滚动位置）。
-        self._shown_report: str | None = None
         from zzz_ddtool.capturebridge import install_capture_bridge
 
         install_capture_bridge()
@@ -1051,24 +1066,76 @@ class MainWindow(QMainWindow):
         splitter.setSizes([240, 340, 740])
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
-        outer.addWidget(splitter, 1)
-        outer.addWidget(self._build_bottom())
-        log_box = QGroupBox("运行日志")
+
+        # 上半：三栏。先装进普通容器，竖直分隔条才能整块拖。
+        upper = QWidget()
+        upper.setObjectName("upperPane")
+        upper_layout = QVBoxLayout(upper)
+        upper_layout.setContentsMargins(0, 0, 0, 0)
+        upper_layout.setSpacing(0)
+        upper_layout.addWidget(splitter)
+
+        # 底部操作栏里的 _refresh_run_status() 会读它，得先有。
+        self._log_tail = None
+        log_box = QFrame()
+        log_box.setObjectName("logPanel")
         log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(10, 8, 10, 10)
+        log_layout.setSpacing(6)
+        # 标题行：运行日志 [▾]  日志文件：…。收起来时只留这一行，日志框整个让位。
+        log_head = QHBoxLayout()
+        log_head.setContentsMargins(0, 0, 0, 0)
+        log_head.setSpacing(4)
+        self.log_title = QLabel("运行日志")
+        self.log_title.setObjectName("panelTitle")
+        self.log_toggle = QToolButton()
+        self.log_toggle.setObjectName("logToggle")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setChecked(True)
+        self.log_toggle.setText("▼")
+        self.log_toggle.setFixedWidth(22)
+        self.log_toggle.setToolTip("收起运行日志")
+        self.log_toggle.toggled.connect(self._toggle_run_log)
+        from zzz_ddtool.paths import logs_dir
+
+        self.log_path = QLabel(f"日志文件：{logs_dir() / 'ddtool.log'}")
+        self.log_path.setObjectName("hint")
+        self.log_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        log_head.addWidget(self.log_title)
+        log_head.addWidget(self.log_toggle)
+        log_head.addSpacing(28)
+        log_head.addWidget(self.log_path)
+        log_head.addStretch(1)
+        log_layout.addLayout(log_head)
         self.run_log = QPlainTextEdit()
         self.run_log.setReadOnly(True)
         self.run_log.setMaximumBlockCount(300)
         self.run_log.setPlaceholderText("开始任务后，这里实时显示识别、判断、操作及失败原因。")
-        self.run_log.setMinimumHeight(100)
-        self.run_log.setMaximumHeight(160)
+        # 只留下限 60；上限交给下面的竖直分隔条——定死 160 手柄就没得拖了。
+        self.run_log.setMinimumHeight(60)
         log_layout.addWidget(self.run_log)
-        from zzz_ddtool.paths import logs_dir
 
-        log_path = QLabel(f"日志文件：{logs_dir() / 'ddtool.log'}")
-        log_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        log_layout.addWidget(log_path)
-        outer.addWidget(log_box)
-        self._log_tail = None
+        # 下半：操作栏 + 运行日志。竖分隔条只动这一整块，拖高拖矮只影响它。
+        lower = QWidget()
+        lower.setObjectName("lowerPane")
+        lower_layout = QVBoxLayout(lower)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+        lower_layout.setSpacing(10)
+        lower_layout.addWidget(self._build_bottom(), 0)
+        # 下半区多出来的高度全给日志面板，操作栏保持原样不被抻高。
+        lower_layout.addWidget(log_box, 1)
+
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.setObjectName("mainSplitter")
+        self._main_splitter.addWidget(upper)
+        self._main_splitter.addWidget(lower)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(8)
+        self._main_splitter.setSizes([430, 310])
+        self._main_splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
+        outer.addWidget(self._main_splitter, 1)
         self._refresh_run_status()
         self._load_path(self._path)
         for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
@@ -1078,18 +1145,24 @@ class MainWindow(QMainWindow):
         self._restore_layout()
         self._layout_ready = True
 
+    @staticmethod
+    def _apply_sizes(splitter: QSplitter, saved: object) -> None:
+        """按记录恢复分隔条比例。条数对不上或值非法就忽略，保持默认布局。"""
+        if not isinstance(saved, list) or len(saved) != len(splitter.sizes()):
+            return
+        try:
+            splitter.setSizes([max(1, int(value)) for value in saved])
+        except (TypeError, ValueError):
+            pass
+
     def _restore_layout(self) -> None:
         """恢复上次退出时的界面布局。没记录过就保持默认。"""
         data = read_layout()
         geometry = data.get("geometry")
         if isinstance(geometry, str) and geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
-        sizes = data.get("config_splitter")
-        if isinstance(sizes, list) and len(sizes) == len(self._config_splitter.sizes()):
-            try:
-                self._config_splitter.setSizes([max(1, int(value)) for value in sizes])
-            except (TypeError, ValueError):
-                pass
+        self._apply_sizes(self._config_splitter, data.get("config_splitter"))
+        self._apply_sizes(self._main_splitter, data.get("main_splitter"))
         if data.get("on_top"):
             self.stay_on_top.setChecked(True)
 
@@ -1100,6 +1173,7 @@ class MainWindow(QMainWindow):
         data = read_layout()
         data["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
         data["config_splitter"] = [int(value) for value in self._config_splitter.sizes()]
+        data["main_splitter"] = [int(value) for value in self._main_splitter.sizes()]
         data["on_top"] = bool(self.stay_on_top.isChecked())
         write_layout(data)
 
@@ -1989,16 +2063,20 @@ class MainWindow(QMainWindow):
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
         self.status.setWordWrap(True)
-        # 结果统计详细区：跑完才展开，可滚动；运行期间不占位。
-        self.run_stats_view = QTextBrowser()
-        self.run_stats_view.setObjectName("stats")
-        self.run_stats_view.setOpenExternalLinks(False)
-        self.run_stats_view.setMinimumHeight(140)
-        self.run_stats_view.setMaximumHeight(260)
-        self.run_stats_view.setVisible(False)
+        # 结果统计：界面**不显示**详细日志正文，只给一行摘要 + 详细日志文件路径。
+        self.run_stats_path_label = QLabel()
+        self.run_stats_path_label.setObjectName("stats_path")
+        self.run_stats_path_label.setWordWrap(True)
+        self.run_stats_path_label.setTextFormat(Qt.TextFormat.RichText)
+        self.run_stats_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.run_stats_path_label.setOpenExternalLinks(True)
+        self.run_stats_path_label.setVisible(False)
         footer.addWidget(self.status)
         footer.addWidget(self.run_status_label)
-        footer.addWidget(self.run_stats_view)
+        footer.addWidget(self.run_stats_path_label)
         self._run_timer = QTimer(self)
         self._run_timer.setInterval(1000)
         self._run_timer.timeout.connect(self._refresh_run_status)
@@ -2078,30 +2156,29 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
 
-    def _show_stats_report(self, headline: str, report: str) -> None:
-        """跑完：状态栏换成结果统计——上面一行摘要，下面可滚动的详细报告。"""
+    def _show_stats(self, headline: str, path: str) -> None:
+        """跑完：状态栏换成结果统计——一行摘要 + 详细日志路径（正文不进界面）。"""
         self.run_status_label.setText(headline or "运行结束")
         self.run_status_label.setWordWrap(True)
-        if report != self._shown_report:
-            self._shown_report = report
-            self.run_stats_view.setMarkdown(report)
-            self.run_stats_view.verticalScrollBar().setValue(0)
+        if path:
+            uri = Path(path).as_uri()
+            self.run_stats_path_label.setText(f'详细结果统计：<a href="{uri}">{path}</a>')
+        else:
+            self.run_stats_path_label.setText("详细结果统计：本轮未生成报告文件")
         # 判据用 isHidden（显式隐藏标志）：isVisible 在窗口还没 show 时恒为 False。
-        if self.run_stats_view.isHidden():
-            self.run_stats_view.setVisible(True)
+        if self.run_stats_path_label.isHidden():
+            self.run_stats_path_label.setVisible(True)
 
-    def _hide_stats_report(self) -> None:
-        """运行中/无统计：收起详细区，状态栏回到进度显示。"""
-        if not self.run_stats_view.isHidden():
-            self.run_stats_view.setVisible(False)
-        self._shown_report = None
+    def _hide_stats(self) -> None:
+        """运行中/无统计：收起结果统计区，状态栏回到进度显示。"""
+        if not self.run_stats_path_label.isHidden():
+            self.run_stats_path_label.setVisible(False)
 
     def _show_run_status(self, data: dict) -> None:
-        report = data.get("stats_report")
-        if report:
-            self._show_stats_report(data.get("stats_headline", ""), report)
+        if data.get("stats_path") or data.get("stats_headline"):
+            self._show_stats(data.get("stats_headline", ""), data.get("stats_path", ""))
             return
-        self._hide_stats_report()
+        self._hide_stats()
         row, col = data.get("global_row"), data.get("global_col")
         where = f"全局{row}行{col}列  " if row else ""
         viewport = data.get("viewport_top_row")
@@ -2171,6 +2248,12 @@ class MainWindow(QMainWindow):
                 )
         else:
             QMessageBox.information(self, "检查更新", f"{detail}\n\n该版本未附带可下载的更新包。")
+
+    def _toggle_run_log(self, expanded: bool) -> None:
+        """收起时只藏日志文本框，标题行留着——不然没地方再展开。"""
+        self.log_toggle.setText("▼" if expanded else "▶")
+        self.log_toggle.setToolTip("收起运行日志" if expanded else "展开运行日志")
+        self.run_log.setVisible(expanded)
 
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""

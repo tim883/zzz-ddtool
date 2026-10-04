@@ -452,7 +452,7 @@ class RunStats:
                 job["seconds"],
             )
         log.info(
-            "结果：成功 %d 件（%s）· 弃置 %d 件（%s）· 跳过 %d 件 · 中断 %d 件",
+            "结果：升满成功 %d 件（%s）· 判定弃置 %d 件（%s）· 跳过 %d 件 · 中断 %d 件",
             data["max_level_kept"],
             KEPT_NOTE,
             counts[OUTCOME_DISCARDED],
@@ -505,7 +505,7 @@ class RunStats:
     # ------------------------------------------------------------ 人类可读报告
 
     def headline(self) -> str:
-        """一行摘要：共计耗时、处理了几个盘、成功几件、弃置几件。
+        """一行摘要：共计耗时、处理了几个盘、升满成功几件、判定弃置几件。
 
         客户端的结果统计栏、报告文件的开头、文本日志都用这一句，三处口径不会写岔。
         """
@@ -515,8 +515,8 @@ class RunStats:
         return (
             f"共计耗时 {format_duration(data['seconds'])}，"
             f"处理了 {totals['processed']} 个盘，"
-            f"成功（{KEPT_NOTE}）{data['max_level_kept']} 件，"
-            f"弃置（{DISCARD_NOTE}）{counts[OUTCOME_DISCARDED]} 件。"
+            f"升满成功 {data['max_level_kept']} 件，"
+            f"判定弃置 {counts[OUTCOME_DISCARDED]} 件。"
         )
 
     @staticmethod
@@ -558,8 +558,8 @@ class RunStats:
             f"| 筛选后合计 | {totals['slots']} 个盘 |",
             f"| 跳过 | {totals['skipped']} 个 |",
             f"| 处理 | {totals['processed']} 个 |",
-            f"| 成功（{KEPT_NOTE}） | {data['max_level_kept']} 件 |",
-            f"| 弃置（{DISCARD_NOTE}） | {counts[OUTCOME_DISCARDED]} 件 |",
+            f"| 升满成功 | {data['max_level_kept']} 件 |",
+            f"| 判定弃置 | {counts[OUTCOME_DISCARDED]} 件 |",
             f"| 总耗时 | {format_duration(data['seconds'])} |",
             "",
             "## 逐任务",
@@ -581,14 +581,14 @@ class RunStats:
             "",
             "| 结果 | 件数 | 口径 |",
             "| --- | --- | --- |",
-            f"| 成功 | {data['max_level_kept']} | {KEPT_NOTE} |",
-            f"| 弃置 | {counts[OUTCOME_DISCARDED]} | {DISCARD_NOTE} |",
+            f"| 升满成功 | {data['max_level_kept']} | {KEPT_NOTE} |",
+            f"| 判定弃置 | {counts[OUTCOME_DISCARDED]} | {DISCARD_NOTE} |",
             f"| 跳过 | {counts[OUTCOME_SKIPPED]} | 不满足条件，未改动 |",
             f"| 中断 | {counts[OUTCOME_FAILED]} | 素材不足等中途停止 |",
             f"| 未完成 | {data['unfinished']} | 未走完流程，不计入等级分布 |",
             "",
             f"- 本轮实际打上弃置标记：**{data['discard_labels']}** 次"
-            f"（和上面的「弃置」不是一个数）",
+            f"（和上面的「判定弃置」不是一个数）",
             "",
             "## 最终等级分布",
             "",
@@ -637,7 +637,7 @@ class RunStats:
             "## 说明",
             "",
             "- 长动作与步骤耗时口径不同，**会重叠，别相加**。",
-            f"- 「成功」= {KEPT_NOTE}；「弃置」= {DISCARD_NOTE}。",
+            f"- 「升满成功」= {KEPT_NOTE}；「判定弃置」= {DISCARD_NOTE}。",
             "",
         ]
         return "\n".join(lines)

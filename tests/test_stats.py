@@ -229,12 +229,24 @@ def _sample() -> S.RunStats:
 
 
 def test_headline_counts_the_four_asked_numbers() -> None:
-    """一行摘要要能独立读懂：耗时 / 处理数 / 成功 / 弃置，四个都在。"""
+    """一行摘要要能独立读懂：耗时 / 处理数 / 升满成功 / 判定弃置，四个都在。
+
+    摘要**不带括号解释**——那是给详细日志用的；客户端那行只摆数。
+    """
     head = _sample().headline()
     assert "共计耗时 3 分 14 秒" in head
     assert "处理了 2 个盘" in head
-    assert "成功（升满 15 级且判定保留）1 件" in head
-    assert "弃置（判定为弃置的盘；不等于实际打过弃置标记的数量）0 件" in head
+    assert "升满成功 1 件" in head
+    assert "判定弃置 0 件" in head
+    # 括号里的口径说明不该出现在摘要里
+    assert "（" not in head and "）" not in head
+
+
+def test_detailed_report_keeps_the_caveats() -> None:
+    """括号里的口径说明从摘要挪到详细日志：摘要不写，详细日志必须写清。"""
+    text = _sample().report_text()
+    assert S.KEPT_NOTE in text
+    assert S.DISCARD_NOTE in text
 
 
 def test_report_fixes_all_five_stages_including_12() -> None:
@@ -246,7 +258,7 @@ def test_report_fixes_all_five_stages_including_12() -> None:
 
 
 def test_discard_label_count_can_differ_from_judged_discard() -> None:
-    """「弃置」报判定数；盘上已有标记时不会真打，所以实打数 ≤ 判定数。"""
+    """「判定弃置」报判定数；盘上已有标记时不会真打，所以实打数 ≤ 判定数。"""
     st = S.RunStats(tag="t")
     for index in (0, 1):
         slot = st.disc_begin("j1", index, 0)

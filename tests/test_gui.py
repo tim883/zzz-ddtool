@@ -1224,6 +1224,7 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     qapp.processEvents()
     window.resize(1500, 900)
     window._config_splitter.setSizes([260, 900, 300])
+    window._main_splitter.setSizes([300, 520])
     window.stay_on_top.setChecked(True)
     qapp.processEvents()
     window.close()
@@ -1232,6 +1233,7 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     assert saved["on_top"] is True
     assert saved["geometry"]
     assert len(saved["config_splitter"]) == 3
+    assert len(saved["main_splitter"]) == 2
 
     reopened = MainWindow(config_path=tmp_path / "t.yaml")
     reopened.show()
@@ -1240,6 +1242,9 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     sizes = reopened._config_splitter.sizes()
     # 出厂默认是 [240, 340, 740]（中间最窄）。恢复成功才会是中间最宽。
     assert sizes[1] > sizes[2]
+    # 下半区默认 [430, 310]（占四成）；恢复成功才会变成占一半以上
+    main_sizes = reopened._main_splitter.sizes()
+    assert main_sizes[1] > sum(main_sizes) * 0.5
     reopened.close()
 
 
@@ -1263,6 +1268,8 @@ def test_close_event_writes_layout_file(qapp: QApplication, tmp_path) -> None:
         {"config_splitter": "oops"},
         {"config_splitter": [1, 2]},
         {"config_splitter": [None, None, None]},
+        {"main_splitter": [1]},
+        {"main_splitter": "oops"},
         {"geometry": 123},
         {"geometry": ""},
         {"on_top": "yes"},
@@ -1284,24 +1291,110 @@ def test_read_layout_ignores_non_dict(qapp: QApplication, tmp_path) -> None:
     assert read_layout() == {}
 
 
+def test_run_log_title_row_has_collapse_toggle(qapp: QApplication, tmp_path) -> None:
+    """运行日志标题行：[运行日志] [▼]  日志文件：…；点箭头只收日志框，标题行留着。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.show()
+    qapp.processEvents()
+
+    # 下限 60；上限不写死，交给我下面那条竖分隔条拖
+    assert window.run_log.minimumHeight() == 60
+    assert window.run_log.maximumHeight() > 10_000
+
+    # 默认展开：倒三角朝下，日志框可见
+    assert window.log_toggle.isChecked()
+    assert window.log_toggle.text() == "▼"
+    assert window.run_log.isVisible()
+
+    # 位置：标题 → 箭头 → 路径，且箭头和路径之间留了间距
+    assert window.log_title.x() < window.log_toggle.x() < window.log_path.x()
+    gap = window.log_path.x() - (window.log_toggle.x() + window.log_toggle.width())
+    assert gap >= 24, gap
+
+    # 收起：日志框藏掉，箭头转正，标题和路径照旧留着
+    window.log_toggle.setChecked(False)
+    qapp.processEvents()
+    assert not window.run_log.isVisible()
+    assert window.log_toggle.text() == "▶"
+    assert window.log_title.isVisible()
+    assert window.log_path.isVisible()
+
+    # 再展开
+    window.log_toggle.setChecked(True)
+    qapp.processEvents()
+    assert window.run_log.isVisible()
+    assert window.log_toggle.text() == "▼"
+    window.close()
+
+
+def test_vertical_splitter_grows_run_log(qapp: QApplication, tmp_path) -> None:
+    """三栏和底下那块（操作栏 + 日志）之间有一根竖分隔条。
+
+    拖它只改下半区高度：日志跟着长，操作栏和窗口本身都不动。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 820)
+    window.show()
+    qapp.processEvents()
+
+    splitter = window._main_splitter
+    assert splitter.count() == 2
+    upper, lower = splitter.widget(0), splitter.widget(1)
+    # 上半是三栏，下半装着操作栏和日志面板
+    assert upper.isAncestorOf(window._config_splitter)
+    assert lower.isAncestorOf(window.start_btn)
+    assert lower.isAncestorOf(window.run_log)
+
+    footer = window.start_btn.parentWidget()
+    window_height = window.height()
+    upper_before = upper.height()
+    log_before = window.run_log.height()
+    footer_height = footer.height()
+
+    # 把分隔条往上拖：下半区变大
+    total = splitter.height()
+    splitter.setSizes([total // 4, total - total // 4])
+    qapp.processEvents()
+
+    assert upper.height() < upper_before
+    assert window.run_log.height() > log_before
+    # 操作栏高度固定，窗口本身也没被撑大
+    assert footer.height() == footer_height
+    assert window.height() == window_height
+    window.close()
+
+
 def test_run_status_swaps_to_result_stats_when_finished(qapp: QApplication, tmp_path) -> None:
-    """跑完：结果统计顶掉「运行状态/当前任务/已处理」三行；运行中收起详细区。"""
+    """跑完：结果统计顶掉「运行状态/当前任务/已处理」三行。
+
+    界面**只给一行摘要 + 详细日志路径**，不贴详细日志正文；运行中收起这块。
+    """
     window = MainWindow(config_path=tmp_path / "t.yaml")
 
     running = {"phase": "running", "processed": 1, "max_discs": 10, "message": "处理中"}
     window._show_run_status(running)
     assert "运行状态：running" in window.run_status_label.text()
-    assert window.run_stats_view.isHidden()
+    assert window.run_stats_path_label.isHidden()
 
-    report = "# 运行结果统计 · t\n\n> **共计耗时 1 分 00 秒**\n\n## 总览\n"
+    report = tmp_path / "20261004-200000.md"
+    report.write_text("# 运行结果统计 · t\n\n## 总览\n", encoding="utf-8")
     window._show_run_status(
-        {"phase": "completed", "stats_report": report, "stats_headline": "共计耗时 1 分 00 秒"}
+        {
+            "phase": "completed",
+            "stats_path": str(report),
+            "stats_headline": "共计耗时 1 分 00 秒，处理了 0 个盘，升满成功 0 件，判定弃置 0 件。",
+        }
     )
-    assert not window.run_stats_view.isHidden()
-    assert window.run_status_label.text() == "共计耗时 1 分 00 秒"
-    assert "总览" in window.run_stats_view.toPlainText()
-    assert window._shown_report == report
+    assert not window.run_stats_path_label.isHidden()
+    assert (
+        window.run_status_label.text()
+        == "共计耗时 1 分 00 秒，处理了 0 个盘，升满成功 0 件，判定弃置 0 件。"
+    )
+    # 只给路径，不显示详细日志正文
+    shown = window.run_stats_path_label.text()
+    assert str(report) in shown
+    assert "总览" not in shown
 
-    # 下一轮开始：详细区必须收起来，别把上一轮的报告留在屏上
+    # 下一轮开始：结果统计区必须收起来，别把上一轮的留在屏上
     window._show_run_status(running)
-    assert window.run_stats_view.isHidden()
+    assert window.run_stats_path_label.isHidden()

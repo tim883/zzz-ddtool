@@ -163,12 +163,13 @@ class Runner:
     _status_lines: list[str] = []
 
     def _set_status(
-        self, phase: str, message: str = "", cell: str = "", report: str = ""
+        self, phase: str, message: str = "", cell: str = "", report_path: str = ""
     ) -> None:
         """运行状态三处落点：run-status.json + 游戏画面悬浮层 + 日志。
 
-        report：跑完后的结果统计（Markdown）。只在收尾那一次带上，界面据此把状态栏
-        换成结果统计；运行中的状态不带它，界面照旧显示进度。
+        report_path：跑完后的结果统计详细日志（.md）路径。只在收尾那一次带上，
+        界面据此把状态栏换成结果统计的一行摘要 + 详细日志路径；运行中的状态不带它，
+        界面照旧显示进度。界面**不显示**详细日志正文，只给路径。
         """
         stamp = time.strftime("%H:%M:%S")
         line = " ".join(x for x in (stamp, cell, phase, message) if x)
@@ -186,8 +187,8 @@ class Runner:
         }
         if self._state is not None:
             payload.update(self._state.status_payload())
-        if report:
-            payload["stats_report"] = report
+        if report_path:
+            payload["stats_path"] = report_path
             payload["stats_headline"] = self.stats.headline()
         if self.on_status is not None:
             self.on_status(dict(payload))
@@ -358,7 +359,7 @@ class Runner:
                 self.hotkeys.close()
             self.trace.finish()
             report = self._finish_stats(run_started)
-            self._set_status(self.outcome, self.end_reason, report=report)
+            self._set_status(self.outcome, self.end_reason, report_path=report)
             logging.getLogger("zzz_ddtool").removeHandler(overlay_handler)
             overlay_handler.close()
         self.log.info("run %s processed=%d", self.outcome, self._processed)
@@ -367,7 +368,8 @@ class Runner:
     def _finish_stats(self, run_started: float) -> str:
         """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 人类可读报告。
 
-        返回报告文本（Markdown）给界面展示。统计出问题不影响任务结果，只记一条警告。
+        返回人类可读报告（.md）的绝对路径，供界面显示「详细日志在哪」；
+        写不出去就返回空串。统计出问题不影响任务结果，只记一条警告。
         """
         try:
             self.stats.seconds = time.monotonic() - run_started
@@ -381,9 +383,9 @@ class Runner:
             report_path = self.stats.write_report(stats_dir() / f"{self.stats.tag}.md")
             if report_path is not None:
                 self.log.info("人类可读报告已写入 %s", report_path)
-            else:
-                self.log.warning("人类可读报告写入失败（不影响本轮结果）")
-            return self.stats.report_text()
+                return str(report_path)
+            self.log.warning("人类可读报告写入失败（不影响本轮结果）")
+            return ""
         except Exception:
             self.log.warning("运行统计生成失败（不影响本轮结果）", exc_info=True)
             return ""
