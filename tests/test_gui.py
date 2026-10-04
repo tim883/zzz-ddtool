@@ -1657,10 +1657,12 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     window.show()
     qapp.processEvents()
     window.resize(1500, 900)
-    window._config_splitter.setSizes([260, 900, 300])
-    window._main_splitter.setSizes([300, 520])
     window.stay_on_top.setChecked(True)
     qapp.processEvents()
+    # 比例放在最后设、设完就关：中间再跑一轮事件循环的话，布局会把没落定的尺寸
+    # 按拉伸因子重算一遍，就把刚设的比例冲掉了（存下来的就不是这里的值）。
+    window._config_splitter.setSizes([260, 900, 300])
+    window._main_splitter.setSizes([300, 520])
     window.close()
 
     saved = read_layout()
@@ -1669,29 +1671,28 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     assert len(saved["config_splitter"]) == 3
     assert len(saved["main_splitter"]) == 2
     saved_main = list(saved["main_splitter"])
-    print("PROBE saved_main", saved_main, "cfg", saved["config_splitter"])
 
     reopened = MainWindow(config_path=tmp_path / "t.yaml")
     reopened.show()
     qapp.processEvents()
     assert reopened.stay_on_top.isChecked()
-    # 离屏窗口很窄（不到 1100px），三栏会被各自的最小宽度顶住，比例根本体现不出来；
-    # 撑到跟保存时差不多的宽度，再套一次记录里的比例，才验得出"比例真的存下来了"。
+    # 离屏窗口很窄（1000px 上下），三栏会被各自的最小宽度顶住、比例根本体现不出来；
+    # 撑到跟保存时差不多的宽度再套一次记录里的比例，才验得出"比例真的存下来了"。
     reopened.resize(1500, 900)
     opened_w = reopened._config_splitter.width()
     reopened._apply_sizes(reopened._config_splitter, saved["config_splitter"])
     reopened._apply_sizes(reopened._main_splitter, saved_main)
     qapp.processEvents()
     sizes = reopened._config_splitter.sizes()
-    if reopened._config_splitter.width() < 1200:
+    if reopened._config_splitter.width() < 1200:  # pragma: no cover - 取决于离屏窗口能多宽
         pytest.skip(f"离屏窗口只有 {opened_w}px 宽，三栏全被最小宽度夹住，比例无从体现")
     # 出厂默认是 [240, 340, 740]（中间最窄）。恢复成功才会是中间最宽。
     assert sizes[1] > sizes[2]
-    # 下面那块的比例照原样恢复（默认 [500, 270]，拖过之后不该回到默认）
+    # 下面那块的比例照原样恢复（默认 [500, 270] → 下半块占 0.35，动过之后不该回到默认）
     main_sizes = reopened._main_splitter.sizes()
     saved_ratio = saved_main[1] / sum(saved_main)
     assert abs(main_sizes[1] / sum(main_sizes) - saved_ratio) < 0.1
-    assert saved_ratio > 0.5
+    assert abs(saved_ratio - 270 / 770) > 0.05, saved_main
     reopened.close()
 
 
@@ -1842,6 +1843,33 @@ def test_red_line_can_still_grow_upper_at_lower_floor(qapp: QApplication, tmp_pa
     assert upper.height() >= upper_before + 140, (upper.height(), upper_before)
     assert window.height() >= win_before + 140, (window.height(), win_before)
     assert lower.height() <= floor + 4, (lower.height(), floor)
+    window.close()
+
+
+def test_red_line_handle_mouse_drag_is_handled_by_window(qapp: QApplication, tmp_path) -> None:
+    """分隔条上的鼠标拖动由窗口自己接管：QSplitter 会在下半块最小高度处把条夹死。"""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    handle = window._red_handle
+    upper = window._main_splitter.widget(0)
+    upper_before = upper.height()
+    win_before = window.height()
+
+    mid = QPoint(handle.width() // 2, handle.height() // 2)
+    down = QPoint(mid.x(), mid.y() + 130)
+    QTest.mousePress(handle, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, mid)
+    QTest.mouseMove(handle, down)
+    QTest.mouseRelease(handle, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, down)
+    qapp.processEvents()
+
+    assert upper.height() >= upper_before + 100, (upper.height(), upper_before)
+    assert window.height() >= win_before + 100, (window.height(), win_before)
     window.close()
 
 
