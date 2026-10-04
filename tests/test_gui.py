@@ -271,7 +271,10 @@ def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_p
 
     老存档里残留的 name 字段一律忽略：写回去也不再落盘。
     """
+    from PySide6.QtCore import Qt
+
     from zzz_ddtool.chain import parse_task_chain
+    from zzz_ddtool.gui import _JobItemDelegate
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window._add_job()
@@ -287,15 +290,21 @@ def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_p
     qapp.processEvents()
 
     label = window.chain_list.item(0).text()
-    assert label == "1. 4号 · 折枝剑歌 · 暴击伤害"
+    assert label == "1 │ 4号 · 折枝剑歌 · 暴击伤害"
     assert "任务" not in label  # 没有默认名顶在前面
     assert "\n" not in label
+
+    # 序号和正文之间那道竖线要真的分开画，且栏窄时的完整内容挂在悬停提示上
+    assert isinstance(window.chain_list.itemDelegate(), _JobItemDelegate)
+    # 不做「悬停显示详情」：条目只有文本，没有 tooltip
+    assert window.chain_list.item(0).toolTip() == ""
+    assert window.chain_list.textElideMode() == Qt.TextElideMode.ElideRight
 
     # 改部位 → 标签跟着变
     window.filter_slots[5].click()
     qapp.processEvents()
     label = window.chain_list.item(0).text()
-    assert label.startswith("1. 5号 · 折枝剑歌")
+    assert label.startswith("1 │ 5号 · 折枝剑歌")
 
     # 存档里若还写着 name，载入后既不显示也不回写
     jobs = parse_task_chain(
@@ -303,7 +312,87 @@ def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_p
     )
     assert len(jobs) == 1
     assert "name" not in jobs[0].to_dict()
-    assert MainWindow._job_item_text(0, jobs[0]) == "1. 2号 · 折枝剑歌"
+    assert MainWindow._job_item_text(0, jobs[0]) == "1 │ 2号 · 折枝剑歌"
+    window.close()
+
+
+def test_chain_panel_is_wide_enough_for_label(qapp: QApplication, tmp_path) -> None:
+    """任务链栏要放得下常见的长标签（双套装 + 主词条，实测全行 291px）。
+
+    最极端的一行（双套装 + 「能量自动回复」）拉满 420px 才全放下，默认靠省略号 +
+    悬停全文兜底，所以这里只保证常见长度不打折。
+    """
+    from PySide6.QtGui import QFontMetrics
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1400, 900)
+    window.show()
+    qapp.processEvents()
+    window._add_job()
+    window.filter_slots[4].click()
+    window._filter_sets = ["静听嘉音", "折枝剑歌"]
+    window._update_set_summary()
+    window._refresh_main_boxes({"暴击伤害"})
+    qapp.processEvents()
+
+    assert window.chain_panel.minimumWidth() >= 340  # 220 时标签只看到半截
+    assert window.chain_panel.maximumWidth() >= 400  # 拉得动才能把极端长行也放全
+
+    text = window.chain_list.item(0).text()
+    need = QFontMetrics(window.chain_list.font()).horizontalAdvance(text)
+    room = window.chain_list.viewport().width()
+    assert need <= room, (text, need, room)
+    window.close()
+
+
+def test_job_seq_column_keeps_two_digits_width(qapp: QApplication) -> None:
+    """序号列默认按 2 位数字留宽：1 与 10 同宽，竖线和正文起点才不会错位。
+
+    序号位数不同（9 → 10）时列宽不变，正文不会随序号位数左右跳；过百的任务
+    （三位数）才按实际宽度放宽。
+    """
+    from PySide6.QtGui import QFont, QFontMetrics
+
+    from zzz_ddtool.gui import _JOB_SEQ_DIGITS, _job_seq_width
+
+    assert _JOB_SEQ_DIGITS == 2
+    fm = QFontMetrics(QFont(qapp.font()))
+    width = lambda seq: _job_seq_width(fm, seq)  # noqa: E731
+
+    assert width("1") == width("10")  # 个位补满两位
+    assert width("9") == width("10")  # 进位时列宽不动
+    assert width("1") == width("99")
+    assert width("100") > width("10")  # 三位数按实际宽度放宽，不截断
+    qapp.processEvents()
+
+
+def test_config_columns_cannot_be_collapsed(qapp: QApplication, tmp_path) -> None:
+    """三栏分隔条不能把某一栏拖到 0 藏起来：拖到极限停在该栏最小宽。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1400, 900)
+    window.show()
+    qapp.processEvents()
+    window._add_job()
+    qapp.processEvents()
+
+    splitter = window._config_splitter
+    assert not splitter.childrenCollapsible()  # 关键开关：关掉「拖到底就折叠」
+
+    # 把两侧的分隔条都往左拖到头，任何栏都不能消失
+    splitter.moveSplitter(0, 0)
+    qapp.processEvents()
+    splitter.moveSplitter(0, 1)
+    qapp.processEvents()
+    sizes = splitter.sizes()
+    assert len(sizes) == 3
+    assert all(size > 0 for size in sizes), sizes
+    assert sizes[0] >= 340  # 任务链栏停在自己的最小宽
+    assert sizes[1] >= 300  # 配置栏停在自己的最小宽
+
+    # 旧 layout.json 里若存了 0，恢复时也要夹回最小宽
+    splitter.setSizes([0, 0, 0])
+    qapp.processEvents()
+    assert all(size > 0 for size in splitter.sizes()), splitter.sizes()
     window.close()
 
 
@@ -1479,9 +1568,9 @@ def test_run_log_title_row_has_collapse_toggle(qapp: QApplication, tmp_path) -> 
     window.show()
     qapp.processEvents()
 
-    # 下限 60；上限不写死，交给我下面那条竖分隔条拖
+    # 高度锁在 60~160：往下留一行能看，往上不让它无限霸占窗口
     assert window.run_log.minimumHeight() == 60
-    assert window.run_log.maximumHeight() > 10_000
+    assert window.run_log.maximumHeight() == 160
 
     # 默认展开：倒三角朝下，日志框可见
     assert window.log_toggle.isChecked()
@@ -1588,6 +1677,48 @@ def test_window_shrink_stops_at_log_floor_never_squeezes_upper(qapp: QApplicatio
     assert window.height() == floor_height
     assert upper.height() == upper_before
     window.close()
+
+
+def test_window_grow_stops_at_log_ceiling(qapp: QApplication, tmp_path) -> None:
+    """窗口底边向下拉：日志涨到 160 就封顶，窗口不再被拉长，三栏也不跟着长。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper = window._main_splitter.widget(0)
+    upper_before = upper.height()
+    ceiling = window.run_log.maximumHeight()
+    # 900 高时日志已经顶到上限，窗口高度此刻就是最高点
+    top = window.height()
+    assert window.run_log.height() == ceiling
+
+    # 一路向下拉：窗口不长、日志不长、三栏不长
+    for h in (1000, 1100, 1400):
+        window.resize(1320, h)
+        qapp.processEvents()
+        assert window.height() == top, h
+        assert window.run_log.height() == ceiling, h
+        assert upper.height() == upper_before, h
+    window.close()
+
+
+def test_window_height_is_clamped_not_pinned(qapp: QApplication, tmp_path) -> None:
+    """窗口不给自己设最大高度——钉死成定长后，Windows 会把拖边框退化成移动窗口。
+
+    上下限只在 resizeEvent 里钳，所以窗口属性本身必须保持"可自由拉伸"（未设 max）。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    assert window.maximumHeight() == 16_777_215  # 没被 setMaximumHeight 钉住
+    # 但内部限值是真的——往上拉仍被钳回去
+    assert window._window_max_height == window.height()
+    window.resize(1320, 1500)
+    qapp.processEvents()
+    assert window.height() == 900
     window.close()
 
 

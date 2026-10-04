@@ -36,7 +36,7 @@ class Preset:
     require_s_rank: bool = True
     skip_locked: bool = True
     skip_equipped: bool = True
-    skip_discarded: bool = True
+    skip_discarded: bool = False  # 新任务默认不勾，等用户自己开
     skip_max_level: bool = True  # 等级15=满级，扫描阶段直接跳过不点击
     max_discs: int = 100
     filter_sets: tuple[str, ...] = ()
@@ -130,7 +130,7 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
         require_s_rank=bool(filters.get("require_s_rank", True)),
         skip_locked=bool(filters.get("skip_locked", True)),
         skip_equipped=bool(filters.get("skip_equipped", True)),
-        skip_discarded=bool(filters.get("skip_discarded", True)),
+        skip_discarded=bool(filters.get("skip_discarded", False)),
         skip_max_level=bool(filters.get("skip_max_level", True)),
         max_discs=max(1, int(run.get("max_discs") or 100)),
         filter_sets=tuple(str(item).strip() for item in raw_sets if str(item).strip()),

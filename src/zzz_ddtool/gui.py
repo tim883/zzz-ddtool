@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QSplitter,
     QTabWidget,
     QToolButton,
@@ -252,6 +254,79 @@ QScrollBar::handle:vertical { background: #c8c8c8; min-height: 32px; border-radi
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
+
+# 任务链条目里序号和正文之间的分隔符。序号和正文的「4号」都是数字，
+# 纯文本连成一片分不清哪个是顺序、哪个是部位，所以用一道竖线隔开。
+_JOB_ITEM_SEP = "│"
+_JOB_SEQ_DIGITS = 2  # 序号列默认按 2 位数字留宽（够 1~99）。1 和 10 的竖线、正文起点才对得上
+_JOB_SEQ_COLOR = "#0078d7"        # 主题蓝，与按钮同色
+_JOB_SEQ_SELECTED_COLOR = "#005a9e"  # 选中行正文也是蓝的，序号压深一档才分得开
+_JOB_SEP_COLOR = "#9aa5b1"
+_JOB_BODY_COLOR = "#1a1a1a"
+
+
+def _job_seq_width(fm_seq: QFontMetrics, seq: str, digits: int = _JOB_SEQ_DIGITS) -> int:
+    """序号列宽：默认留够 `digits` 位数字的宽度，序号本身更长（过百的任务）就按实际宽。
+
+    固定列宽是为了让「1 │ …」和「10 │ …」的竖线位置一致，正文不会随序号位数左右跳。
+    """
+    return max(fm_seq.horizontalAdvance("0" * digits), fm_seq.horizontalAdvance(seq))
+
+
+class _JobItemDelegate(QStyledItemDelegate):
+    """任务链条目：序号和正文分开画。
+
+    序号占固定 2 位宽（右对齐，1 和 10 的竖线对齐）+ 一道浅灰竖线，正文用普通文字色。
+    正文按可视宽度收省略号，完整内容在悬停提示里（栏宽 340–420px 也放不下两个套装 + 长主词条）。
+    """
+
+    def paint(self, painter, option, index) -> None:  # noqa: ANN001
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_PanelItemViewItem, opt, painter, widget)
+
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        seq, _, body = text.partition(_JOB_ITEM_SEP)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+
+        base = QFont(option.font)
+        seq_font = QFont(base)
+        seq_font.setWeight(QFont.Weight.Medium)
+        fm = QFontMetrics(base)
+        fm_seq = QFontMetrics(seq_font)
+
+        seq = seq.strip()
+        left = option.rect.left() + 5
+        width = max(0, option.rect.width() - 10)
+        seq_w = _job_seq_width(fm_seq, seq)
+        sep_gap = fm.horizontalAdvance(_JOB_ITEM_SEP) + 10
+        body_w = max(0, width - seq_w - sep_gap)
+
+        painter.save()
+        painter.setFont(seq_font)
+        painter.setPen(QColor(_JOB_SEQ_SELECTED_COLOR if selected else _JOB_SEQ_COLOR))
+        # 序号在固定列宽里右对齐：个位对齐个位，「1」和「10」的竖线落在同一处
+        painter.drawText(
+            QRect(left, option.rect.top(), seq_w, option.rect.height()),
+            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            seq,
+        )
+        painter.setFont(base)
+        painter.setPen(QColor(_JOB_SEP_COLOR))
+        painter.drawText(
+            QRect(left + seq_w + 6, option.rect.top(), option.rect.width(), option.rect.height()),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            _JOB_ITEM_SEP,
+        )
+        painter.setPen(QColor(_JOB_SEQ_COLOR if selected else _JOB_BODY_COLOR))
+        painter.drawText(
+            QRect(left + seq_w + sep_gap, option.rect.top(), body_w, option.rect.height()),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            fm.elidedText(body.strip(), Qt.TextElideMode.ElideRight, body_w),
+        )
+        painter.restore()
 
 
 def remember_config_path(path: Path) -> None:
@@ -1085,6 +1160,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
+        # 不允许把某一栏拖到 0 藏起来：拖到极限就停在该栏的最小宽（任务链 340 / 配置栏 300）
+        splitter.setChildrenCollapsible(False)
         splitter.setSizes([240, 360, 720])
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
@@ -1134,8 +1211,9 @@ class MainWindow(QMainWindow):
         self.run_log.setReadOnly(True)
         self.run_log.setMaximumBlockCount(300)
         self.run_log.setPlaceholderText("开始任务后，这里实时显示识别、判断、操作及失败原因。")
-        # 只留下限 60；上限交给下面的竖直分隔条——定死 160 手柄就没得拖了。
+        # 运行日志高度锁在 60~160：往下留一行能看，往上不让它无限霸占窗口。
         self.run_log.setMinimumHeight(60)
+        self.run_log.setMaximumHeight(160)
         log_layout.addWidget(self.run_log)
 
         # 下面那块：状态行 + 运行日志。自身高度不吃窗口拉伸，只被红框顶着上下移动。
@@ -1159,6 +1237,9 @@ class MainWindow(QMainWindow):
         self._main_splitter.setHandleWidth(6)
         self._main_splitter.setSizes([500, 270])
         self._lower_height = 270
+        # 窗口高度的上下限：只在 resizeEvent 里当钳制用，**不设成窗口的 min/max**。
+        self._window_min_height = 0
+        self._window_max_height = 16_777_215
         self._dragging_main_splitter = False
         self._main_splitter.splitterMoved.connect(self._on_main_splitter_moved)
         outer.addWidget(self._main_splitter, 1)
@@ -1211,23 +1292,42 @@ class MainWindow(QMainWindow):
             self._layout_timer.start(800)
 
     def _remember_lower_height(self) -> None:
-        """记下红线以下那块的高度，拖红框时照它锁住。"""
+        """记下红线以下那块的高度，拖红框时照它锁住；顺手刷新窗口的上下限。"""
         sizes = self._main_splitter.sizes()
         if len(sizes) == 2:
             self._lower_height = sizes[1]
-        self._update_min_height()
+        self._update_window_limits()
 
-    def _update_min_height(self) -> None:
-        """窗口最小高度 = 当前高度 − 日志窗还能让出的量。
+    def _update_window_limits(self) -> None:
+        """算出窗口最多能拖多高、最少能拖多矮，记在实例上。
 
-        日志窗触底后再缩窗口，Qt 会转而去压上面三栏——这里把最小高度动态顶到
-        「三栏当前高度 + 日志窗最小高度」，日志一到底窗口就缩不动，三栏永不被挤压。
+        **不调 setMinimumHeight/setMaximumHeight**：把窗口钉死成定长后，Windows 会把
+        「拖边框」退化成「移动窗口」——高度不变，整个窗口却跟着滑走。所以这里只记
+        数字，真正拦截放在 resizeEvent 里，窗口对系统始终是"可自由拉伸"的。
+
+        - 上限：日志窗离它的上限（160）还差多少，就给窗口留多少余量
+        - 下限：下面那块（状态行 + 日志）还愿意让出多少高度，窗口最多缩这么多
         """
         if not self._layout_ready:
             return
         floor = self._lower_pane.minimumSizeHint().height()
-        extra = max(0, self._lower_pane.height() - floor)
-        self.setMinimumHeight(max(0, self.height() - extra))
+        shrinkable = max(0, self._lower_pane.height() - floor)
+        growable = 0
+        if self.run_log.isVisible():
+            growable = max(0, self.run_log.maximumHeight() - self.run_log.height())
+        self._window_min_height = max(0, self.height() - shrinkable)
+        self._window_max_height = self.height() + growable
+
+    def _clamp_window_height(self) -> bool:
+        """把窗口高度拉回 [_window_min_height, _window_max_height] 之内。
+
+        返回是否真的改过——改过就说明这次是被钳回来的，别再重复调度后面的事。
+        """
+        target = min(max(self.height(), self._window_min_height), self._window_max_height)
+        if target == self.height():
+            return False
+        self.resize(self.width(), target)
+        return True
 
     def _on_main_splitter_moved(self, pos: int, index: int) -> None:  # noqa: ARG002
         """拖红框下边那条线：只改红框（三栏 + 操作栏）的高度。
@@ -1242,16 +1342,20 @@ class MainWindow(QMainWindow):
         if delta:
             self._dragging_main_splitter = True
             try:
-                self.resize(self.width(), max(self.minimumHeight(), self.height() - delta))
+                self.resize(self.width(), max(self._window_min_height, self.height() - delta))
             finally:
                 self._dragging_main_splitter = False
+            self._update_window_limits()
         self._queue_layout_save()
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
-        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
+        # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记、也别钳。
         if self._layout_ready and not self._dragging_main_splitter:
-            QTimer.singleShot(0, self._remember_lower_height)
+            # 用户拖窗口边：超出上下限就弹回去。窗口本身不设 min/max，
+            # 所以系统始终按"拉伸"处理，不会退化成移动窗口。
+            if not self._clamp_window_height():
+                QTimer.singleShot(0, self._remember_lower_height)
         self._queue_layout_save()
 
     def moveEvent(self, event) -> None:  # noqa: ANN001
@@ -1343,12 +1447,13 @@ class MainWindow(QMainWindow):
 
         flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
-        self.require_s = QCheckBox("只要 S 级")
-        self.skip_locked = QCheckBox("跳过锁定")
+        self.require_s = QCheckBox("跳过非S级")
+        self.skip_locked = QCheckBox("跳过有锁定标记")
         self.skip_equipped = QCheckBox("跳过已装备")
-        self.skip_discarded = QCheckBox("跳过已有弃置标记")
-        for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
-            box.setChecked(True)
+        self.skip_discarded = QCheckBox("跳过有弃置标记")
+        for box in (self.require_s, self.skip_equipped, self.skip_locked, self.skip_discarded):
+            # 弃置标记默认不勾，其余三项默认勾。
+            box.setChecked(box is not self.skip_discarded)
             flags.addWidget(box)
         layout.addWidget(flags_box)
         task_box = QGroupBox("当前任务限制")
@@ -1496,17 +1601,25 @@ class MainWindow(QMainWindow):
 
     def _build_chain(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(220)
-        panel.setMaximumWidth(260)
+        # 条目要放「序号 │ 4号 · 套装 · 主词条」，最长的一行（两个套装 + 长主词条）实测要 323px，
+        # 220–260 只能看到半截。放宽 + 里面少留白，配合省略号和悬停全文。
+        panel.setMinimumWidth(340)
+        panel.setMaximumWidth(420)
+        self.chain_panel = panel
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
         box = QGroupBox("任务链")
         inner = QVBoxLayout(box)
+        inner.setContentsMargins(6, 9, 6, 9)
         hint = QLabel("编完一个部位再新建。执行按从上到下的顺序。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         # 没有任务名：列表里靠「序号 + 部位 · 套装 · 主词条」区分，不再单独起名。
         self.chain_list = QListWidget()
+        self.chain_list.setItemDelegate(_JobItemDelegate(self.chain_list))
+        # 条目文本比栏宽长（最长要 279px），收省略号 + 悬停看全文，别出现横向滚动条
+        self.chain_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.chain_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.chain_list.currentRowChanged.connect(self._on_chain_row)
         new_btn = QPushButton("新建任务")
         new_btn.setObjectName("primary")
@@ -1537,12 +1650,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _job_item_text(index: int, job: TaskJob) -> str:
-        """列表条目文本：序号 + 内容摘要（部位 · 套装 · 主词条）。
+        """列表条目文本：序号 │ 内容摘要（部位 · 套装 · 主词条）。
 
         没有任务名，这条摘要就是任务的唯一标识；改实时写回后摘要会跟着变，
-        所以抽出来给两处共用。
+        所以抽出来给两处共用。序号和正文之间那道竖线由 `_JobItemDelegate` 分色画。
         """
-        return f"{index + 1}. {job.title()}"
+        return f"{index + 1} {_JOB_ITEM_SEP} {job.title()}"
+
+    def _apply_job_item(self, item: QListWidgetItem, index: int, job: TaskJob) -> None:
+        """写条目文本（栏窄时会收省略号）。"""
+        item.setText(self._job_item_text(index, job))
 
     def _refresh_chain_list(self, select_id: str | None = None) -> None:
         current_id = select_id or self._editing_job_id
@@ -1552,8 +1669,9 @@ class MainWindow(QMainWindow):
         self.chain_list.blockSignals(True)
         self.chain_list.clear()
         for index, job in enumerate(self._jobs):
-            item = QListWidgetItem(self._job_item_text(index, job))
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, job.job_id)
+            self._apply_job_item(item, index, job)
             self.chain_list.addItem(item)
         if current_id:
             for row in range(self.chain_list.count()):
@@ -1591,7 +1709,7 @@ class MainWindow(QMainWindow):
             self._jobs[index] = fresh
             item = self.chain_list.item(index)
             if item is not None:
-                item.setText(self._job_item_text(index, fresh))
+                self._apply_job_item(item, index, fresh)
             return
 
     def _clear_editor(self) -> None:
@@ -1755,14 +1873,11 @@ class MainWindow(QMainWindow):
     def _update_set_summary(self) -> None:
         if not self._filter_sets:
             text = "未选"
-            full = ""
         else:
             text = "、".join(self._filter_sets)
-            full = text
         fm = QFontMetrics(self.set_summary.font())
         width = max(self.set_summary.width(), 180)
         self.set_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
-        self.set_summary.setToolTip(full)
 
     def _open_set_picker(self) -> None:
         extra = [name for name in self._filter_sets if name not in SETS]
@@ -1788,7 +1903,7 @@ class MainWindow(QMainWindow):
                 continue
             item = self.chain_list.item(index)
             if item is not None:
-                item.setText(self._job_item_text(index, self._job_from_editor(job.job_id)))
+                self._apply_job_item(item, index, self._job_from_editor(job.job_id))
             return
 
     def _update_apply_buttons(self) -> None:
