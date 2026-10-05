@@ -58,6 +58,11 @@ def isolated_user_data(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
     monkeypatch.setattr(paths, "user_data_root", lambda: tmp_path / "application-root")
     monkeypatch.setattr(paths, "legacy_plan_dirs", lambda: (tmp_path / "legacy" / "data",))
+    # 运行时产出（日志/截图/状态/统计）同样要隔离：界面启动会去读 log/run-status.json
+    # 恢复状态行，文件在不在会改变下半区（状态行+日志）的最小高度，进而左右窗口缩放
+    # 类断言的成败。不隔离就会读到开发机上真实的 run-status.json，测试结果不稳定。
+    monkeypatch.setattr(paths, "log_dir", lambda: tmp_path / "log")
+    monkeypatch.setattr(paths, "status_file", lambda: tmp_path / "log" / "run-status.json")
 
 
 def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
