@@ -4,6 +4,8 @@
     级别   —— 日志写多少（截图始终全量，不受这个影响）
     容量   —— 截图留多少张，纯按数量，超了从最旧的轮次整轮删
 
+这两样都会记到 user/log-settings.json（读写归 logprefs.py），下次启动自动装回。
+
 为什么没有「失败永远保留」：
     排错靠 debug 模式重跑复现，不靠翻旧图回溯。留着失败图
     只会把正常的图挤掉。见 retain.py。
@@ -28,7 +30,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from zzz_ddtool.retain import clear_captures, count_captures, get_max_files, retain_captures, set_max_files
+from zzz_ddtool.logprefs import (
+    MAX_KEEP_FILES,
+    MIN_KEEP_FILES,
+    apply as apply_prefs,
+    load as load_prefs,
+)
+from zzz_ddtool.retain import clear_captures, count_captures, retain_captures
 from zzz_ddtool.widgets import NoWheelSpinBox
 
 # 级别只影响日志写多少，不影响截图
@@ -63,11 +71,13 @@ class LogSettingsDialog(QDialog):
         self.setWindowTitle("日志设置")
         self.setMinimumWidth(460)
 
-        from zzz_ddtool.logutil import level as current_level
         from zzz_ddtool.paths import captures_dir, log_dir
 
         self._captures_dir = captures_dir
         self._log_dir = log_dir
+
+        # 从记着的设置里读，不从运行时状态读：只在内存里改过没保存的那一轮不该被显示出来
+        saved_level, saved_keep = load_prefs()
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -75,7 +85,7 @@ class LogSettingsDialog(QDialog):
 
         # 级别：截图不受影响，这句话必须写清楚，否则用户以为开了详细才存图
         self.level_combo = _LevelCombo()
-        self.level_combo.set_level(current_level())
+        self.level_combo.set_level(saved_level)
         form.addRow("日志级别", self.level_combo)
         note = QLabel("截图始终全量保存，不随级别变化。级别只管日志写多少。")
         note.setObjectName("hint")
@@ -83,10 +93,10 @@ class LogSettingsDialog(QDialog):
         form.addRow("", note)
 
         self.keep_spin = NoWheelSpinBox()
-        self.keep_spin.setRange(20, 5000)
+        self.keep_spin.setRange(MIN_KEEP_FILES, MAX_KEEP_FILES)
         self.keep_spin.setSingleStep(50)
         self.keep_spin.setSuffix(" 张")
-        self.keep_spin.setValue(get_max_files())
+        self.keep_spin.setValue(saved_keep)
         form.addRow("截图最多留", self.keep_spin)
 
         keep_note = QLabel("超了从最旧的轮次整轮删。半截的轮次没参考价值。")
@@ -147,15 +157,11 @@ class LogSettingsDialog(QDialog):
         return self.keep_spin.value()
 
     def apply_settings(self) -> None:
-        """应用设置：改级别 + 记下新上限并按它回收。
+        """应用设置：改级别 + 记下新上限 + 按它回收。
 
-        上限要记住（set_max_files），否则下一次 save_image 走默认值又裁回 300，
-        用户填的数字等于白填。
+        上限要落盘，否则下次启动 retain 又回到 300，用户填的数字等于白填。
         """
-        from zzz_ddtool.logutil import set_level
-
-        set_level(self.chosen_level())
-        set_max_files(self.chosen_keep())
+        apply_prefs(self.chosen_level(), self.chosen_keep())
         retain_captures()
 
 

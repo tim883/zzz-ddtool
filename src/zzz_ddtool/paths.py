@@ -70,6 +70,11 @@ def layout_file() -> Path:
     return user_dir() / "layout.json"
 
 
+def log_settings_file() -> Path:
+    """日志设置记忆（日志级别 + 截图张数上限）。用户数据，更新永不碰。"""
+    return user_dir() / "log-settings.json"
+
+
 def log_dir() -> Path:
     """所有运行时产出的根目录，第一层就叫 log。
 
