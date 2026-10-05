@@ -37,7 +37,19 @@ def blocked_substats(slot: int, mainstats: Iterable[str] = ()) -> set[str]:
     fixed = FIXED_MAINSTATS.get(slot)
     if fixed is not None:
         return {fixed}
-    return set(mainstats) & set(SLOT_MAINSTATS.get(slot, ())) & set(SUBSTAT_NAMES)
+    choices = set(mainstats) & set(SLOT_MAINSTATS.get(slot, ()))
+    # 多个主属性是任选其一：某主属性在其他盘上仍能成为副属性。
+    return choices & set(SUBSTAT_NAMES) if len(choices) == 1 else set()
+
+
+def possible_substats(slot: int, mainstats: Iterable[str], names: Iterable[str]) -> bool:
+    """副词条组合至少能出现在一个所选主属性的盘上。"""
+    present = set(names)
+    fixed = FIXED_MAINSTATS.get(slot)
+    if fixed is not None:
+        return fixed not in present
+    choices = set(mainstats) & set(SLOT_MAINSTATS.get(slot, ()))
+    return not choices or any(main not in present for main in choices)
 
 
 def default_stage_require(slot: int) -> dict[str, dict[int, float]]:

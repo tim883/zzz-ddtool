@@ -15,6 +15,7 @@ from zzz_ddtool.navigation import (
     anchor_screen_rows,
     load_profile,
     measure_layout,
+    is_empty_warehouse,
     save_profile,
     scroll_rows,
 )
@@ -68,6 +69,30 @@ def _labels(rows: int, cols: int, *, top0: int = 347, pitch: int = 175):
 
 
 # ------------------------------------------------------------------ 布局测量
+
+
+def test_empty_filtered_warehouse_live_screenshot():
+    image = QImage(str(FIXTURES / "list-empty-filtered.png"))
+    assert not image.isNull()
+    assert is_empty_warehouse(image) is True
+
+
+@pytest.mark.parametrize("text,tile,page,expected", [
+    ("驱动仓库 [ 0 / 3000 ]", True, True, True),
+    ("驱动仓库 [ 1 / 3000 ]", True, True, False),
+    ("驱动仓库 [ 0 / 3000 ]", False, True, False),
+    ("驱动仓库 [ 0 / 3000 ]", None, True, False),
+    ("驱动仓库 [ 0 / 3000 ]", True, False, False),
+    ("驱动仓库", True, True, False),
+])
+def test_empty_warehouse_needs_count_page_and_placeholders(monkeypatch, text, tile, page, expected):
+    import zzz_ddtool.equipped as equipped
+    import zzz_ddtool.screen as screen
+
+    monkeypatch.setattr(screen, "is_page", lambda *args: page)
+    monkeypatch.setattr(ocr_module, "read_rect", lambda *args: [ocr_module.OcrLine(text, .99, 70, 120, 350, 150)])
+    monkeypatch.setattr(equipped, "tile_is_empty", lambda *args: tile)
+    assert is_empty_warehouse(QImage(1920, 1080, QImage.Format.Format_RGB32)) is expected
 
 
 def test_measure_layout_reads_origin_and_pitch(monkeypatch):

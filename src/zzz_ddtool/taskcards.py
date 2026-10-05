@@ -1,0 +1,157 @@
+"""Shared task card selection and bounded, in-memory combination cache."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from threading import Lock
+
+from zzz_ddtool.chain import TaskJob
+from zzz_ddtool.gamedata import blocked_substats, possible_substats
+from zzz_ddtool.origin import Origin
+from zzz_ddtool.patterns import (
+    CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize, enumerate_patterns,
+    first_filter, score_slots, useful_ordered,
+)
+
+
+def effective_weights(job: TaskJob) -> dict[str, float]:
+    blocked = blocked_substats(job.slot, job.mainstats)
+    return {name: value for name, value in job.weights.items() if name not in blocked}
+
+
+def rebase_selection(job: TaskJob, *, filtered: bool = True,
+                     cancelled: Callable[[], bool] | None = None) -> tuple[str, ...] | None:
+    """The same effective whitelist for editing, counts, saving and execution.
+
+    None means an ungenerated, skipped task; an explicit empty tuple stays empty.
+    Changing useful stats can collapse multiple old cards to one canonical card.
+    """
+    if job.accepted is None:
+        return None
+    weights = effective_weights(job)
+    useful = set(useful_ordered(weights))
+    if not useful:
+        return ()
+    blocked = blocked_substats(job.slot, job.mainstats)
+    out = set()
+    for i, pid in enumerate(job.accepted):
+        if i % 128 == 0 and cancelled is not None and cancelled():
+            raise InterruptedError
+        try:
+            origin, checkpoint, body = pid.split(":", 2)
+            slots = []
+            for token in body.split("|"):
+                name, plus, bonus = token.rpartition("+")
+                if not plus:
+                    name, bonus = token, "0"
+                slots.append(Slot(name if name in useful or name == EMPTY else JUNK, int(bonus)))
+            canonical = canonicalize(slots, weights)
+            pattern = Pattern(Origin(origin), int(checkpoint), canonical, score_slots(canonical, weights))
+        except ValueError:
+            continue
+        if any(token.split("+", 1)[0] in blocked for token in body.split("|")):
+            continue
+        if not possible_substats(job.slot, job.mainstats, (token.split("+", 1)[0] for token in body.split("|"))):
+            continue
+        if filtered:
+            if pattern.checkpoint not in CHECKPOINTS:
+                continue
+            need = (job.stage_require.get(origin) or {}).get(pattern.checkpoint, 0.0)
+            if pattern.score + 1e-9 < need or not first_filter([pattern]):
+                continue
+        out.add(pattern.pattern_id)
+    return tuple(sorted(out))
+
+
+def counts_signature(job: TaskJob) -> tuple:
+    weights = effective_weights(job)
+    return (
+        job.slot, tuple(sorted(job.mainstats)),
+        tuple(sorted(blocked_substats(job.slot, job.mainstats))),
+        tuple((name, float(weights[name])) for name in useful_ordered(weights)),
+        tuple(float((job.stage_require.get(origin.value) or {}).get(level, 0))
+              for origin in Origin for level in CHECKPOINTS),
+        job.accepted,
+    )
+
+
+class PatternCatalog:
+    """Reuse generated cards across previews and tasks; never cache partial work.
+
+    UI cache reads take only the short data lock. Generation is serialized in workers,
+    so two consumers of the same weights do not enumerate the same combinations twice.
+    """
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[tuple, dict] = OrderedDict()
+        self._lock = Lock()
+        self._build_lock = Lock()
+
+    @staticmethod
+    def key(weights: Mapping[str, float]) -> tuple:
+        return tuple((name, float(weights[name])) for name in useful_ordered(weights))
+
+    def peek(self, weights: Mapping[str, float]) -> dict | None:
+        with self._lock:
+            return self._entries.get(self.key(weights))
+
+    def get(self, weights: Mapping[str, float], cancelled: Callable[[], bool],
+            enumerator=None) -> dict | None:
+        enumerator = enumerator or enumerate_patterns
+        key = self.key(weights)
+        while not self._build_lock.acquire(timeout=0.01):
+            if cancelled():
+                return None
+        try:
+            if cancelled():
+                return None
+            with self._lock:
+                cached = self._entries.get(key)
+                if cached is not None:
+                    self._entries.move_to_end(key)
+                    return cached
+            grouped = {}
+            for origin in Origin:
+                for level in CHECKPOINTS:
+                    if cancelled():
+                        return None
+                    raw = enumerator(dict(key), origin=origin, checkpoint=level, cancelled=cancelled) if key else []
+                    if cancelled():
+                        return None
+                    grouped[(origin.value, level)] = tuple(first_filter(raw))
+            with self._lock:
+                self._entries[key] = grouped
+                # At most four weight configurations and about one maximum-size catalog.
+                while len(self._entries) > 1 and (
+                    len(self._entries) > 4 or
+                    sum(len(cards) for groups in self._entries.values() for cards in groups.values()) > 60000
+                ):
+                    self._entries.popitem(last=False)
+            return grouped
+        finally:
+            self._build_lock.release()
+
+
+def task_counts(job: TaskJob, grouped: Mapping[tuple[str, int], tuple[Pattern, ...]],
+                cancelled: Callable[[], bool] = lambda: False) -> dict[str, tuple[int, int]] | None:
+    if job.accepted is None:
+        return None
+    accepted = rebase_selection(job, cancelled=cancelled)
+    keep = frozenset(accepted)
+    result = {}
+    for origin in Origin:
+        picked = qualified = 0
+        for level in CHECKPOINTS:
+            need = float((job.stage_require.get(origin.value) or {}).get(level, 0))
+            for i, pattern in enumerate(grouped[(origin.value, level)]):
+                if i % 128 == 0 and cancelled():
+                    return None
+                if pattern.score + 1e-9 >= need and possible_substats(
+                    job.slot, job.mainstats, (slot.name for slot in pattern.slots)
+                ):
+                    qualified += 1
+                    if pattern.pattern_id in keep:
+                        picked += 1
+        result[origin.value] = (picked, qualified)
+    return result

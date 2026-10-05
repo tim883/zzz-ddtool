@@ -146,9 +146,9 @@ def _confirm_popup(hwnd: int) -> None:
 
 
 def _text_lines() -> list:
-    """抓一帧，返回全窗口的 OCR 文本行。"""
+    """主属性定位只识别右侧面板，避免扫描仓库中的无关文字。"""
     image, _ = _grab()
-    return read_rect(image, FULL_WINDOW)
+    return _panel_lines(image)
 
 
 def _title_y(lines, title: str) -> int | None:
@@ -188,14 +188,15 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
     此前直接点名，OCR 永远找不到主属性名，滚 8 轮后中断——B5 的根因。
 
     **返回**「已确认展开」那一帧的 OCR 文本行。紧接着调用的 `_pick_mainstats` 就在同一
-    状态下点名，直接把这一帧交给它，省掉一次全屏 OCR（实测 1.3~1.5s，且中间无点击、
-    帧不会变）。
+    状态下点名，直接把这一帧交给它，省掉一次面板 OCR（中间无点击，帧不会变）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     for _round in range(_MAX_PANEL_SCROLLS + 1):
         lines = _text_lines()
         title_y = _title_y(lines, MAINSTAT_TITLE)
         if title_y is None:
+            if _round == _MAX_PANEL_SCROLLS:
+                break
             wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
             time.sleep(0.35)
             continue
@@ -204,6 +205,12 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
             raise FilterClickError("主属性词条区没找到「点击展开 / 点击收起」开关，中断。")
         if "收起" in toggle.text.replace(" ", ""):
             return lines
+        if toggle.bottom > scale_point(0, 1080 - _PANEL_CLICK_BOTTOM_GAP, width, height)[1]:
+            if _round == _MAX_PANEL_SCROLLS:
+                break
+            wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+            time.sleep(0.35)
+            continue
         click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
         time.sleep(0.7)
         after = _text_lines()
@@ -214,7 +221,7 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
             return after
         raise FilterClickError("点了主属性「点击展开」但该区没有展开，中断。")
     raise FilterClickError(
-        "滚动面板 %d 轮后仍未看到「主属性词条」区，中断。" % _MAX_PANEL_SCROLLS
+        "滚动面板 %d 轮后「主属性词条」区仍未就位或无法展开，中断。" % _MAX_PANEL_SCROLLS
     )
 
 
@@ -260,34 +267,53 @@ def _pick_mainstats(
     """在已展开的主属性词条区里点名勾选。
 
     主属性是复选框，勾上即生效，没有弹层、也没有「确认筛选」；
-    逐条精确点名为主，找不齐直接中断，不滚动、不猜。
+    逐条点名；目标未露出或落在底部点击无效区时，向下滚动后重新 OCR。
+    已选词条从待选列表移除，滚动后不重复点击；只匹配主属性区。
 
     `lines` 传入 `_open_mainstat_section` 返回的那一帧即可（两者状态相同、中间无点击），
     不传则自己抓一帧。
     """
     log = get_logger("zzz_ddtool.gamefilter")
-    pending = list(names)
+    pending = list({_normalize_stat(name): name for name in names}.values())
     if not pending:
         return
     if lines is None:
         lines = _text_lines()
-    title_y = _title_y(lines, MAINSTAT_TITLE)
-    if title_y is None:
+    if _title_y(lines, MAINSTAT_TITLE) is None:
         raise FilterClickError("主属性词条区不在视口里，无法点名，中断。")
-    sub_y = _title_y(lines, SUBSTAT_TITLE)
-    top = title_y + 20
-    bottom = sub_y - 20 if sub_y is not None and sub_y - 20 > top else title_y + 320
-    missing: list[str] = []
-    for name in pending:
-        hit = _best_match(lines, name, top, bottom)
-        if hit is None:
-            missing.append(name)
-            continue
-        click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
-        log.info("mainstat clicked %r at (%d,%d)", name, hit.left, hit.top)
-        time.sleep(0.3)
-    if missing:
-        raise FilterClickError(f"主属性词条区里找不到：{missing}")
+    left, panel_top, right, panel_bottom = scale_rect(1300, 100, 1880, 980, width, height)
+    click_bottom = scale_point(0, 1080 - _PANEL_CLICK_BOTTOM_GAP, width, height)[1]
+    margin = max(1, round(20 * height / 1080))
+    for scrolls in range(_MAX_PANEL_SCROLLS + 1):
+        title_y = _title_y(lines, MAINSTAT_TITLE)
+        sub_y = _title_y(lines, SUBSTAT_TITLE)
+        # 向下滚动后，主标题可能移到视口上方；副标题仍可界定主属性区的下沿。
+        # 两个标题都认不上时不点，继续滚动重找，避免误选副属性同名项。
+        if title_y is not None or sub_y is not None:
+            top = title_y + margin if title_y is not None else panel_top
+            bottom = sub_y - margin if sub_y is not None else min(
+                panel_bottom, title_y + round(320 * height / 1080)
+            )
+            candidates = [line for line in lines if left <= (line.left + line.right) // 2 <= right]
+            still = []
+            for name in pending:
+                hit = _best_match(candidates, name, top, bottom)
+                if hit is None or hit.bottom > click_bottom:
+                    still.append(name)
+                    continue
+                _click_line(hwnd, hit)
+                log.info("mainstat clicked %r at (%d,%d)", name, hit.left, hit.top)
+                time.sleep(0.3)
+            pending = still
+            if not pending:
+                return
+        if scrolls == _MAX_PANEL_SCROLLS:
+            break
+        log.info("主属性选项未全部就位，向下滚动重找（第%d次）：%s", scrolls + 1, pending)
+        wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+        time.sleep(0.35)
+        lines = _text_lines()
+    raise FilterClickError(f"主属性词条区滚动 {_MAX_PANEL_SCROLLS} 轮后仍找不到或无法点击：{pending}")
 
 
 def apply_sets_mainstats(
@@ -314,7 +340,7 @@ def apply_sets_mainstats(
         _confirm_popup(hwnd)
         log.info("sets picked: %s", list(sets))
     if mainstats:
-        # 展开最后一帧直接交给点名用，省一次全屏 OCR（两者之间不点击，帧不变）。
+        # 展开最后一帧直接交给点名用，省一次面板 OCR（两者之间不点击，帧不变）。
         lines = _open_mainstat_section(hwnd, width, height)
         _pick_mainstats(hwnd, mainstats, width=width, height=height, lines=lines)
         log.info("mainstats picked: %s", list(mainstats))

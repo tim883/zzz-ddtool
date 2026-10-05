@@ -283,6 +283,33 @@ def save_profile(profile: NavProfile) -> Path:
 # ---------------------------------------------------------------- 布局与锚点
 
 
+def is_empty_warehouse(image) -> bool:
+    """置顶后的驱动盘页：数量为零且全部格位为空才确认空结果。
+
+    不把缺少等级标签或黑屏当作空列表。固定网格仅用于验证空占位，不替代布局测量。
+    """
+    import re
+
+    from zzz_ddtool.equipped import tile_is_empty
+    from zzz_ddtool.layout import GRID_COLS, GRID_ROWS, GRID_ORIGIN, GRID_STEP, scale_point
+    from zzz_ddtool.ocr import read_rect
+    from zzz_ddtool.screen import DRIVE_DISC, is_page
+
+    if not is_page(image, DRIVE_DISC):
+        return False
+    counts = [re.search(r"[\[【]?\s*(\d+)\s*[/／]\s*\d+", line.text)
+              for line in read_rect(image, (60, 105, 420, 175))]
+    if not any(match is not None and int(match.group(1)) == 0 for match in counts):
+        return False
+    return all(
+        tile_is_empty(image, *scale_point(
+            GRID_ORIGIN[0] + col * GRID_STEP[0], GRID_ORIGIN[1] + row * GRID_STEP[1],
+            image.width(), image.height(),
+        )) is True
+        for row in range(GRID_ROWS) for col in range(GRID_COLS)
+    )
+
+
 def measure_layout(image) -> tuple[float, float]:
     """原点图测 (origin_center_y, row_pitch_px)（spec §4.1 第 1-2 条）。
 

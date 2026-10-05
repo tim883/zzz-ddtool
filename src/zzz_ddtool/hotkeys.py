@@ -7,8 +7,9 @@ Runner 在每个安全检查点调用 checkpoint()：
 - 暂停中：阻塞等待，再按 F9 恢复，或按 F10 停止
 - 已停止：抛 RunnerStopped，Runner 捕获后带已有结果优雅退出
 
-检查点粒度是「格子级」：一个盘子正在处理时（如强化链路中途）按 F10，
-会在当前这个盘子处理完后的下一个检查点停下，不会在弹层中间撂挑子。
+检查点包括业务步骤和每次输入动作：导航、标定、筛选、强化途中也会响应。
+已经开始的点击/按键会完成释放；暂停/停止在后续输入前生效。正在执行的 OCR
+和固定等待不会被强行打断，停止后保留当前页面供复核。
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ class HotkeyController:
             for vk, name in ((VK_F9, "F9"), (VK_F10, "F10")):
                 down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
                 with self._lock:
-                    if down and vk not in self._pressed:
+                    if down and vk not in self._pressed and not self.stopped:
                         if vk == VK_F9:
                             self.paused = not self.paused
                             self.log.info("热键 F9：暂停=%s", self.paused)
@@ -70,11 +71,14 @@ class HotkeyController:
         with self._lock:
             if not self.stopped:
                 self.paused = not self.paused
-            return self.paused
+            paused = self.paused
+        self.log.info("控制请求：暂停=%s", paused)
+        return paused
 
     def request_stop(self) -> None:
         with self._lock:
             self.stopped = True
+        self.log.info("控制请求：停止")
 
     def close(self) -> None:
         self._closed.set()

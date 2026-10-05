@@ -20,6 +20,7 @@ from PySide6.QtGui import QImage
 from zzz_ddtool.capture import find_game_hwnd, grab_game_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
+from zzz_ddtool.control import controlled_inputs
 from zzz_ddtool.decide import decide
 from zzz_ddtool.gamefilter import apply_game_filter, reset_game_filter
 from zzz_ddtool.substatfilter import plan_substat_filter
@@ -35,10 +36,12 @@ from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc, next_stage_level
 from zzz_ddtool.nav import NavError, goto_warehouse, reset_to_top
 from zzz_ddtool.navigation import (
+    NavigationError,
     NavProfile,
     calibrate,
     load_profile,
     measure_layout,
+    is_empty_warehouse,
     probe_environment,
     save_profile,
     scroll_rows,
@@ -181,7 +184,7 @@ class Runner:
             "cell": cell,
             "message": message,
             "processed": self._processed,
-            "max_discs": sum(self._job_limit(job) for job in self._jobs()),
+            "max_discs": sum(self._job_limit(job) for job in self._jobs() if job.accepted is not None),
             "job_processed": self._processed - getattr(self, "_job_started_at", 0),
             "job_max_discs": getattr(self, "_job_max_discs", self.preset.max_discs),
         }
@@ -297,6 +300,12 @@ class Runner:
 
     def run(self) -> list[RunResult]:
         """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。"""
+        # 导航、标定、筛选与强化共享此任务的控制器。只在一次完整输入前检查，
+        # 不在 mouse/key down 与 up 之间抛出停止，避免留下按住的键。
+        with controlled_inputs(self._checkpoint):
+            return self._run()
+
+    def _run(self) -> list[RunResult]:
         if not self._valid_max_pages():
             self.outcome = "failed"
             self.end_reason = f"max_pages 非法：{self.preset.max_pages!r}，未发送任何游戏输入"
@@ -319,11 +328,12 @@ class Runner:
 
         overlay_handler = OverlayLogHandler()
         logging.getLogger("zzz_ddtool").addHandler(overlay_handler)
-        total_limit = sum(self._job_limit(job) for job in jobs)
+        total_limit = sum(self._job_limit(job) for job in jobs if job.accepted is not None)
         self.log.info("run start jobs=%d max_discs=%d (F9 暂停 / F10 停止)", len(jobs), total_limit)
         self._set_status("run_start", f"jobs={len(jobs)}")
         self.trace.ok("unknown", "run", f"共 {len(jobs)} 个任务，各任务独立限额，合计最多处理 {total_limit} 个盘")
         run_started = time.monotonic()
+        skipped_jobs = 0
         try:
             for index, job in enumerate(jobs, 1):
                 self._checkpoint()
@@ -333,6 +343,17 @@ class Runner:
                     job.sets,
                     job.mainstats,
                 )
+                if job.accepted is None:
+                    skipped_jobs += 1
+                    self._job_started_at = self._processed
+                    self._job_max_discs = 0
+                    self._state = None
+                    message = f"第 {index} 个任务「{job.title()}」未生成卡片名单，已跳过"
+                    self.log.info(message)
+                    self.trace.ok("unknown", "job_skipped", message)
+                    self._set_status("job_skipped", message)
+                    self.stats.job_end(0.0, 0)
+                    continue
                 job_started = time.monotonic()
                 try:
                     self._run_job(job)
@@ -344,6 +365,8 @@ class Runner:
                     )
             self.outcome = "completed"
             self.end_reason = f"已处理 {self._processed} 个盘"
+            if skipped_jobs:
+                self.end_reason += f"；跳过 {skipped_jobs} 个未生成任务"
         except RunnerStopped:
             self.outcome = "stopped"
             self.end_reason = f"用户停止，已处理 {self._processed} 个盘"
@@ -396,6 +419,9 @@ class Runner:
     # ---------------------------------------------------------------- 主任务
 
     def _run_job(self, job: TaskJob) -> None:
+        if job.accepted is None:
+            self.log.info("任务 %s 未生成卡片名单，跳过", job.job_id)
+            return
         self._job_started_at = self._processed
         self._job_max_discs = self._job_limit(job)
         self.log.info("job start slot=%d sets=%s mains=%s", job.slot, job.sets, job.mainstats)
@@ -423,25 +449,24 @@ class Runner:
         extra_filter = {}
         if substat_filter.names:
             extra_filter = {"substats": substat_filter.names, "substat_counts": substat_filter.counts}
-        filter_started = time.monotonic()
-        apply_game_filter(
-            hwnd,
-            image.width(),
-            image.height(),
-            slots=[job.slot],
-            sets=job.sets,
-            mainstats=job.mainstats,
-            **extra_filter,
-        )
-        self.stats.span("筛选", "设置游戏筛选", time.monotonic() - filter_started)
+        with self.stats.timed("筛选", "设置游戏筛选"):
+            apply_game_filter(
+                hwnd,
+                image.width(),
+                image.height(),
+                slots=[job.slot],
+                sets=job.sets,
+                mainstats=job.mainstats,
+                **extra_filter,
+            )
         self.trace.ok(
             "drive_disc",
             "filter",
             f"{job.slot}号位"
             + (f" 套装 {'、'.join(job.sets)}" if job.sets else "")
-            + (f" 主词条 {'、'.join(job.mainstats)}" if job.mainstats else ""),
+            + (f" 主词条 {'、'.join(job.mainstats)}" if job.mainstats else "")
+            + f"；{substat_filter.summary()}",
         )
-        self.trace.ok("drive_disc", "filter", substat_filter.summary())
         time.sleep(0.3)
 
         accepted_ids = None if job.accepted is None else set(job.accepted)
@@ -459,6 +484,9 @@ class Runner:
 
         with self.stats.timed("导航", "切页置顶+布局复核"):
             profile = self._prepare_navigation(hwnd, state)
+        if profile is None:
+            self._set_status("job_empty", "筛选结果为空，继续下一任务")
+            return
         # 先起第 1 批，再摆起点：跳号启动要按新视口覆盖批次计数（见 _seed_start_index）。
         state.start_first_batch()
         if self.start_index > 0:
@@ -468,6 +496,7 @@ class Runner:
         self._set_status("batch", "首批网格起点")
 
         up_counts: dict[int, int] = {}
+        scan_snapshot = None
 
         while True:
             self._checkpoint()
@@ -480,7 +509,10 @@ class Runner:
                 )
                 break
 
-            if self._restored_scan is not None:
+            if scan_snapshot is not None:
+                cells, problems, skips = scan_snapshot
+                scan_snapshot = None
+            elif self._restored_scan is not None:
                 cells, problems, skips = self._restored_scan
                 self._restored_scan = None
             else:
@@ -544,6 +576,9 @@ class Runner:
                         at_top=True,
                         at_bottom=True,
                     )
+                    # 这里只提交端点状态，游戏画面未变化。复用扫描结果解除末行延期，
+                    # 不再抓图/OCR 一遍；后续点击、前进或恢复仍会重新扫描。
+                    scan_snapshot = (cells, problems, skips)
                     continue
                 before_top = state.viewport_top_row0
                 if not self._advance(hwnd, state, cells, rows=_FORWARD_ROWS):
@@ -624,6 +659,8 @@ class Runner:
                 raise RunnerError("无法读取游戏窗口 DPI，未开始滚动标定")
             try:
                 profile = calibrate(hwnd, env=env)
+            except RunnerStopped:
+                raise
             except Exception as exc:
                 raise RunnerError(f"滚轮标定失败：{exc}，停止任务链") from exc
             if env.persistable:
@@ -636,7 +673,7 @@ class Runner:
             profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y
         )
 
-    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile:
+    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile | None:
         """置顶 → 以本轮实测布局复核 → 再次置顶（spec §5.1）。
 
         滚轮协议已由 `_ensure_profile` 在筛选前备好，这里只复核当次布局并再次置顶，
@@ -644,7 +681,14 @@ class Runner:
         """
         reset_to_top(hwnd)
         image, _method, _hwnd = grab_game_image(hwnd)
-        origin, pitch = measure_layout(image)
+        try:
+            origin, pitch = measure_layout(image)
+        except NavigationError:
+            if not is_empty_warehouse(image):
+                raise
+            self.log.info("筛选结果为空，正常结束当前任务")
+            self.trace.ok("drive_disc", "scan", "筛选结果为空（0 个盘），继续下一任务", image=image)
+            return None
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
         if reason:
             self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)

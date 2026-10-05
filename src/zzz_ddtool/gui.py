@@ -9,10 +9,11 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPalette
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontMetrics, QMouseEvent, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -60,15 +61,17 @@ from zzz_ddtool.gamedata import (
     blocked_substats,
     empty_slot_plan,
     selectable_mainstats,
+    possible_substats,
 )
 from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
+from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_weights, rebase_selection, task_counts
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
-    CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize,
-    enumerate_filtered, enumerate_patterns, first_filter, score_slots, useful_ordered,
+    CHECKPOINTS, EMPTY, JUNK, Pattern,
+    enumerate_filtered, enumerate_patterns, first_filter, useful_ordered,
 )
 
 # 词条下拉的顺序偏好：常用的排前面（双爆最常用）。
@@ -280,6 +283,40 @@ _JOB_SEQ_COLOR = "#0078d7"        # 主题蓝，与按钮同色
 _JOB_SEQ_SELECTED_COLOR = "#005a9e"  # 选中行正文也是蓝的，序号压深一档才分得开
 _JOB_SEP_COLOR = "#9aa5b1"
 _JOB_BODY_COLOR = "#1a1a1a"
+_JOB_COUNTS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+_JOB_COUNTS_STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+_JOB_COUNT_WIDTH = 108
+_JOB_COUNT_FONT_PT = 10
+
+
+def _job_count_rects(rect: QRect) -> tuple[QRect, QRect]:
+    right = rect.right() - 5
+    return tuple(QRect(right - (2 - i) * _JOB_COUNT_WIDTH + 1, rect.top(),
+                       _JOB_COUNT_WIDTH, rect.height()) for i in range(2))
+
+
+class _JobCountHeader(QWidget):
+    def __init__(self, view: QListWidget) -> None:
+        super().__init__()
+        self.view = view
+        self.setFixedHeight(28)
+        self.setToolTip("已选 / 合格：按开始任务时的有效设置统计，汇总 +0～+15 六档及全部分页。\n"
+                        "未生成卡片名单的任务会跳过。统计的是组合数量，不是仓库盘子数量。")
+        view.verticalScrollBar().rangeChanged.connect(lambda *_: self.update())
+
+    def paintEvent(self, event) -> None:  # noqa: ANN001
+        painter = QPainter(self)
+        font = QFont(self.font())
+        font.setPointSize(_JOB_COUNT_FONT_PT)
+        painter.setFont(font)
+        painter.setPen(QColor("#5f6b7a"))
+        offset = self.mapFromGlobal(self.view.viewport().mapToGlobal(QPoint(0, 0))).x()
+        rect = QRect(offset, 0, self.view.viewport().width(), self.height())
+        columns = _job_count_rects(rect)
+        painter.drawText(QRect(offset + 5, 0, max(0, columns[0].left() - offset - 10), self.height()),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), "任务 · 已选/合格")
+        for column, title in zip(columns, ("初始3词", "初始4词")):
+            painter.drawText(column, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), title)
 
 
 def _job_seq_width(fm_seq: QFontMetrics, seq: str, digits: int = _JOB_SEQ_DIGITS) -> int:
@@ -319,7 +356,8 @@ class _JobItemDelegate(QStyledItemDelegate):
         width = max(0, option.rect.width() - 10)
         seq_w = _job_seq_width(fm_seq, seq)
         sep_gap = fm.horizontalAdvance(_JOB_ITEM_SEP) + 10
-        body_w = max(0, width - seq_w - sep_gap)
+        columns = _job_count_rects(option.rect)
+        body_w = max(0, columns[0].left() - 10 - left - seq_w - sep_gap)
 
         painter.save()
         painter.setFont(seq_font)
@@ -343,6 +381,17 @@ class _JobItemDelegate(QStyledItemDelegate):
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             fm.elidedText(body.strip(), Qt.TextElideMode.ElideRight, body_w),
         )
+        count_font = QFont(base)
+        count_font.setPointSize(_JOB_COUNT_FONT_PT)
+        painter.setFont(count_font)
+        counts = index.data(_JOB_COUNTS_ROLE)
+        state = str(index.data(_JOB_COUNTS_STATE_ROLE) or "计算中")
+        for column, origin in zip(columns, ("three", "four")):
+            pair = counts.get(origin) if counts is not None else None
+            label = f"{pair[0]}/{pair[1]}" if pair is not None else state
+            painter.setPen(QColor("#c42b1c" if pair is not None and pair[0] == 0 and pair[1] > 0
+                                 else _JOB_SEQ_COLOR if selected else _JOB_BODY_COLOR))
+            painter.drawText(column, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), label)
         painter.restore()
 
 
@@ -1136,6 +1185,7 @@ def qualifying_pattern_ids(
     mainstats: tuple[str, ...],
     weights: Mapping[str, float],
     stage_require: Mapping[str, Mapping[int, float]] | None = None,
+    catalog: PatternCatalog | None = None,
 ) -> tuple[str, ...]:
     """一个任务「生成组合 + 全选当前可见」等价的可勾选图案全集。
 
@@ -1150,9 +1200,16 @@ def qualifying_pattern_ids(
     effective = {name: value for name, value in weights.items() if name not in blocked}
     if not useful_ordered(effective):
         return ()
+    if catalog is not None:
+        grouped = catalog.get(effective, lambda: False)
+        return tuple(pattern.pattern_id for (origin, level), patterns in grouped.items()
+                     for pattern in patterns
+                     if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
+                     if pattern.score + 1e-9 >= float(((stage_require or {}).get(origin) or {}).get(level, 0)))
     return tuple(
         pattern.pattern_id
         for pattern in enumerate_filtered(effective, stage_require=stage_require)
+        if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
     )
 
 
@@ -1180,6 +1237,12 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._exit_after_close: int | None = None
         self._utility_thread = None
+        self._pattern_catalog = PatternCatalog()
+        self._counts_thread = None
+        self._job_counts: dict[str, tuple[tuple, dict]] = {}
+        self._counts_timer = QTimer(self)
+        self._counts_timer.setSingleShot(True)
+        self._counts_timer.timeout.connect(self._start_task_counts)
         self.sections: dict[tuple[str, int], StageSection] = {}
         self._active_slot = 4
         self._slot_plans: dict[int, dict] = {slot: empty_slot_plan(slot) for slot in SLOTS}
@@ -1214,9 +1277,9 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
-        # 不允许把某一栏拖到 0 藏起来：拖到极限就停在该栏的最小宽（任务链 380 / 配置栏 300）
+        # 任务链给两个统计列留宽；各栏不允许拖到 0。
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([380, 360, 720])
+        splitter.setSizes([540, 360, 720])
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
 
@@ -1604,16 +1667,16 @@ class MainWindow(QMainWindow):
         slot_row.addStretch()
         game.addLayout(slot_row)
 
-        self._main_boxes_by_slot: dict[int, dict[str, QRadioButton]] = {}
-        self.filter_main_boxes: dict[str, QRadioButton] = {}
+        self._main_boxes_by_slot: dict[int, dict[str, QCheckBox]] = {}
+        self.filter_main_boxes: dict[str, QCheckBox] = {}
         self._main_groups: dict[int, QButtonGroup] = {}
-        self._main_any_by_slot: dict[int, QRadioButton] = {}
+        self._main_any_by_slot: dict[int, QCheckBox] = {}
         self.main_host = QStackedWidget()
         self.main_host.setObjectName("mainHost")
         self.main_host.setFixedHeight(_MAINSTAT_PAGE_HEIGHT)
         self._mainstat_pages: dict[int, QWidget] = {}
         for slot, names in _MAINSTAT_PAGES.items():
-            boxes: dict[str, QRadioButton] = {}
+            boxes: dict[str, QCheckBox] = {}
             page = QWidget()
             page.setFixedHeight(_MAINSTAT_PAGE_HEIGHT)
             grid = QGridLayout(page)
@@ -1622,17 +1685,18 @@ class MainWindow(QMainWindow):
             grid.setColumnStretch(0, 1)
             grid.setColumnStretch(1, 1)
             group = QButtonGroup(page)
+            group.setExclusive(False)
             self._main_groups[slot] = group
-            any_main = QRadioButton("不限")
+            any_main = QCheckBox("不限")
             group.addButton(any_main)
             any_main.setChecked(True)
-            any_main.toggled.connect(self._on_filter_changed)
+            any_main.toggled.connect(lambda checked, s=slot: self._on_main_changed(s, None, checked))
             self._main_any_by_slot[slot] = any_main
             grid.addWidget(any_main, 0, 0)
             for idx, name in enumerate(names, start=1):
-                box = QRadioButton(name)
+                box = QCheckBox(name)
                 group.addButton(box)
-                box.toggled.connect(self._on_filter_changed)
+                box.toggled.connect(lambda checked, s=slot, n=name: self._on_main_changed(s, n, checked))
                 boxes[name] = box
                 grid.addWidget(box, idx // _MAINSTAT_COLS, idx % _MAINSTAT_COLS)
             self._mainstat_pages[slot] = page
@@ -1666,9 +1730,9 @@ class MainWindow(QMainWindow):
         # 条目要放「序号 │ 4号 · 套装 · 主词条」。正文可用宽 = 栏宽 − 序号列 − 竖线两侧 − 内边距，
         # 12pt 下扣掉约 85px；实测「4号 · 双套装 · 暴击伤害」要 261px、「…· 能量自动回复」
         # 要 293px，所以要 380 才两行都不收省略号（340 连常见的双套装行都差 6px）。
-        # 上限 420 兜住更长的组合，再长就靠省略号 + 悬停全文。
-        panel.setMinimumWidth(380)
-        panel.setMaximumWidth(420)
+        # 两个统计列固定宽，任务名可省略并悬停查看；允许拉宽看长名称。
+        panel.setMinimumWidth(500)
+        panel.setMaximumWidth(760)
         self.chain_panel = panel
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1706,6 +1770,8 @@ class MainWindow(QMainWindow):
         row.addWidget(down_btn)
         row.addWidget(del_btn)
         inner.addWidget(hint)
+        self.chain_count_header = _JobCountHeader(self.chain_list)
+        inner.addWidget(self.chain_count_header)
         inner.addWidget(self.chain_list, 1)
         inner.addLayout(add_row)
         inner.addLayout(row)
@@ -1724,9 +1790,144 @@ class MainWindow(QMainWindow):
     def _apply_job_item(self, item: QListWidgetItem, index: int, job: TaskJob) -> None:
         """写条目文本（栏窄时会收省略号）。"""
         item.setText(self._job_item_text(index, job))
+        self._queue_job_counts(item, job)
+
+    def _count_job(self, job: TaskJob) -> TaskJob:
+        """Snapshot without parsing a large whitelist on the GUI thread."""
+        if job.job_id != self._editing_job_id or self._loading:
+            return replace(job, weights=dict(job.weights),
+                           stage_require={origin: dict(table) for origin, table in job.stage_require.items()})
+        return TaskJob(
+            job_id=job.job_id, slot=self._active_slot, sets=tuple(self._filter_sets),
+            mainstats=tuple(self._selected_mains()),
+            weights=self.weight_editor.weights(), accepted=self._selection_seed,
+            stage_require={origin.value: {level: float(self.sections[(origin.value, level)].require.value())
+                                          for level in CHECKPOINTS} for origin in Origin},
+        )
+
+    def _set_job_counts(self, item: QListWidgetItem, job: TaskJob, counts: dict | None,
+                        state: str = "计算中") -> None:
+        item.setData(_JOB_COUNTS_ROLE, counts)
+        item.setData(_JOB_COUNTS_STATE_ROLE, state)
+        detail = "\n".join(f"初始{3 if origin == 'three' else 4}词：{pair[0]}/{pair[1]}"
+                           for origin, pair in (counts or {}).items())
+        item.setToolTip(f"{job.title()}\n{detail or state}\n已选/合格，汇总六档及全部分页。")
+        if state == "未生成":
+            item.setToolTip(f"{job.title()}\n未生成：尚未指定卡片名单，开始任务时跳过。\n"
+                            "请点击生成组合，或使用全任务卡片全选建立名单。")
+
+    def _queue_job_counts(self, item: QListWidgetItem, job: TaskJob) -> None:
+        if self._closing:
+            return
+        if job.accepted is None:
+            self._job_counts.pop(job.job_id, None)
+            generating = job.job_id == self._editing_job_id and (
+                self._preview_thread is not None or self._preview_timer.isActive())
+            self._set_job_counts(item, job, None, "计算中" if generating else "未生成")
+            return
+        signature = counts_signature(job)
+        cached = self._job_counts.get(job.job_id)
+        if cached is None or cached[0] != signature:
+            cached = next((result for result in self._job_counts.values() if result[0] == signature), None)
+        if cached is not None and cached[0] == signature:
+            self._job_counts[job.job_id] = cached
+            self._set_job_counts(item, job, cached[1])
+        elif not useful_ordered(effective_weights(job)):
+            counts = {origin.value: (0, 0) for origin in Origin}
+            self._job_counts[job.job_id] = (signature, counts)
+            self._set_job_counts(item, job, counts)
+        else:
+            self._set_job_counts(item, job, None)
+            if self._counts_thread is not None:
+                self._counts_thread.requestInterruption()
+            self._counts_timer.start(180)
+
+    def _refresh_current_counts(self) -> None:
+        if self._loading or self._closing:
+            return
+        job = self._editing_job()
+        if job is None:
+            return
+        job = self._count_job(job)
+        item = next((self.chain_list.item(i) for i in range(self.chain_list.count())
+                     if self.chain_list.item(i).data(Qt.ItemDataRole.UserRole) == job.job_id), None)
+        if item is None:
+            return
+        if job.accepted is None:
+            self._queue_job_counts(item, job)
+        elif not self._preview_dirty:
+            counts = {
+                origin.value: (
+                    sum(len(section.visible_accepted()) for section in self.sections.values() if section.origin is origin),
+                    sum(len(section._visible_indices) for section in self.sections.values() if section.origin is origin),
+                ) for origin in Origin
+            }
+            self._job_counts[job.job_id] = (counts_signature(job), counts)
+            self._set_job_counts(item, job, counts)
+        else:
+            self._queue_job_counts(item, job)
+
+    def _start_task_counts(self) -> None:
+        if self._closing:
+            return
+        if self._counts_thread is not None:
+            self._counts_thread.requestInterruption()
+            return
+        plans = []
+        for saved in self._jobs:
+            job = self._count_job(saved)
+            if job.accepted is None:
+                continue
+            signature = counts_signature(job)
+            cached = self._job_counts.get(job.job_id)
+            if cached is None or cached[0] != signature:
+                plans.append((signature, job))
+        if not plans:
+            return
+        worker = _TaskCountsThread(plans, self._pattern_catalog, self)
+        self._counts_thread = worker
+        worker.result.connect(self._on_task_counts)
+        worker.failed.connect(self._on_task_counts_failed)
+        worker.finished.connect(self._on_task_counts_finished)
+        worker.start()
+
+    def _on_task_counts(self, signature: tuple, job_id: str, counts: dict) -> None:
+        if self._closing:
+            return
+        for index, saved in enumerate(self._jobs):
+            if saved.job_id != job_id:
+                continue
+            job = self._count_job(saved)
+            if job.accepted is None:
+                return
+            if counts_signature(job) != signature:
+                return  # Configuration changed while this result was being calculated.
+            self._job_counts[job_id] = (signature, counts)
+            item = self.chain_list.item(index)
+            if item is not None:
+                self._set_job_counts(item, job, counts)
+            return
+
+    def _on_task_counts_failed(self, signature: tuple, job_id: str, message: str) -> None:
+        for index, saved in enumerate(self._jobs):
+            if saved.job_id == job_id and counts_signature(self._count_job(saved)) == signature:
+                item = self.chain_list.item(index)
+                self._set_job_counts(item, saved, None, "计算失败")
+                item.setToolTip(f"{saved.title()}\n统计失败：{message}；修改配置后重试。")
+
+    def _on_task_counts_finished(self) -> None:
+        worker = self._counts_thread
+        self._counts_thread = None
+        worker.deleteLater()
+        if self._closing:
+            self.close()
+        elif worker.isInterruptionRequested():
+            self._counts_timer.start(1)
 
     def _refresh_chain_list(self, select_id: str | None = None) -> None:
         current_id = select_id or self._editing_job_id
+        ids = {job.job_id for job in self._jobs}
+        self._job_counts = {job_id: result for job_id, result in self._job_counts.items() if job_id in ids}
         # 选中行必须也在屏蔽信号区间内：否则 setCurrentRow 会触发 currentRowChanged
         # → _on_chain_row → _load_job → rebuild_cards，把 242 张卡片整屏重建一遍
         # （实测 ~250ms），而调用方（加入/更新/删除）本身已经不需要重新载入。
@@ -2014,7 +2215,7 @@ class MainWindow(QMainWindow):
         要求各跑一遍（部位不同，屏蔽的副词条也不同，不能共用当前界面那套）。
         会覆盖这些任务现有的勾选，执行前先弹二次确认。
         一次性的：只处理此刻已有的任务；之后新建的任务依旧是空的（accepted
-        为 None，运行时走分数判定），不受这次影响。
+        为 None，运行时跳过），不受这次影响。
         """
         self._commit_editor()
         if not self._jobs:
@@ -2039,7 +2240,7 @@ class MainWindow(QMainWindow):
         ]
         self._start_utility(
             lambda: [
-                (job_id, qualifying_pattern_ids(slot, mains, weights, require))
+                (job_id, qualifying_pattern_ids(slot, mains, weights, require, self._pattern_catalog))
                 for job_id, slot, mains, weights, require in plans
             ],
             self._apply_select_all,
@@ -2088,23 +2289,22 @@ class MainWindow(QMainWindow):
         for slot, boxes in self._main_boxes_by_slot.items():
             group = self._main_groups[slot]
             group.setExclusive(False)
-            choice = next((name for name in boxes if slot == self._active_slot and name in keep), None)
+            choices = set(boxes) & keep if slot == self._active_slot else set()
             for name, box in boxes.items():
                 box.blockSignals(True)
-                box.setChecked(name == choice)
+                box.setChecked(name in choices)
                 box.blockSignals(False)
             any_main = self._main_any_by_slot[slot]
             any_main.blockSignals(True)
-            any_main.setChecked(choice is None)
+            any_main.setChecked(not choices)
             any_main.blockSignals(False)
-            group.setExclusive(True)
         if active_slot is not None:
             self.main_host.setCurrentWidget(self._mainstat_pages[active_slot])
         else:
             self.main_host.setCurrentIndex(self.main_host.count() - 1)
         self.filter_main_boxes = self._main_boxes_by_slot.get(self._active_slot, {})
         if available:
-            self.main_hint.setText(f"{self._active_slot} 号位可选主词条。已选主词条不会出现在右侧副词条里。")
+            self.main_hint.setText(f"{self._active_slot} 号位主词条可多选，共用单价与卡片规则；单选时排除同名副词条。")
         else:
             self.main_hint.setText(
                 f"{self._active_slot} 号位主词条固定是{FIXED_MAINSTATS[self._active_slot]}，不用选。右侧只编这个部位的副词条。"
@@ -2185,6 +2385,21 @@ class MainWindow(QMainWindow):
         # 部位变了，主词条跟着变：清掉不属于新部位的选择，并同步回任务
         job.mainstats = tuple(self._selected_mains())
         self._refresh_chain_list(job.job_id)
+
+    def _on_main_changed(self, slot: int, name: str | None, checked: bool) -> None:
+        if self._loading:
+            return
+        boxes = self._main_boxes_by_slot[slot]
+        if name is None and checked:
+            for box in boxes.values():
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+        any_main = self._main_any_by_slot[slot]
+        any_main.blockSignals(True)
+        any_main.setChecked(not any(box.isChecked() for box in boxes.values()))
+        any_main.blockSignals(False)
+        self._on_filter_changed()
 
     def _on_filter_changed(self) -> None:
         if self._loading:
@@ -2298,6 +2513,9 @@ class MainWindow(QMainWindow):
         """用当前 UI 配置在子线程启动 Runner；运行期间禁用按钮，结束自动恢复。"""
         if self._run_thread is not None or self._utility_thread is not None:
             return
+        if self._preview_thread is not None or self._preview_timer.isActive():
+            self.status.setText("组合正在生成，请等待完成后开始任务。")
+            return
         try:
             preset = self.collect_preset()
         except Exception as exc:  # 配置缺失 / 构建失败
@@ -2307,6 +2525,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法启动", "请先添加并配置任务。")
             return
         for index, job in enumerate(preset.task_chain, start=1):
+            if job.accepted is None:
+                continue
             blocked = blocked_substats(job.slot, job.mainstats)
             if not any(value > 0 and name in SUBSTAT_NAMES and name not in blocked for name, value in job.weights.items()):
                 QMessageBox.warning(self, "无法启动", f"第 {index} 个任务「{job.title()}」没有可用的正权重副词条。")
@@ -2317,6 +2537,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法启动", f"开始前自动保存失败：{exc}")
             return
         self._set_saved_state()
+        if all(job.accepted is None for job in preset.task_chain):
+            self.status.setText("所有任务均未生成，已跳过。请先生成组合。")
+            return
         self.start_btn.setEnabled(False)
         self.start_btn.setText("运行中…")
         self._config_splitter.setEnabled(False)
@@ -2584,7 +2807,7 @@ class MainWindow(QMainWindow):
         ]
         for job in self._jobs:
             job.min_useful_types = 0
-            job.mainstats = tuple(name for name in job.mainstats if name in _MAINSTAT_PAGES.get(job.slot, ()))[:1]
+            job.mainstats = tuple(dict.fromkeys(name for name in job.mainstats if name in _MAINSTAT_PAGES.get(job.slot, ())))
             if job.max_discs is None:
                 job.max_discs = preset.max_discs
         self._editing_job_id = self._jobs[0].job_id if self._jobs else None
@@ -2640,6 +2863,7 @@ class MainWindow(QMainWindow):
         self._mark_unsaved()
         self.trial.set_name_choices(self._blocked_substats())
         self._update_status()
+        self._refresh_current_counts()
 
     def _reset_preview(self) -> None:
         self._invalidate_preview()
@@ -2647,6 +2871,7 @@ class MainWindow(QMainWindow):
             section.set_cards([], lambda _pid: False)
         self.trial.set_name_choices(self._blocked_substats())
         self._update_status()
+        self._refresh_current_counts()
 
     def _invalidate_preview(self) -> None:
         self._preview_generation += 1
@@ -2687,13 +2912,14 @@ class MainWindow(QMainWindow):
     def _start_preview(self, request: tuple) -> None:
         generation, weights, policy = request
         self._preview_policy = policy
-        worker = _PatternThread(generation, weights, self)
+        worker = _PatternThread(generation, weights, self, self._pattern_catalog)
         self._preview_thread = worker
         worker.result.connect(self._on_preview_result)
         worker.failed.connect(self._on_preview_failed)
         worker.finished.connect(self._on_preview_finished)
         self.status.setText("正在后台计算组合…")
         self.refresh_cards_btn.setText("重新生成")
+        self._refresh_current_counts()
         worker.start()
 
     def _on_preview_result(self, generation: int, grouped: dict) -> None:
@@ -2707,6 +2933,10 @@ class MainWindow(QMainWindow):
         if self._closing or not self._preview_install:
             return
         key, patterns = self._preview_install.pop(0)
+        mains = tuple(self._selected_mains())
+        patterns = [pattern for pattern in patterns if possible_substats(
+            self._active_slot, mains, (slot.name for slot in pattern.slots)
+        )]
         section = self.sections[key]
         if section.can_reuse(patterns):
             section.reuse_cards(patterns, self._preview_policy)
@@ -2717,10 +2947,20 @@ class MainWindow(QMainWindow):
             self._preview_timer.start(1)
             return
         self._preview_dirty = False
+        # Explicit generation establishes a whitelist; editing settings alone does not.
+        if self._selection_seed is None:
+            self._selection_seed = tuple(self._accepted_ids())
+            keep = frozenset(self._selection_seed)
+            for section in self.sections.values():
+                previous_block = section.blockSignals(True)
+                section.resync_checks(lambda pid: pid in keep)
+                section.blockSignals(previous_block)
+            self._mark_unsaved()
         for section in self.sections.values():
             section.flow_host.show()
         self.refresh_cards_btn.setText("刷新组合")
         self._update_status()
+        self._refresh_current_counts()
 
     def _on_preview_failed(self, generation: int, message: str) -> None:
         if generation == self._preview_generation and not self._closing:
@@ -2737,39 +2977,17 @@ class MainWindow(QMainWindow):
             request = self._preview_request
             self._preview_request = None
             self._start_preview(request)
+        else:
+            self._refresh_current_counts()
 
     def _rebased_selection(self, filtered: bool = False) -> tuple[str, ...] | None:
-        weights = self._effective_weights()
-        blocked = self._blocked_substats()
-        useful = set(useful_ordered(weights))
-        if self._selection_seed is None:
-            return None
-        if not useful:
-            return ()
-        out = set()
-        for pid in self._selection_seed:
-            try:
-                origin, checkpoint, body = pid.split(":", 2)
-                slots = []
-                for token in body.split("|"):
-                    name, plus, bonus = token.rpartition("+")
-                    if not plus:
-                        name, bonus = token, "0"
-                    slots.append(Slot(name if name in useful or name == EMPTY else JUNK, int(bonus)))
-                canonical = canonicalize(slots, weights)
-                pattern = Pattern(Origin(origin), int(checkpoint), canonical, score_slots(canonical, weights))
-            except ValueError:
-                continue
-            if any(token.split("+", 1)[0] in blocked for token in body.split("|")):
-                continue
-            if filtered:
-                section = self.sections.get((pattern.origin.value, pattern.checkpoint))
-                if section is None or pattern.score + 1e-9 < section.require.value():
-                    continue
-                if not first_filter([pattern]):
-                    continue
-            out.add(pattern.pattern_id)
-        return tuple(sorted(out))
+        job = TaskJob(
+            slot=self._active_slot, mainstats=tuple(self._selected_mains()),
+            weights=self.weight_editor.weights(), accepted=self._selection_seed,
+            stage_require={origin.value: {level: float(self.sections[(origin.value, level)].require.value())
+                                          for level in CHECKPOINTS} for origin in Origin},
+        )
+        return rebase_selection(job, filtered=filtered)
 
     def _card_check_policy(self):
         accepted = self._rebased_selection()
@@ -2786,15 +3004,23 @@ class MainWindow(QMainWindow):
         )
         self._mark_unsaved()
         self._update_status()
+        self._refresh_current_counts()
 
     def _on_require_changed(self) -> None:
         self._mark_unsaved()
         self._update_status()
+        self._refresh_current_counts()
 
     def collect_preset(self) -> Preset:
         # 落盘 / 试判 / 开始任务都走这里，是「离开编辑器」的汇总口：先把当前编辑内容
         # 写回任务节点，再取配置，否则跑的是上一次提交的旧值。
         self._commit_editor()
+        # Apply the same effective selection to inactive tasks too. Batch weight edits
+        # must not leave old IDs executable while the list shows the new configuration.
+        for job in self._jobs:
+            job.accepted = rebase_selection(job)
+        self._refresh_chain_list(self._editing_job_id)
+        self._refresh_current_counts()
         self._slot_plans[self._active_slot] = self._snapshot_slot()
         current = self._slot_plans[self._active_slot]
         return preset_from_dict(
@@ -2981,6 +3207,9 @@ class MainWindow(QMainWindow):
             self.trial.result.setText("至少填一条副词条。")
             return
         preset = self.collect_preset()
+        if preset.accepted is None:
+            self.trial.result.setText("当前任务未生成卡片名单，执行时会跳过；请先生成组合。")
+            return
         result = decide(disc, preset, preset.accepted)
         self.trial.result.setText(
             f"{result.action.value}  ·  {result.reason}\n"
@@ -2995,6 +3224,11 @@ class MainWindow(QMainWindow):
         self._preview_request = None
         self._preview_install = []
         self._preview_timer.stop()
+        self._counts_timer.stop()
+        if self._counts_thread is not None:
+            self._counts_thread.requestInterruption()
+            event.ignore()
+            return
         if self._preview_thread is not None:
             self._preview_thread.requestInterruption()
             event.ignore()
@@ -3056,10 +3290,12 @@ class _PatternThread(QThread):
     result = Signal(int, object)
     failed = Signal(int, str)
 
-    def __init__(self, generation: int, weights: dict[str, float], parent: QWidget) -> None:
+    def __init__(self, generation: int, weights: dict[str, float], parent: QWidget,
+                 catalog: PatternCatalog | None = None) -> None:
         super().__init__(parent)
         self.generation = generation
         self.weights = dict(weights)
+        self.catalog = catalog or PatternCatalog()
 
     def run(self) -> None:
         from time import monotonic, sleep
@@ -3077,20 +3313,56 @@ class _PatternThread(QThread):
             return self.isInterruptionRequested()
 
         try:
-            grouped = {}
-            for origin in Origin:
-                for checkpoint in CHECKPOINTS:
-                    if self.isInterruptionRequested():
-                        return
-                    patterns = enumerate_patterns(
-                        self.weights, origin=origin, checkpoint=checkpoint,
-                        cancelled=cancelled,
-                    )
-                    grouped[(origin.value, checkpoint)] = first_filter(patterns)
-            if not self.isInterruptionRequested():
-                self.result.emit(self.generation, grouped)
+            grouped = self.catalog.get(self.weights, cancelled, enumerate_patterns)
+            if grouped is not None and not self.isInterruptionRequested():
+                self.result.emit(self.generation, {key: list(cards) for key, cards in grouped.items()})
         except Exception as exc:
             self.failed.emit(self.generation, str(exc))
+
+
+class _TaskCountsThread(QThread):
+    result = Signal(object, str, dict)
+    failed = Signal(object, str, str)
+
+    def __init__(self, plans: list, catalog: PatternCatalog, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.plans = plans
+        self.catalog = catalog
+
+    def run(self) -> None:
+        from time import monotonic, sleep
+
+        next_yield = monotonic() + 0.01
+
+        def cancelled() -> bool:
+            nonlocal next_yield
+            if self.isInterruptionRequested():
+                return True
+            if monotonic() >= next_yield:
+                sleep(0.001)
+                next_yield = monotonic() + 0.01
+            return self.isInterruptionRequested()
+
+        memo = {}
+        for signature, job in self.plans:
+            if cancelled():
+                return
+            try:
+                if signature in memo:
+                    self.result.emit(signature, job.job_id, memo[signature])
+                    continue
+                grouped = self.catalog.get(effective_weights(job), cancelled)
+                if grouped is None:
+                    return
+                counts = task_counts(job, grouped, cancelled)
+                if counts is None or cancelled():
+                    return
+                memo[signature] = counts
+                self.result.emit(signature, job.job_id, counts)
+            except InterruptedError:
+                return
+            except Exception as exc:
+                self.failed.emit(signature, job.job_id, str(exc))
 
 
 class _RunThread(QThread):

@@ -96,7 +96,7 @@ def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     window.weight_editor.set_weights({"暴击率": 1.0})
     preset = window.collect_preset()
     assert preset.weights == {"暴击率": 1.0}
-    assert preset.accepted is None  # Default selection does not need a generated whitelist.
+    assert preset.accepted is None  # Ungenerated tasks stay invalid until a list is established.
     assert decide_sample(preset) in {Action.UPGRADE, Action.MARK_DISCARD, Action.SKIP, Action.STOP}
     window.close()
 
@@ -311,8 +311,8 @@ def test_job_label_is_derived_from_slot_sets_mainstats(qapp: QApplication, tmp_p
 
     # 序号和正文之间那道竖线要真的分开画，且栏窄时的完整内容挂在悬停提示上
     assert isinstance(window.chain_list.itemDelegate(), _JobItemDelegate)
-    # 不做「悬停显示详情」：条目只有文本，没有 tooltip
-    assert window.chain_list.item(0).toolTip() == ""
+    assert "4号 · 折枝剑歌 · 暴击伤害" in window.chain_list.item(0).toolTip()
+    assert "未生成" in window.chain_list.item(0).toolTip()
     assert window.chain_list.textElideMode() == Qt.TextElideMode.ElideRight
 
     # 改部位 → 标签跟着变
@@ -344,11 +344,12 @@ def test_chain_panel_is_wide_enough_for_label(qapp: QApplication, tmp_path) -> N
     """
     from PySide6.QtGui import QFont, QFontMetrics
 
-    from zzz_ddtool.gui import _JOB_ITEM_SEP, _job_seq_width
+    from zzz_ddtool.gui import _JOB_ITEM_SEP, _JOB_COUNT_WIDTH, _job_seq_width
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1400, 900)
     window.show()
+    window._config_splitter.setSizes([680, 300, 400])
     qapp.processEvents()
     window._add_job()
     job = window._jobs[0]
@@ -372,6 +373,7 @@ def test_chain_panel_is_wide_enough_for_label(qapp: QApplication, tmp_path) -> N
     room = window.chain_list.viewport().width() - 10  # 委托左右各留 5px
     room -= _job_seq_width(fm_seq, "1")
     room -= fm.horizontalAdvance(_JOB_ITEM_SEP) + 10
+    room -= 2 * _JOB_COUNT_WIDTH + 10
 
     # 正文（去掉「序号 │ 」前缀）必须放得下
     body = label.partition(_JOB_ITEM_SEP)[2].strip()
@@ -659,6 +661,7 @@ def test_task_buttons_and_close_share_controller(qapp, tmp_path, monkeypatch):
     window._add_job()
     window.weight_editor.set_weights({"暴击率": 1})
     window.show()
+    refresh_cards(window, qapp)
     window.start_btn.click()
     assert entered.wait(3)
     window._on_start_clicked()  # 防重复启动
@@ -1289,6 +1292,8 @@ def test_refresh_requests_coalesce_and_close_waits_for_worker(qapp, tmp_path, mo
         assert max(p.score for s in window.sections.values() for p in s.patterns) == 18
         entered.clear()
         release.clear()
+        # Same weights now reuse the catalog; change weights to exercise a fresh worker.
+        window.weight_editor._rows[0][1].setValue(4)
         window.rebuild_cards()
         assert entered.wait(1)
         window.close()
@@ -1381,7 +1386,7 @@ def test_mainstat_has_priority_over_weights_everywhere(qapp, tmp_path, slot, mai
 
 
 @pytest.mark.parametrize("slot", [4, 5, 6])
-def test_mainstats_are_exclusive_and_prices_survive_switches(qapp, tmp_path, slot):
+def test_mainstats_allow_multiple_and_prices_survive_switches(qapp, tmp_path, slot):
     from zzz_ddtool.config import load_preset
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
@@ -1391,11 +1396,12 @@ def test_mainstats_are_exclusive_and_prices_survive_switches(qapp, tmp_path, slo
     window.weight_editor.set_weights(prices)
     window.filter_main_boxes["生命值%"].click()
     window.filter_main_boxes["攻击力%"].click()
-    assert window._selected_mains() == ["攻击力%"]
+    assert set(window._selected_mains()) == {"生命值%", "攻击力%"}
+    assert window._blocked_substats() == set()
     assert window.weight_editor.weights() == prices
     window._add_job()
     window.chain_list.setCurrentRow(0)
-    assert window._selected_mains() == ["攻击力%"]
+    assert set(window._selected_mains()) == {"生命值%", "攻击力%"}
     assert window.weight_editor.weights() == prices
     window._main_any_by_slot[slot].click()
     assert window._selected_mains() == []
@@ -1406,7 +1412,7 @@ def test_mainstats_are_exclusive_and_prices_survive_switches(qapp, tmp_path, slo
     window.close()
 
 
-def test_loading_legacy_multi_mainstats_normalizes_unvisited_tasks(qapp, tmp_path):
+def test_loading_multi_mainstats_preserves_unvisited_tasks(qapp, tmp_path):
     from zzz_ddtool.config import preset_from_dict
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
@@ -1414,8 +1420,42 @@ def test_loading_legacy_multi_mainstats_normalizes_unvisited_tasks(qapp, tmp_pat
         {"slot": 4, "mainstats": ["暴击伤害", "暴击率"]},
         {"slot": 5, "mainstats": ["攻击力%", "生命值%"]},
     ]}))
-    assert [job.mainstats for job in window.collect_preset().task_chain] == [("暴击伤害",), ("攻击力%",)]
+    preset = window.collect_preset()
+    assert [set(job.mainstats) for job in preset.task_chain] == [{"暴击伤害", "暴击率"}, {"攻击力%", "生命值%"}]
+    window._path = tmp_path / "multi.yaml"
+    window.save_current()
+    from zzz_ddtool.config import load_preset
+    assert [set(job.mainstats) for job in load_preset(window._path).task_chain] == [
+        {"暴击伤害", "暴击率"}, {"攻击力%", "生命值%"},
+    ]
     window.close()
+
+
+def test_multi_mainstat_preview_matches_saved_whitelist(qapp, tmp_path):
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    window = MainWindow(config_path=tmp_path / "multi-preview.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"攻击力%": 2, "暴击率": 3, "暴击伤害": 1})
+        window.filter_main_boxes["攻击力%"].click()
+        window.filter_main_boxes["暴击率"].click()
+        refresh_cards(window, qapp)
+        for section in window.sections.values():
+            for pattern in section.patterns:
+                names = {slot.name for slot in pattern.slots}
+                assert not {"攻击力%", "暴击率"} <= names
+        job = window.collect_preset().task_chain[0]
+        expected = qualifying_pattern_ids(job.slot, job.mainstats, job.weights, job.stage_require)
+        assert set(job.accepted) == set(expected)
+        assert any("攻击力%" in pid for pid in job.accepted)
+        assert any("暴击率" in pid for pid in job.accepted)
+        window.filter_main_boxes["攻击力%"].click()
+        assert window._blocked_substats() == {"暴击率"}
+        window.filter_main_boxes["暴击率"].click()
+        assert window._main_any_by_slot[4].isChecked()
+    finally:
+        window.close()
 
 
 def test_apply_buttons_disabled_without_tasks(qapp, tmp_path):
@@ -1514,7 +1554,7 @@ def test_game_filter_is_inline_and_slots_123_have_no_mainstat_choice(qapp, tmp_p
     qapp.processEvents()
     assert "穿透率" in window.filter_main_boxes
     assert "暴击伤害" not in window.filter_main_boxes
-    assert "可选主词条" in window.main_hint.text()
+    assert "主词条可多选" in window.main_hint.text()
     window.close()
 
 
@@ -1529,6 +1569,7 @@ def test_start_rejects_tasks_without_effective_prices(qapp, tmp_path, monkeypatc
     window._add_job()
     window._on_slot_clicked(1)
     window.weight_editor.set_weights({"生命值": 2})
+    window._selection_seed = ()  # An explicitly generated list still needs usable weights.
     window._on_start_clicked()
     assert "正权重" in errors[-1]
     assert window._run_thread is None
@@ -1649,6 +1690,303 @@ def test_gui_preserves_global_label_policy_before_advanced_settings(qapp, tmp_pa
     assert not preset.labels.discard
     assert not preset.labels.save
     window.close()
+
+
+def wait_task_counts(window, qapp):
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE, _JOB_COUNTS_STATE_ROLE
+
+    wait_until(qapp, lambda: window._counts_thread is None and not window._counts_timer.isActive()
+               and all(window.chain_list.item(i).data(_JOB_COUNTS_ROLE) is not None
+                       or window.chain_list.item(i).data(_JOB_COUNTS_STATE_ROLE) == "未生成"
+                       for i in range(window.chain_list.count())))
+
+
+def close_count_window(window, qapp):
+    window.close()
+    wait_until(qapp, lambda: window._counts_thread is None and window._preview_thread is None)
+
+
+def test_task_counts_include_unopened_tasks_without_generating_widgets(qapp, tmp_path):
+    from zzz_ddtool.config import preset_from_dict
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+    from zzz_ddtool.patterns import enumerate_filtered
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._apply_preset(preset_from_dict({"task_chain": [
+        {"slot": 4, "weights": {"暴击率": 1}},
+        {"slot": 5, "weights": {"暴击率": 1, "暴击伤害": 0.5},
+         "stage_require": {"three": {0: 1.5}}, "accepted": []},
+    ]}))
+    try:
+        wait_task_counts(window, qapp)
+        assert not any(section.patterns for section in window.sections.values())
+        assert window._preview_dirty
+        for i, job in enumerate(window._jobs):
+            if job.accepted is None:
+                assert window.chain_list.item(i).data(_JOB_COUNTS_ROLE) is None
+                assert "未生成" in window.chain_list.item(i).toolTip()
+                continue
+            patterns = enumerate_filtered(job.weights, stage_require=job.stage_require)
+            for origin in ("three", "four"):
+                total = sum(pattern.origin.value == origin for pattern in patterns)
+                pair = window.chain_list.item(i).data(_JOB_COUNTS_ROLE)[origin]
+                assert tuple(pair) == (0, total)
+        assert window._jobs[0].accepted is None
+        assert window._jobs[1].accepted == ()
+        assert not window._path.exists()
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_task_count_clicks_and_threshold_changes_reuse_all_pages(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import gui, taskcards
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1, "攻击力%": 0.5})
+        refresh_cards(window, qapp)
+        wait_task_counts(window, qapp)
+        window._copy_job()
+        wait_task_counts(window, qapp)
+        window.chain_list.setCurrentRow(0)
+        refresh_cards(window, qapp)
+        wait_task_counts(window, qapp)
+        unchanged = window.chain_list.item(1).data(_JOB_COUNTS_ROLE)
+
+        def unexpected(*args, **kwargs):
+            raise AssertionError("Card clicks, thresholds and cached previews must not enumerate again")
+
+        monkeypatch.setattr(gui, "enumerate_patterns", unexpected)
+        monkeypatch.setattr(taskcards, "enumerate_patterns", unexpected)
+        section = window.sections[("four", 15)]
+        assert len(section._visible_indices) > section.PAGE_SIZE
+        old = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)["four"]
+        section.cards[0].checkbox.click()
+        changed = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)["four"]
+        assert tuple(changed) == (old[0] - 1, old[1])
+        section._change_page(1)
+        assert window.chain_list.item(0).data(_JOB_COUNTS_ROLE)["four"] == changed
+        assert window.chain_list.item(1).data(_JOB_COUNTS_ROLE) == unchanged
+        section.require.setValue(5)
+        for origin in ("three", "four"):
+            sections = [s for s in window.sections.values() if s.origin.value == origin]
+            pair = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)[origin]
+            assert tuple(pair) == (sum(len(s.visible_accepted()) for s in sections),
+                                   sum(len(s._visible_indices) for s in sections))
+        window.rebuild_cards()
+        wait_until(qapp, lambda: not window._preview_dirty)
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_unsaved_counts_start_yaml_and_execution_share_the_same_snapshot(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import QObject, Signal
+    from zzz_ddtool import gui, hotkeys
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+    from zzz_ddtool.taskcards import effective_weights, task_counts
+
+    executed = []
+
+    class FakeRun(QObject):
+        status_changed = Signal(dict)
+        finished = Signal()
+
+        def __init__(self, preset, controller):
+            super().__init__()
+            self.preset = preset
+
+        def start(self):
+            executed.append(self.preset)
+
+    class FakeHotkeys:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gui, "_RunThread", FakeRun)
+    monkeypatch.setattr(hotkeys, "HotkeyController", FakeHotkeys)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 0.5})
+        window._schedule_rebuild()
+        refresh_cards(window, qapp)
+        window.save_current()
+        old_yaml = window._path.read_bytes()
+        wait_task_counts(window, qapp)
+        before = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)
+        window.sections[("four", 0)].require.setValue(1.5)
+        wait_task_counts(window, qapp)
+        after = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)
+        assert after != before
+        assert window._path.read_bytes() == old_yaml
+        assert window.save_label.objectName() == "saveStateIdle"
+        window._on_start_clicked()
+        assert len(executed) == 1
+        saved = load_preset(window._path)
+        assert saved.task_chain == executed[0].task_chain
+        wait_task_counts(window, qapp)
+        for i, job in enumerate(saved.task_chain):
+            grouped = window._pattern_catalog.peek(effective_weights(job))
+            counts = task_counts(job, grouped)
+            assert window.chain_list.item(i).data(_JOB_COUNTS_ROLE) == counts
+        assert saved.task_chain[0].accepted is not None
+        window._on_run_finished()
+    finally:
+        window._run_thread = None
+        close_count_window(window, qapp)
+
+
+def test_stale_task_counts_cannot_replace_updated_or_removed_tasks(qapp, tmp_path):
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+    from zzz_ddtool.taskcards import counts_signature
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1})
+        window._schedule_rebuild()
+        refresh_cards(window, qapp)
+        wait_task_counts(window, qapp)
+        saved = window._jobs[0]
+        old_signature = counts_signature(window._count_job(saved))
+        window.weight_editor.set_weights({"暴击率": 2})
+        window._schedule_rebuild()
+        assert window.chain_list.item(0).data(_JOB_COUNTS_ROLE) is None
+        bogus = {"three": (999, 999), "four": (999, 999)}
+        window._on_task_counts(old_signature, saved.job_id, bogus)
+        assert window.chain_list.item(0).data(_JOB_COUNTS_ROLE) is None
+        window._remove_job()
+        window._on_task_counts(old_signature, saved.job_id, bogus)
+        assert window.chain_list.count() == 0
+        assert saved.job_id not in window._job_counts
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_inactive_task_after_batch_weights_matches_saved_execution_selection(qapp, tmp_path):
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.taskcards import effective_weights, task_counts
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1})
+        refresh_cards(window, qapp)
+        window._check_visible(True)
+        window._copy_job()
+        window.weight_editor.set_weights({"暴击率": 0.5})
+        window._schedule_rebuild()
+        window._apply_weights_to_all()
+        wait_task_counts(window, qapp)
+        before = [window.chain_list.item(i).data(_JOB_COUNTS_ROLE) for i in range(2)]
+        window.save_current()
+        wait_task_counts(window, qapp)
+        for i, job in enumerate(load_preset(window._path).task_chain):
+            expected = task_counts(job, window._pattern_catalog.peek(effective_weights(job)))
+            assert window.chain_list.item(i).data(_JOB_COUNTS_ROLE) == expected == before[i]
+            assert all("暴击伤害" not in pid for pid in job.accepted)
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_ungenerated_task_stays_invalid_after_edits_and_save(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import gui, taskcards
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE, _JOB_COUNTS_STATE_ROLE
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("An ungenerated task must not enumerate cards or start execution")
+
+    monkeypatch.setattr(gui, "enumerate_patterns", unexpected)
+    monkeypatch.setattr(taskcards, "enumerate_patterns", unexpected)
+    monkeypatch.setattr(gui, "_RunThread", unexpected)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 0.5})
+        window._schedule_rebuild()
+        window.sections[("three", 0)].require.setValue(1.5)
+        wait_task_counts(window, qapp)
+        item = window.chain_list.item(0)
+        assert item.data(_JOB_COUNTS_STATE_ROLE) == "未生成"
+        assert item.data(_JOB_COUNTS_ROLE) is None
+        assert window._pattern_catalog.peek(window._effective_weights()) is None
+        window.save_current()
+        assert load_preset(window._path).task_chain[0].accepted is None
+        window._on_start_clicked()
+        assert window._run_thread is None
+        assert "未生成" in window.status.text() and "跳过" in window.status.text()
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_first_generation_establishes_whitelist_and_lower_threshold_does_not_add_cards(qapp, tmp_path):
+    from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+    from zzz_ddtool.taskcards import task_counts
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1})
+        window._schedule_rebuild()
+        section = window.sections[("four", 0)]
+        section.require.setValue(2)
+        assert window.collect_preset().task_chain[0].accepted is None
+        refresh_cards(window, qapp)
+        first = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)["four"]
+        accepted = window.collect_preset().task_chain[0].accepted
+        assert accepted is not None and len(accepted) > 0
+        section.require.setValue(0)
+        second = window.chain_list.item(0).data(_JOB_COUNTS_ROLE)["four"]
+        assert second[0] == first[0]
+        assert second[1] > first[1]
+        job = window.collect_preset().task_chain[0]
+        assert job.accepted == accepted
+        assert window.chain_list.item(0).data(_JOB_COUNTS_ROLE) == task_counts(
+            job, window._pattern_catalog.peek(window._effective_weights()))
+        window.tabs.setCurrentIndex(2)  # 全部词数和档位都取消。
+        window._check_visible(False)
+        assert all(pair[0] == 0 for pair in window.chain_list.item(0).data(_JOB_COUNTS_ROLE).values())
+        assert window.collect_preset().task_chain[0].accepted == ()
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_generation_in_progress_keeps_task_invalid_and_prevents_start(qapp, tmp_path, monkeypatch):
+    import threading
+    from zzz_ddtool import gui
+    from zzz_ddtool.gui import _JOB_COUNTS_STATE_ROLE
+
+    entered, release = threading.Event(), threading.Event()
+    original = gui.enumerate_patterns
+
+    def slow(weights, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(weights, **kwargs)
+
+    monkeypatch.setattr(gui, "enumerate_patterns", slow)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1})
+        window.rebuild_cards()
+        assert entered.wait(1)
+        assert window.chain_list.item(0).data(_JOB_COUNTS_STATE_ROLE) == "计算中"
+        assert window.collect_preset().task_chain[0].accepted is None
+        window._on_start_clicked()
+        assert window._run_thread is None
+        assert "等待" in window.status.text()
+        release.set()
+        wait_until(qapp, lambda: not window._preview_dirty)
+        assert window.collect_preset().task_chain[0].accepted is not None
+    finally:
+        release.set()
+        close_count_window(window, qapp)
 
 
 def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_path) -> None:

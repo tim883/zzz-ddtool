@@ -18,6 +18,9 @@ from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Action, Disc, Substat
+from zzz_ddtool.patterns import enumerate_filtered
+from zzz_ddtool.taskcards import effective_weights
+from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.navigation import Environment, NavProfile, ScrollSend
 from zzz_ddtool.runner import Runner, RunnerError
 from zzz_ddtool.traversal import (
@@ -31,6 +34,19 @@ from zzz_ddtool.traversal import (
 
 VIEWPORT_ROWS = 4
 GRID_COLS = 9
+
+
+def generated_job(**kwargs):
+    """Give execution regressions a real explicit whitelist, as the GUI now does."""
+    job = TaskJob(**kwargs)
+    return replace(job, accepted=tuple(p.pattern_id for p in enumerate_filtered(
+        effective_weights(job), stage_require=job.stage_require)))
+
+
+def generated_preset(**kwargs):
+    preset = Preset(**kwargs)
+    return replace(preset, accepted=tuple(p.pattern_id for p in enumerate_filtered(
+        preset.effective_weights(), stage_require=preset.stage_require)))
 
 
 def make_cell(global_row0, col, screen_row0, level=0):
@@ -213,6 +229,47 @@ def wire_grid(runner, monkeypatch, grid: FakeGrid):
 
 
 # ---------------------------------------------------------------- 遍历不漏不重复
+
+@pytest.mark.parametrize("phase", ["navigation", "calibration", "filter"])
+def test_stop_during_preparation_blocks_next_input(offline_runner, monkeypatch, phase):
+    from zzz_ddtool import hotkeys, wininput
+
+    monkeypatch.setattr(hotkeys.user32, "GetAsyncKeyState", lambda vk: 0)
+    windows = Mock()
+    monkeypatch.setattr(wininput, "user32", windows)
+    monkeypatch.setattr(wininput, "kernel32", Mock())
+    ctrl = HotkeyController()
+    runner = Runner(generated_preset(max_discs=1), controller=ctrl)
+    monkeypatch.setattr(runner, "_bind_instance", lambda: 1)
+    monkeypatch.setattr(runner, "_ensure_profile", Mock())
+
+    def interrupted(*args, **kwargs):
+        ctrl.request_stop()
+        wininput.click_client(1, 100, 100)
+
+    if phase == "navigation":
+        monkeypatch.setattr(runner_module, "goto_warehouse", interrupted)
+    elif phase == "calibration":
+        monkeypatch.setattr(runner, "_ensure_profile", interrupted)
+    else:
+        monkeypatch.setattr(runner_module, "apply_game_filter", interrupted)
+    try:
+        runner.run()
+        assert runner.outcome == "stopped"
+        assert runner.processed_disc_count == 0
+        assert not windows.mock_calls
+        offline_runner["click_client"].assert_not_called()
+    finally:
+        ctrl.close()
+
+
+def test_calibration_preserves_user_stop(offline_runner, monkeypatch):
+    runner = Runner(Preset(), hotkeys=False)
+    monkeypatch.setattr(runner_module, "load_profile", lambda env: None)
+    monkeypatch.setattr(runner_module, "calibrate", Mock(side_effect=RunnerStopped("user stop")))
+    with pytest.raises(RunnerStopped):
+        runner._ensure_profile(1)
+
 
 
 @pytest.mark.parametrize("filtered_rows", [(), (0, 1, 2), (3, 4)])
@@ -485,8 +542,8 @@ def test_restore_without_protocol_fails(offline_runner, monkeypatch):
 def test_restore_failure_stops_entire_chain(offline_runner, monkeypatch):
     """首批正常、恢复校验失败：failed 且不进入下一个 TaskJob。"""
     jobs = (
-        TaskJob(slot=4, weights={"暴击率": 1}, accepted=None),
-        TaskJob(slot=5, weights={"暴击率": 1}, accepted=None),
+        generated_job(slot=4, weights={"暴击率": 1}, accepted=None),
+        generated_job(slot=5, weights={"暴击率": 1}, accepted=None),
     )
     runner = Runner(Preset(task_chain=jobs, max_discs=5), hotkeys=False)
     calls = {"n": 0}
@@ -558,7 +615,7 @@ def test_upgrade_saves_resume_point_before_entering_page(offline_runner, monkeyp
 
 def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkeypatch):
     """第 N 件强化后达 max_discs：直接结束，不为恢复原位置再切页/滚动。"""
-    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner = Runner(generated_preset(max_discs=1, accepted=None), hotkeys=False)
     monkeypatch.setattr(
         runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
     )
@@ -580,7 +637,7 @@ def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatc
     空格），锚点落在空格子上就选不中，标定必失败。标定与列表内容无关，应满屏时先做。
     """
     order = []
-    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner = Runner(generated_preset(max_discs=1, accepted=None), hotkeys=False)
     monkeypatch.setattr(Runner, "_ensure_profile", lambda self, hwnd: order.append("profile"))
     monkeypatch.setattr(Runner, "_prepare_navigation", lambda self, hwnd, state: fake_profile())
     offline_runner["apply_game_filter"].side_effect = lambda *a, **kw: order.append("filter")
@@ -703,7 +760,7 @@ def sample_disc(level=0):
     )
 
 
-@pytest.mark.parametrize("accepted, expected", [(None, Action.UPGRADE), ((), Action.MARK_DISCARD)])
+@pytest.mark.parametrize("accepted, expected", [(None, None), ((), Action.MARK_DISCARD)])
 def test_run_preserves_empty_whitelist(offline_runner, monkeypatch, accepted, expected):
     job = TaskJob(slot=4, weights={"暴击率": 1.0}, accepted=accepted)
     runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
@@ -717,12 +774,46 @@ def test_run_preserves_empty_whitelist(offline_runner, monkeypatch, accepted, ex
 
     monkeypatch.setattr(runner, "_upgrade_loop", upgrade_loop)
     runner.run()
-    assert actions == [expected]
+    assert actions == ([] if expected is None else [expected])
+    if accepted is None:
+        assert runner.processed_disc_count == 0
+        assert "未生成" in runner.end_reason
+        for mock in offline_runner.values():
+            mock.assert_not_called()
+
+
+def test_ungenerated_tasks_are_skipped_and_valid_tasks_keep_order(offline_runner, monkeypatch):
+    jobs = (
+        TaskJob(slot=1, accepted=None, max_discs=99),
+        TaskJob(slot=4, accepted=(), max_discs=2),
+        TaskJob(slot=2, accepted=None, max_discs=99),
+        generated_job(slot=5, weights={"暴击率": 1}, max_discs=3),
+    )
+    runner = Runner(Preset(task_chain=jobs), hotkeys=False)
+    run_job = Mock()
+    monkeypatch.setattr(runner, "_run_job", run_job)
+    runner.run()
+    assert [call.args[0].job_id for call in run_job.call_args_list] == [jobs[1].job_id, jobs[3].job_id]
+    assert runner.outcome == "completed"
+    assert "跳过 2 个未生成任务" in runner.end_reason
+    assert [call.args[0] for call in runner._set_status.call_args_list].count('job_skipped') == 2
+    assert sum(runner._job_limit(job) for job in runner._jobs() if job.accepted is not None) == 5
+    assert runner.stats.jobs[0].processed == runner.stats.jobs[2].processed == 0
+
+
+def test_direct_ungenerated_job_never_binds_or_sends_game_input(offline_runner, monkeypatch):
+    runner = Runner(Preset(), hotkeys=False)
+    bind = Mock(side_effect=AssertionError("An ungenerated task must not bind the game"))
+    monkeypatch.setattr(runner, "_bind_instance", bind)
+    runner._run_job(TaskJob(slot=4, weights={"暴击率": 1}))
+    bind.assert_not_called()
+    for mock in offline_runner.values():
+        mock.assert_not_called()
 
 
 @pytest.mark.parametrize("page", ["detail", "upgrade"])
 def test_uncertain_origin_stops_entire_chain(offline_runner, monkeypatch, page):
-    jobs = (TaskJob(slot=4, weights={"暴击率": 1.0}), TaskJob(slot=5, weights={"暴击率": 1.0}))
+    jobs = (generated_job(slot=4, weights={"暴击率": 1.0}), generated_job(slot=5, weights={"暴击率": 1.0}))
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     uncertain = sample_disc(level=6)  # +6 却无强化次数，三/四词来源均不成立。
     monkeypatch.setattr(runner, "_parse_disc", lambda image: uncertain if page == "detail" else sample_disc())
@@ -803,7 +894,7 @@ def button_lines(runner, monkeypatch, missing=None):
 
 
 def test_run_calls_real_upgrade_buttons_then_rejudges(offline_runner, monkeypatch):
-    job = TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}})
+    job = generated_job(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}})
     runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
     initial = sample_disc()
     upgraded = Disc(3, (Substat("暴击率", 2),) + initial.substats[1:])
@@ -834,7 +925,7 @@ def test_upgrade_page_falls_back_to_detail_layout_when_maxed(offline_runner, mon
     真机第 5 轮实测：12→15 满级确认后 UPGRADE_LEVEL 区域无文字、DISC_LEVEL 读到
     「等级15」，原实现直接报「未识别出盘面」把整条任务链打断。
     """
-    job = TaskJob(
+    job = generated_job(
         slot=4,
         weights={"暴击率": 1},
         stage_require={"four": {0: 0, 3: 0, 6: 0, 9: 0, 12: 0}},
@@ -863,7 +954,7 @@ def test_upgrade_page_falls_back_to_detail_layout_when_maxed(offline_runner, mon
 
 def test_upgrade_page_fails_when_both_layouts_unreadable(offline_runner, monkeypatch):
     """强化页与详情页两套坐标都读不出时，仍按原语义报错停止任务链。"""
-    job = TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0}})
+    job = generated_job(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0}})
     runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
@@ -887,7 +978,7 @@ def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch,
 
 
 def test_missing_upgrade_button_stops_later_jobs(offline_runner, monkeypatch):
-    jobs = (TaskJob(slot=4, weights={"暴击率": 1}), TaskJob(slot=5, weights={"暴击率": 1}))
+    jobs = (generated_job(slot=4, weights={"暴击率": 1}), generated_job(slot=5, weights={"暴击率": 1}))
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
@@ -913,8 +1004,8 @@ def test_return_from_warehouse_does_not_press_escape(offline_runner, monkeypatch
 
 def test_auto_substat_filter_is_applied_for_each_task(offline_runner, monkeypatch):
     jobs = (
-        TaskJob(slot=4, weights={"暴击率": 1, "暴击伤害": 1}, stage_require={"three": {0: 2}, "four": {0: 2}}),
-        TaskJob(slot=5, weights={"穿透值": 1}, stage_require={"three": {0: 1}, "four": {0: 1}}),
+        generated_job(slot=4, weights={"暴击率": 1, "暴击伤害": 1}, stage_require={"three": {0: 2}, "four": {0: 2}}),
+        generated_job(slot=5, weights={"穿透值": 1}, stage_require={"three": {0: 1}, "four": {0: 1}}),
     )
     runner = Runner(Preset(task_chain=jobs, max_discs=1), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
@@ -1007,8 +1098,8 @@ def test_unrecognized_return_retries_without_escape(offline_runner, monkeypatch)
 @pytest.mark.parametrize("level,rolls", [(3, 2), (15, 6)])
 def test_return_failure_fails_entire_chain(offline_runner, monkeypatch, level, rolls):
     jobs = (
-        TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {3: 999}}),
-        TaskJob(slot=5, weights={"暴击率": 1}),
+        generated_job(slot=4, weights={"暴击率": 1}, stage_require={"four": {3: 999}}),
+        generated_job(slot=5, weights={"暴击率": 1}),
     )
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
@@ -1028,7 +1119,7 @@ def test_return_failure_fails_entire_chain(offline_runner, monkeypatch, level, r
 
 
 def test_enter_upgrade_failure_cannot_complete(offline_runner, monkeypatch):
-    runner = Runner(Preset(), hotkeys=False)
+    runner = Runner(generated_preset(), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: False)
     runner.run()
@@ -1262,6 +1353,69 @@ def test_single_row_list_is_flushed_as_bottom(offline_runner, monkeypatch):
     assert runner.outcome == "completed"
     assert len(grid.visited) == 5
     assert runner.processed_disc_count == 5
+    assert grid.scans == 1  # 确认短列表到底只改变遍历状态，复用同一帧解除末行延期。
+
+
+def test_single_row_filtered_list_reuses_scan_without_clicks(offline_runner, monkeypatch):
+    runner = Runner(Preset(max_discs=10, accepted=()), hotkeys=False)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=1, filtered_rows=(0,), last_row_cols=5))
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert grid.scans == 1
+    assert grid.visited == []
+    assert runner.processed_disc_count == 0
+
+
+def test_failed_filter_is_included_in_action_timing(offline_runner):
+    runner = Runner(Preset(max_discs=10, accepted=()), hotkeys=False)
+    offline_runner["apply_game_filter"].side_effect = RunnerError("filter failed")
+
+    runner.run()
+
+    assert runner.outcome == "failed"
+    spans = [span for span in runner.stats.actions if span.page == "筛选" and span.action == "设置游戏筛选"]
+    assert len(spans) == 1
+    assert spans[0].seconds >= 0
+
+
+def test_empty_filter_finishes_job_and_continues_chain(offline_runner, monkeypatch):
+    from zzz_ddtool.navigation import NavigationError
+
+    runner = Runner(Preset(max_discs=1, task_chain=(
+        TaskJob(slot=4, accepted=()), TaskJob(slot=5, accepted=()),
+    )), hotkeys=False)
+    wire_grid(runner, monkeypatch, FakeGrid(total_rows=1, last_row_cols=1))
+    monkeypatch.setattr(runner, "_ensure_profile", Mock())
+    runner._profile = fake_profile()
+    monkeypatch.setattr(runner_module, "measure_layout", Mock(side_effect=[
+        NavigationError("no labels"), (267.0, 175.0),
+    ]))
+    monkeypatch.setattr(runner_module, "is_empty_warehouse", lambda image: True)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert runner.stats.jobs[0].processed == 0
+    assert runner.stats.jobs[1].processed == 1
+    assert offline_runner["apply_game_filter"].call_count == 2
+
+
+def test_missing_labels_without_empty_evidence_still_fails(offline_runner, monkeypatch):
+    from zzz_ddtool.navigation import NavigationError
+
+    runner = Runner(Preset(max_discs=1, accepted=()), hotkeys=False)
+    monkeypatch.setattr(runner, "_ensure_profile", Mock())
+    monkeypatch.setattr(runner_module, "measure_layout", Mock(side_effect=NavigationError("no labels")))
+    monkeypatch.setattr(runner_module, "is_empty_warehouse", lambda image: False)
+
+    runner.run()
+
+    assert runner.outcome == "failed"
+    assert runner.processed_disc_count == 0
 
 
 # ---------------------------------------------------------- 单行小列表真机重放
@@ -1369,8 +1523,8 @@ def test_upgrade_reaching_next_stage_keeps_going(offline_runner, monkeypatch):
 def test_upgrade_shortfall_stops_later_jobs(offline_runner, monkeypatch):
     """素材不足要停整条任务链，不是只跳过这一个盘。"""
     jobs = (
-        TaskJob(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}}),
-        TaskJob(slot=5, weights={"暴击率": 1}),
+        generated_job(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0, 3: 999}}),
+        generated_job(slot=5, weights={"暴击率": 1}),
     )
     runner = Runner(Preset(task_chain=jobs, max_discs=2), hotkeys=False)
     monkeypatch.setattr(

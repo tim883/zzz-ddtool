@@ -10,6 +10,7 @@ kernel32 = ctypes.windll.kernel32
 advapi32 = ctypes.windll.advapi32
 
 from zzz_ddtool.logutil import get_logger
+from zzz_ddtool.control import checkpoint_input
 
 _input_log = get_logger("zzz_ddtool.wininput")
 
@@ -192,6 +193,7 @@ def input_blocked_reason(hwnd: int) -> str | None:
 
 
 def focus_window(hwnd: int) -> None:
+    checkpoint_input()
     user32.ShowWindow(hwnd, SW_RESTORE)
     user32.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
     user32.LockSetForegroundWindow(LSFW_UNLOCK)
@@ -230,6 +232,7 @@ def _key_event(vk: int, *, up: bool = False, scancode: bool = False) -> INPUT:
 
 def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
     """Foreground click, same idea as OneDragon: move cursor then mouse down/up."""
+    checkpoint_input()
     _input_log.info("click (%d,%d) alt=%s", x, y, alt)
     sx, sy = client_to_screen(hwnd, x + randint(-2, 2), y + randint(-2, 2))
     focus_window(hwnd)
@@ -252,6 +255,7 @@ def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
 
     保持既有调用兼容（一次缩放 delta、自带聚焦/移光标/随机等待）。批量按行
     发送请用 send_wheel_event，不要用这个。"""
+    checkpoint_input()
     _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
     sx, sy = client_to_screen(hwnd, x, y)
     focus_window(hwnd)
@@ -273,6 +277,7 @@ def send_wheel_event(delta_units: int) -> None:
     """
     if delta_units == 0:
         raise InputError("滚轮事件格数不能为 0。")
+    checkpoint_input()
     _input_log.info("wheel_event delta_units=%d", delta_units)
     user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_units * 120, 0)
 
@@ -280,6 +285,7 @@ def send_wheel_event(delta_units: int) -> None:
 def press_key_once(hwnd: int, vk: int) -> None:
     """只按一次键（down+up 一对）。R 弃置这类开关型键必须用这个：
     press_key 会发多对 down/up，R 按奇数次才有效，偶数次等于没按。"""
+    checkpoint_input()
     _input_log.info("key_once vk=0x%02X", vk)
     focus_window(hwnd)
     _send([_key_event(vk), _key_event(vk, scancode=True)])
@@ -290,6 +296,7 @@ def press_key_once(hwnd: int, vk: int) -> None:
 
 
 def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
+    checkpoint_input()
     _input_log.info("key vk=0x%02X", vk)
     scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or SCAN_ESCAPE
     focus_window(hwnd)

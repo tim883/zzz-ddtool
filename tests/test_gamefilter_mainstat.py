@@ -139,6 +139,21 @@ def test_open_mainstat_section_raises_when_toggle_missing(monkeypatch) -> None:
     assert wheels == []
 
 
+def test_open_mainstat_section_scrolls_before_clicking_bottom_toggle(monkeypatch) -> None:
+    frames = iter([
+        [line("主属性词条", 1349, 850), line("点击展开", 1563, 960)],
+        PANEL_COLLAPSED,
+        PANEL_EXPANDED,
+    ])
+    clicks, wheels = [], []
+    _stub(monkeypatch, lambda: list(next(frames)), clicks, wheels, frames_are_fn=True)
+
+    gf._open_mainstat_section(1, 1920, 1080)
+
+    assert wheels == [(1560, 500)]
+    assert clicks == [(1563, 623)]
+
+
 def test_open_mainstat_section_raises_after_scroll_limit(monkeypatch) -> None:
     clicks: list[tuple[int, int]] = []
     wheels: list[tuple[int, int]] = []
@@ -147,7 +162,7 @@ def test_open_mainstat_section_raises_after_scroll_limit(monkeypatch) -> None:
     with pytest.raises(FilterClickError):
         gf._open_mainstat_section(1, 1920, 1080)
 
-    assert len(wheels) == gf._MAX_PANEL_SCROLLS + 1
+    assert len(wheels) == gf._MAX_PANEL_SCROLLS
 
 
 # ---------------------------------------------------------------- 主属性点名
@@ -208,6 +223,101 @@ def test_pick_mainstats_raises_on_unknown_name(monkeypatch) -> None:
     assert clicks == []
 
 
+def test_pick_mainstats_scrolls_to_offscreen_target(monkeypatch) -> None:
+    """实测失败场景：展开后只露出前两排，暴击伤害仍在视口下方。"""
+    initial = [
+        line("主属性词条", 1349, 746),
+        line("点击收起", 1563, 799),
+        line("攻击力百分比", 1425, 854),
+        line("生命值百分比", 1705, 854),
+        line("防御力百分比", 1425, 911),
+        line("暴击率", 1705, 911),
+    ]
+    clicks, wheels = [], []
+    _stub(monkeypatch, lambda: PANEL_EXPANDED, clicks, wheels, frames_are_fn=True)
+
+    gf._pick_mainstats(1, ["暴击伤害"], width=1920, height=1080, lines=initial)
+
+    assert wheels == [(1560, 500)]
+    assert clicks == [(1705, 793)]
+
+
+def test_pick_mainstats_scrolls_before_clicking_bottom_band(monkeypatch) -> None:
+    initial = [line("主属性词条", 1349, 746), line("暴击率", 1705, 911)]
+    clicks, wheels = [], []
+    _stub(monkeypatch, PANEL_EXPANDED, clicks, wheels)
+
+    gf._pick_mainstats(1, ["暴击率"], width=1920, height=1080, lines=initial)
+
+    assert wheels == [(1560, 500)]
+    assert clicks == [(1425, 793)]
+
+
+def test_pick_mainstats_keeps_selected_names_when_scrolling(monkeypatch) -> None:
+    initial = [line("主属性词条", 1349, 746), line("攻击力百分比", 1705, 854)]
+    clicks, wheels = [], []
+    _stub(monkeypatch, PANEL_EXPANDED, clicks, wheels)
+
+    gf._pick_mainstats(1, ["攻击力%", "暴击伤害"], width=1920, height=1080, lines=initial)
+
+    assert wheels == [(1560, 500)]
+    assert clicks == [(1705, 854), (1705, 793)]
+
+
+def test_pick_mainstats_uses_substat_boundary_after_main_title_scrolls_away(monkeypatch) -> None:
+    initial = [line("主属性词条", 1349, 746)]
+    after = [
+        line("暴击伤害", 1705, 200),
+        line("副属性词条", 1349, 260),
+        line("暴击伤害", 1705, 400),
+    ]
+    clicks, wheels = [], []
+    _stub(monkeypatch, after, clicks, wheels)
+
+    gf._pick_mainstats(1, ["暴击伤害"], width=1920, height=1080, lines=initial)
+
+    assert clicks == [(1705, 200)]
+    assert len(wheels) == 1
+
+
+def test_pick_mainstats_missing_name_stops_at_scroll_limit(monkeypatch) -> None:
+    clicks, wheels = [], []
+    _stub(monkeypatch, PANEL_EXPANDED, clicks, wheels)
+
+    with pytest.raises(FilterClickError, match="冲击力"):
+        gf._pick_mainstats(1, ["冲击力"], width=1920, height=1080)
+
+    assert clicks == []
+    assert len(wheels) == gf._MAX_PANEL_SCROLLS
+
+
+def test_pick_mainstats_ignores_same_name_in_warehouse(monkeypatch) -> None:
+    frames = [line("主属性词条", 1349, 570), line("暴击伤害", 800, 700)]
+    clicks, wheels = [], []
+    _stub(monkeypatch, frames, clicks, wheels)
+
+    with pytest.raises(FilterClickError):
+        gf._pick_mainstats(1, ["暴击伤害"], width=1920, height=1080)
+
+    assert clicks == []
+
+
+def test_pick_mainstats_scales_panel_scroll_and_click_band(monkeypatch) -> None:
+    initial = [line("主属性词条", 674, 373), line("暴击率", 852, 456)]
+    after = [line("主属性词条", 674, 285), line("暴击率", 713, 397)]
+    clicks, wheels = [], []
+    _stub(monkeypatch, after, clicks, wheels)
+
+    gf._pick_mainstats(1, ["暴击率"], width=960, height=540, lines=initial)
+
+    assert wheels == [(780, 250)]
+    assert clicks == [(713, 397)]
+
+
+def test_pick_mainstats_normalized_duplicates_are_clicked_once(monkeypatch) -> None:
+    assert _pick(monkeypatch, ["攻击力%", "攻击力百分比"]) == [(1706, 678)]
+
+
 # ---------------------------------------------------------------- 接线
 
 
@@ -224,7 +334,7 @@ def test_apply_sets_mainstats_mainstat_path_has_no_confirm(monkeypatch) -> None:
 
 
 def test_apply_sets_mainstats_reuses_expand_frame(monkeypatch) -> None:
-    """展开区那一帧直接交给点名复用：整个主属性路径只该抓一帧全屏。
+    """展开区那一帧直接交给点名复用：整个主属性路径只该识别一帧面板。
 
     抓一帧全屏 OCR 实测 1.3~1.5s，多抓一次就是白扔。两函数之间没有任何点击，
     同一帧状态没变，可以安全复用。这条守住的就是「别再各抓一帧」。
@@ -243,7 +353,7 @@ def test_apply_sets_mainstats_reuses_expand_frame(monkeypatch) -> None:
 
     gf.apply_sets_mainstats(1, 1920, 1080, sets=(), mainstats=["暴击率"])
 
-    assert len(reads) == 1, f"主属性路径抓了 {len(reads)} 帧全屏，应只抓 1 帧"
+    assert len(reads) == 1, f"主属性路径识别了 {len(reads)} 帧面板，应只识别 1 帧"
     assert clicks == [(1425, 793)]
 
 
