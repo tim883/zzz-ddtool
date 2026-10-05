@@ -638,8 +638,8 @@ def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkey
     runner.run()
     assert runner.outcome == "completed"
     assert runner.processed_disc_count == 1
-    # 长列表只在筛选后置顶一次（旧流程的第二次无条件置顶已删除），恢复不再置顶。
-    assert offline_runner["reset_to_top"].call_count == 1
+    # 长列表筛选后不置顶（关面板时游戏已回顶），恢复也不再置顶：全程零切页。
+    offline_runner["reset_to_top"].assert_not_called()
 
 
 def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatch):
@@ -1182,7 +1182,7 @@ def test_start_index_seeds_prefix_and_lands_on_target_row(offline_runner, monkey
     assert state.at_top is False
     assert state.position_valid is True
     assert state.status_of(99) is CellStatus.PENDING  # 起点本身不被标跳过
-    # 置顶由 _prepare_navigation 负责，跳号只做「滚到目标行」
+    # 筛选后不置顶（关面板时游戏已回顶），跳号只做「滚到目标行」
     offline_runner["reset_to_top"].assert_not_called()
     assert sent == [10]
 
@@ -1651,8 +1651,8 @@ def test_prepare_navigation_uses_single_screen_without_top_reset(offline_runner,
     offline_runner["reset_to_top"].assert_not_called()
 
 
-def test_prepare_navigation_long_list_resets_top_once(offline_runner, monkeypatch):
-    """长列表（97 个）：只置顶一次；旧流程的第二次无条件置顶已删除。"""
+def test_prepare_navigation_long_list_does_not_reset_top(offline_runner, monkeypatch):
+    """长列表（97 个）：不置顶——关掉筛选面板时游戏已回到顶部，切页纯属多余。"""
     runner = Runner(generated_preset(accepted=None), hotkeys=False)
     runner._profile = fake_profile()
     state = _state()
@@ -1661,7 +1661,7 @@ def test_prepare_navigation_long_list_resets_top_once(offline_runner, monkeypatc
 
     assert prep is not None and prep.mode == VIEWPORT_SCROLLING
     assert state.viewport_mode == VIEWPORT_SCROLLING
-    assert offline_runner["reset_to_top"].call_count == 1
+    offline_runner["reset_to_top"].assert_not_called()
 
 
 @pytest.mark.parametrize("count", [37, 300])

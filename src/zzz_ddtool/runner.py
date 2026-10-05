@@ -736,11 +736,9 @@ class Runner:
     def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavigationPrep | None:
         """筛选后准备（改造方案 §5.1）。
 
-        先读当前画面：结果整屏可见就直接返回单屏准备，不调用 `reset_to_top`、
-        不发送探底滚轮；否则只置顶一次建立已知顶部原点，再测一次布局进长列表遍历。
-
-        旧流程是「置顶 → 复核布局 → 再置顶」：两次置顶之间只有只读的布局测量与
-        参数更新，第二次没有独立效果，已删除。返回 None 表示筛选结果为空。
+        先读当前画面：结果整屏可见就直接返回单屏准备，否则按长列表准备。两条路径
+        都**不调用 `reset_to_top`**、都不发送探底滚轮——当前画面本来就是顶部原点，
+        理由见长列表分支的注释。返回 None 表示筛选结果为空。
         """
         profile = self._profile
         if profile is None:
@@ -783,20 +781,16 @@ class Runner:
             self.trace.ok("drive_disc", "single_screen", note, image=image)
             return prep
 
-        # 长列表：置顶一次建立已知顶部原点，再测一次布局取正式网格（方案 §5.1）。
-        with self.stats.timed("导航", "切页置顶"):
-            reset_to_top(hwnd)
-        image, lines = self._grab_label_frame(hwnd)
-        origin, pitch = measure_layout(image, lines=lines)
-        reason = check_layout_reference(origin, pitch, image.width(), image.height())
-        if reason:
-            self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)
-            raise RunnerError(f"网格布局不受支持：{reason}，停止任务链")
-        self._origin_center_y = float(origin)
-        self._row_pitch = float(pitch)
-        profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
-        self._profile = profile
-        state.navigation_profile = profile.as_dict()
+        # 长列表：不置顶、也不再测一次布局，直接用上面那一次测量结果（方案 §5.1）。
+        #
+        # 事实：**关闭筛选面板时游戏自己就把列表滚回了顶部**，不用我们切页去置顶。
+        # 证据（20261005-133401 轮日志与截图）：0004 是「设置游戏筛选」成功那一刻拍的，
+        # 那时置顶动作还没发生，画面已经是 34/3000、实体盘从第 1 格起连续排列、末尾
+        # EMPTY；之后两次切页置顶（13:34:40→44、13:34:45→49）拍到的 0005 与它逐像素
+        # 相比，网格区差异只有 7%（全是图标高光与背景流动），说明置顶没改变视口。
+        #
+        # 也就是说置顶既不改筛选结果、也不改视口，只是白花一次切页往返，已删除。视口
+        # 原点沿用筛选关闭后那一次测量——它本来就在顶部。
         state.mark_viewport_mode(VIEWPORT_SCROLLING)
         self.trace.ok("drive_disc", "layout_check", f"{self._layout_detail(profile)}；{note}", image=image)
         return NavigationPrep(profile=profile, mode=VIEWPORT_SCROLLING)
