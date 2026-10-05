@@ -16,6 +16,7 @@ from zzz_ddtool.navigation import (
     load_profile,
     measure_layout,
     is_empty_warehouse,
+    parse_warehouse_count,
     save_profile,
     scroll_rows,
 )
@@ -122,6 +123,48 @@ def test_measure_layout_rejects_image_without_labels(monkeypatch):
     monkeypatch.setattr(ocr_module, "read_rect", lambda *a, **k: [])
     with pytest.raises(NavigationError):
         measure_layout(QImage(1920, 1080, QImage.Format.Format_RGB32))
+
+
+# ------------------------------------------------------------------ 数量解析
+
+
+def _count_line(text, *, left=70, top=120, right=350, bottom=150):
+    return ocr_module.OcrLine(text, 0.99, left, top, right, bottom)
+
+
+def test_parse_warehouse_count_reads_unique_value():
+    assert parse_warehouse_count([_count_line("驱动仓库 [ 12 / 3000 ]")], width=1920, height=1080) == 12
+
+
+def test_parse_warehouse_count_accepts_fullwidth_and_full_brackets():
+    assert parse_warehouse_count([_count_line("【34／3000】")], width=1920, height=1080) == 34
+
+
+def test_parse_warehouse_count_returns_none_without_value():
+    assert parse_warehouse_count([_count_line("驱动仓库")], width=1920, height=1080) is None
+
+
+def test_parse_warehouse_count_returns_none_on_conflict():
+    """两行读出不同数字：不可靠，一律按读不出处理。"""
+    lines = [_count_line("驱动仓库 [ 12 / 3000 ]"), _count_line("驱动仓库 [ 13 / 3000 ]")]
+    assert parse_warehouse_count(lines, width=1920, height=1080) is None
+
+
+def test_parse_warehouse_count_deduplicates_same_value():
+    lines = [_count_line("驱动仓库 [ 12 / 3000 ]"), _count_line("[ 12 / 3000 ]")]
+    assert parse_warehouse_count(lines, width=1920, height=1080) == 12
+
+
+def test_parse_warehouse_count_ignores_lines_outside_area():
+    """同样形如 N/总数，但落在计数区域外（例如按钮），不能当数量。"""
+    lines = [_count_line("驱动仓库 [ 12 / 3000 ]", left=1500, top=900, right=1800, bottom=930)]
+    assert parse_warehouse_count(lines, width=1920, height=1080) is None
+
+
+def test_parse_warehouse_count_scales_with_client_size():
+    # 1280×720：计数区域等比缩到 2/3，落点也跟着缩才读得到
+    lines = [ocr_module.OcrLine("驱动仓库 [ 7 / 3000 ]", 0.99, 47, 80, 233, 100)]
+    assert parse_warehouse_count(lines, width=1280, height=720) == 7
 
 
 # ------------------------------------------------------------------ 锚点读取

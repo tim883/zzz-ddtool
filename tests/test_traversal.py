@@ -12,11 +12,15 @@ from zzz_ddtool.traversal import (
     CAL_OK,
     CAL_OVER,
     CAL_SHORT,
+    VIEWPORT_SCROLLING,
+    VIEWPORT_SINGLE_SCREEN,
+    VIEWPORT_UNKNOWN,
     AnchorObservation,
     CellStatus,
     ResumePoint,
     GridCell,
     GridMetrics,
+    GridSnapshot,
     PositionError,
     TraversalState,
     bottom_evidence,
@@ -27,12 +31,15 @@ from zzz_ddtool.traversal import (
     global_index,
     global_row_col,
     display_row_col,
+    grid_snapshot,
     layout_reference,
     make_filter_signature,
     map_labels,
     max_restore_rows,
     rate_candidate,
     restore_request_rows,
+    single_screen_verdict,
+    snapshot_change,
     split_stable_cells,
     tail_slots_confirmed,
 )
@@ -651,3 +658,187 @@ def test_tail_slots_confirmed_for_short_list_ending_mid_viewport():
     rest = [(1, col) for col in range(1, COLS)] + _full_rows(2, 3)
     assert tail_slots_confirmed(occupied, _screen_set(rest), rows=ROWS, cols=COLS)
     assert not tail_slots_confirmed(occupied, _screen_set(rest[:-1]), rows=ROWS, cols=COLS)
+
+
+# --------------------------------------------------------------------------
+# 整屏判定（改造方案 §4、§10 验收：0/1/9/10/27/34/35/36/37 个盘）
+# --------------------------------------------------------------------------
+
+
+def _cell(row0: int, col0: int, *, level: int = 0) -> GridCell:
+    """造一个单屏（顶部=0）格位：全局行列按 COLS 换算。"""
+    return GridCell(
+        global_index=row0 * COLS + col0,
+        global_row0=row0,
+        global_col0=col0,
+        screen_row0=row0,
+        screen_col0=col0,
+        center_x=0,
+        center_y=0,
+        level=level,
+    )
+
+
+def _first_cells(count: int) -> list[GridCell]:
+    """从首行首列起连续铺 count 个实体盘（新方案要求筛选后无空洞）。"""
+    return [_cell(index // COLS, index % COLS) for index in range(count)]
+
+
+def _tail_empty(count: int) -> set:
+    """首 count 格之外的全部格位都确认为空占位。"""
+    order = [(row, col) for row in range(ROWS) for col in range(COLS)]
+    return set(order[count:])
+
+
+@pytest.mark.parametrize("count", [1, 9, 10, 27, 34, 35])
+def test_single_screen_verdict_accepts_small_lists(count):
+    cells = _first_cells(count)
+    empty = _tail_empty(count)
+    ok, why = single_screen_verdict(cells, empty, {}, total_count=count)
+    assert ok, why
+
+
+def test_single_screen_verdict_accepts_exactly_capacity():
+    """恰好 36 个：必须有总数佐证，否则和长列表前 36 个无法区分。"""
+    cells = _first_cells(36)
+    ok, why = single_screen_verdict(cells, set(), {}, total_count=36)
+    assert ok, why
+
+
+def test_single_screen_verdict_rejects_full_screen_without_total():
+    cells = _first_cells(36)
+    ok, why = single_screen_verdict(cells, set(), {}, total_count=None)
+    assert not ok and "数量" in why
+
+
+def test_single_screen_verdict_rejects_over_capacity():
+    """37 个不进单屏（37 > 36），即使占位看起来连续。"""
+    cells = _first_cells(36)
+    ok, why = single_screen_verdict(cells, set(), {}, total_count=37)
+    assert not ok and "36" in why
+
+
+def test_single_screen_verdict_rejects_zero_total():
+    ok, why = single_screen_verdict([], set(), {}, total_count=0)
+    assert not ok
+
+
+def test_single_screen_verdict_rejects_count_mismatch():
+    """总数 9 但只识别到 8 格：漏识别，不能宣布整屏。"""
+    cells = _first_cells(8)
+    empty = _tail_empty(9)
+    ok, why = single_screen_verdict(cells, empty, {}, total_count=9)
+    assert not ok and "9" in why
+
+
+def test_single_screen_verdict_rejects_unclear_placeholder():
+    cells = _first_cells(9)
+    empty = set(_tail_empty(9))
+    empty.discard((1, 0))
+    ok, why = single_screen_verdict(cells, empty, {(1, 0): "灰"}, total_count=9)
+    assert not ok and "不确定" in why
+
+
+def test_single_screen_verdict_rejects_ragged_placement():
+    """实体盘不从首行首列连续排列（第 1 行出现空洞）：退回长列表。"""
+    cells = [_cell(0, 0), _cell(0, 2)]
+    empty = _tail_empty(2)
+    ok, why = single_screen_verdict(cells, empty, {}, total_count=2)
+    assert not ok and "连续" in why
+
+
+def test_single_screen_verdict_rejects_unconfirmed_tail():
+    """其余格位没确认是游戏空占位：不当整屏，继续走长列表恢复。"""
+    cells = _first_cells(9)
+    ok, why = single_screen_verdict(cells, set(), {}, total_count=9)
+    assert not ok and "空占位" in why
+
+
+# --------------------------------------------------------------------------
+# 前后快照对比（改造方案 §6、§10 验收：成员变化使旧关联失效）
+# --------------------------------------------------------------------------
+
+
+def test_grid_snapshot_payload_is_json_friendly():
+    snapshot = GridSnapshot(total=2, levels={0: 3, 1: 6}, empty=frozenset({(0, 2)}))
+    payload = snapshot.as_payload()
+    assert payload["total"] == 2
+    assert payload["levels"] == {"0": 3, "1": 6}
+    assert payload["empty"] == [(0, 2)]
+
+
+def test_snapshot_change_none_when_identical():
+    snapshot = grid_snapshot([_cell(0, 0, level=6)], total=1)
+    assert snapshot_change(snapshot, snapshot) is None
+
+
+def test_snapshot_change_allows_active_level_up_only():
+    before = grid_snapshot([_cell(0, 0, level=3)], total=1)
+    after = grid_snapshot([_cell(0, 0, level=15)], total=1)
+    assert snapshot_change(before, after, active_index=0) is None
+    # 同一格等级上升但不是刚强化那件：视为列表变化
+    assert snapshot_change(before, after, active_index=None) is not None
+
+
+def test_snapshot_change_rejects_active_level_drop():
+    before = grid_snapshot([_cell(0, 0, level=9)], total=1)
+    after = grid_snapshot([_cell(0, 0, level=6)], total=1)
+    assert snapshot_change(before, after, active_index=0) is not None
+
+
+def test_snapshot_change_detects_total_change():
+    before = grid_snapshot([_cell(0, 0)], total=9)
+    after = grid_snapshot([_cell(0, 0)], total=8)
+    reason = snapshot_change(before, after)
+    assert reason is not None and "数量" in reason
+
+
+def test_snapshot_change_detects_member_shift():
+    """某盘退出筛选后后面的盘补位：可见格位集合变化，旧关联失效。"""
+    before = grid_snapshot([_cell(0, 0), _cell(0, 1)], total=2)
+    after = grid_snapshot([_cell(0, 0)], total=2)
+    reason = snapshot_change(before, after)
+    assert reason is not None and "格位" in reason
+
+
+# --------------------------------------------------------------------------
+# 视口模式提交（改造方案 §4、§7）
+# --------------------------------------------------------------------------
+
+
+def test_default_viewport_mode_is_unknown():
+    state = TraversalState("j1")
+    assert state.viewport_mode == VIEWPORT_UNKNOWN
+    assert state.single_screen_total is None
+
+
+def test_single_screen_mode_requires_total():
+    state = TraversalState("j1")
+    with pytest.raises(PositionError):
+        state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN)
+    state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=12)
+    assert state.viewport_mode == VIEWPORT_SINGLE_SCREEN
+    assert state.single_screen_total == 12
+
+
+def test_mark_viewport_mode_rejects_unknown_mode():
+    state = TraversalState("j1")
+    with pytest.raises(PositionError):
+        state.mark_viewport_mode("bogus")
+
+
+def test_mark_viewport_mode_clears_total_when_leaving_single_screen():
+    state = TraversalState("j1")
+    state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=12)
+    state.mark_viewport_mode(VIEWPORT_SCROLLING)
+    assert state.viewport_mode == VIEWPORT_SCROLLING
+    assert state.single_screen_total is None
+
+
+def test_status_payload_exposes_viewport_mode():
+    state = TraversalState("j1")
+    assert state.status_payload()["viewport_mode"] == VIEWPORT_UNKNOWN
+    state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=34)
+    payload = state.status_payload()
+    assert payload["viewport_mode"] == VIEWPORT_SINGLE_SCREEN
+    assert payload["single_screen_total"] == 34

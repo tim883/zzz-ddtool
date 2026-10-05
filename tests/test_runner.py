@@ -6,7 +6,7 @@
 
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pytest
 from PySide6.QtGui import QImage
@@ -24,6 +24,8 @@ from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.navigation import Environment, NavProfile, ScrollSend
 from zzz_ddtool.runner import Runner, RunnerError
 from zzz_ddtool.traversal import (
+    VIEWPORT_SCROLLING,
+    VIEWPORT_SINGLE_SCREEN,
     CellStatus,
     GridCell,
     TraversalState,
@@ -34,6 +36,14 @@ from zzz_ddtool.traversal import (
 
 VIEWPORT_ROWS = 4
 GRID_COLS = 9
+
+#: 替身默认按「长列表」准备：筛选后总数超过单屏容量 36，走一次置顶的遍历路径。
+FAKE_WAREHOUSE_COUNT = 97
+
+
+def fake_label_lines(count=FAKE_WAREHOUSE_COUNT):
+    """替身列表区域 OCR 行：只有一条仓库数量行，没有「等级」标签。"""
+    return [ocr_module.OcrLine(f"{count}/3000", 0.99, 70, 120, 350, 150)]
 
 
 def generated_job(**kwargs):
@@ -155,7 +165,9 @@ def offline_runner(monkeypatch):
     monkeypatch.setattr(runner_module, "find_game_hwnd", lambda: 1)
     monkeypatch.setattr(runner_module, "window_pid", lambda hwnd: 100)
     monkeypatch.setattr(runner_module, "grab_game_image", lambda hwnd=None: (image, "test", 1))
-    monkeypatch.setattr(runner_module, "measure_layout", lambda img: (267.0, 175.0))
+    monkeypatch.setattr(runner_module, "measure_layout", lambda img, **kw: (267.0, 175.0))
+    # 列表区域只读一次、由调用方复用：替身固定给一条数量行（默认 97/3000，长列表）。
+    monkeypatch.setattr(Runner, "_read_label_lines", lambda self, image: fake_label_lines())
     monkeypatch.setattr(runner_module, "probe_environment", lambda hwnd: fake_env())
     monkeypatch.setattr(runner_module, "load_profile", lambda env: fake_profile())
     monkeypatch.setattr(
@@ -171,7 +183,7 @@ def offline_runner(monkeypatch):
 
     # 默认两行数据：首行可点、末行被延后，模拟真实稳定行策略
     default_cells = ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
-    monkeypatch.setattr(Runner, "_scan_cells", lambda self, state: default_cells)
+    monkeypatch.setattr(Runner, "_scan_cells", lambda self, state, **kw: default_cells)
     monkeypatch.setattr(Runner, "_grab", lambda *a, **kw: (image, "unknown", "test", 1))
     monkeypatch.setattr(Runner, "_advance", lambda self, hwnd, state, cells, *, rows: True)
 
@@ -199,7 +211,7 @@ def offline_runner(monkeypatch):
 def wire_grid(runner, monkeypatch, grid: FakeGrid):
     """把替身网格接到 Runner：扫描返回全局格位，前进更新视口与端点。"""
 
-    def scan(state):
+    def scan(state, **kwargs):
         runner._selected_cell = grid.selected_cell()
         cells, problems, skips = grid.scan()
         runner._tail_slots_confirmed = grid.at_bottom
@@ -425,7 +437,7 @@ def test_restore_position_returns_to_saved_viewport(offline_runner, monkeypatch)
     state.restore_request_limit_rows = max_restore_rows(20)
     state.confirm_viewport(10, 50.0, row_pitch_px=175.0, at_top=False, at_bottom=False)
     state.begin_upgrade(100)
-    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([make_cell(10, 0, 0)], [], {}))
+    monkeypatch.setattr(runner, "_scan_cells", lambda s, **kw: ([make_cell(10, 0, 0)], [], {}))
     sent: list[int] = []
 
     def fake_scroll(hwnd, rows, profile, **kwargs):
@@ -469,7 +481,7 @@ def test_restore_settles_only_after_actually_scrolling(offline_runner, monkeypat
     state.restore_request_limit_rows = max_restore_rows(20)
     state.confirm_viewport(0, 0.0, row_pitch_px=175.0, at_top=True, at_bottom=False)
     state.begin_upgrade(3)
-    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0)], [], {}))
+    monkeypatch.setattr(runner, "_scan_cells", lambda s, **kw: ([make_cell(0, 0, 0)], [], {}))
     slept: list[float] = []
     monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: slept.append(seconds))
     monkeypatch.setattr(runner_module, "scroll_rows", Mock())
@@ -492,7 +504,7 @@ def test_restore_retries_once_when_grid_unreadable(offline_runner, monkeypatch):
             ([make_cell(4, 0, 0)], [], {}),
         ]
     )
-    monkeypatch.setattr(runner, "_scan_cells", lambda s: next(results))
+    monkeypatch.setattr(runner, "_scan_cells", lambda s, **kw: next(results))
     runner._restore_position(1, state)
     assert state.restore_attempt == 2
     assert state.restore_retries == 1
@@ -507,7 +519,7 @@ def test_restore_twice_unreadable_fails(offline_runner, monkeypatch):
     state.restore_request_limit_rows = max_restore_rows(20)
     state.confirm_viewport(4, 0.0, row_pitch_px=175.0)
     state.begin_upgrade(36)
-    monkeypatch.setattr(runner, "_scan_cells", lambda s: ([], ["标签无法映射到行列"], {}))
+    monkeypatch.setattr(runner, "_scan_cells", lambda s, **kw: ([], ["标签无法映射到行列"], {}))
     with pytest.raises(RunnerError, match="恢复保存视口失败"):
         runner._restore_position(1, state)
     assert state.restore_attempt == 2
@@ -617,7 +629,7 @@ def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkey
     """第 N 件强化后达 max_discs：直接结束，不为恢复原位置再切页/滚动。"""
     runner = Runner(generated_preset(max_discs=1, accepted=None), hotkeys=False)
     monkeypatch.setattr(
-        runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
+        runner, "_scan_cells", lambda s, **kw: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
     )
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
@@ -626,8 +638,8 @@ def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkey
     runner.run()
     assert runner.outcome == "completed"
     assert runner.processed_disc_count == 1
-    # 仅任务开始时标定前后各置顶一次，恢复不再置顶。
-    assert offline_runner["reset_to_top"].call_count == 2
+    # 长列表只在筛选后置顶一次（旧流程的第二次无条件置顶已删除），恢复不再置顶。
+    assert offline_runner["reset_to_top"].call_count == 1
 
 
 def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatch):
@@ -639,7 +651,13 @@ def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatc
     order = []
     runner = Runner(generated_preset(max_discs=1, accepted=None), hotkeys=False)
     monkeypatch.setattr(Runner, "_ensure_profile", lambda self, hwnd: order.append("profile"))
-    monkeypatch.setattr(Runner, "_prepare_navigation", lambda self, hwnd, state: fake_profile())
+    monkeypatch.setattr(
+        Runner,
+        "_prepare_navigation",
+        lambda self, hwnd, state: runner_module.NavigationPrep(
+            profile=fake_profile(), mode="scrolling"
+        ),
+    )
     offline_runner["apply_game_filter"].side_effect = lambda *a, **kw: order.append("filter")
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
@@ -721,7 +739,9 @@ def test_click_leaving_page_unrecoverable_fails(offline_runner, monkeypatch):
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
     runner = Runner(Preset(max_discs=3, accepted=()), hotkeys=False)
-    monkeypatch.setattr(runner, "_scan_cells", lambda state: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {}))
+    monkeypatch.setattr(
+        runner, "_scan_cells", lambda state, **kw: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
+    )
     monkeypatch.setattr(runner, "_grab", lambda *a, **kw: (image, "menu", "test", 1))
     runner.run()
     assert runner.outcome == "failed"
@@ -1389,8 +1409,10 @@ def test_empty_filter_finishes_job_and_continues_chain(offline_runner, monkeypat
     wire_grid(runner, monkeypatch, FakeGrid(total_rows=1, last_row_cols=1))
     monkeypatch.setattr(runner, "_ensure_profile", Mock())
     runner._profile = fake_profile()
+    # 任务 1：筛选后读不到「等级」标签且确认空仓 → 正常结束本任务。
+    # 任务 2：读得出布局；长列表路径会「读一次 + 置顶后再读一次」，所以给两次值。
     monkeypatch.setattr(runner_module, "measure_layout", Mock(side_effect=[
-        NavigationError("no labels"), (267.0, 175.0),
+        NavigationError("no labels"), (267.0, 175.0), (267.0, 175.0),
     ]))
     monkeypatch.setattr(runner_module, "is_empty_warehouse", lambda image: True)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
@@ -1528,7 +1550,7 @@ def test_upgrade_shortfall_stops_later_jobs(offline_runner, monkeypatch):
     )
     runner = Runner(Preset(task_chain=jobs, max_discs=2), hotkeys=False)
     monkeypatch.setattr(
-        runner, "_scan_cells", lambda s: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
+        runner, "_scan_cells", lambda s, **kw: ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
     )
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
@@ -1580,3 +1602,203 @@ def test_material_slot_scales_with_window_size(offline_runner, monkeypatch):
 
     assert runner._upgrade_once(99, 2) is True
     assert offline_runner["click_client"].call_args_list[0] == call(99, 1069, 564)
+
+
+# ----------------------------------------------- 单屏整屏可见快速路径（改造方案 §4、§5）
+#
+# 验收（方案 §10）：数量与格位一致时 1/9/10/27/34/35 个盘进单屏；恰好 36 个靠总数
+# 判定；37+ 不进单屏；单屏内不置顶、不探底、不滚轮；强化后原地重扫、无仓库页签点击。
+
+
+def _empty_slots_beyond(count: int) -> set:
+    """4×9 视口里，首 count 格之外全部格位（供单屏判定当「已确认空占位」）。"""
+    order = [(row, col) for row in range(VIEWPORT_ROWS) for col in range(GRID_COLS)]
+    return set(order[count:])
+
+
+def _stub_single_screen_scan(runner, cells, count, *, unclear=None):
+    """把扫描结果与原始可观察量（总数 / 空占位 / 拿不准）一起交给 Runner。"""
+
+    def scan(state, **kwargs):
+        runner._last_count = count
+        runner._last_empties = _empty_slots_beyond(count) - set((unclear or {}).keys())
+        runner._last_unclear = dict(unclear or {})
+        return list(cells), [], {}
+
+    return scan
+
+
+def _single_screen_cells(count: int, *, levels=None):
+    """从首行首列起连续铺 count 个实体盘，可指定各格等级。"""
+    levels = levels or {}
+    return [make_cell(0, index, 0, level=levels.get(index, 0)) for index in range(count)]
+
+
+def test_prepare_navigation_uses_single_screen_without_top_reset(offline_runner, monkeypatch):
+    """5 个盘整屏可见：不置顶、不探底，返回单屏准备并复用判定那一帧的扫描。"""
+    runner = Runner(generated_preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    cells = _single_screen_cells(5)
+    monkeypatch.setattr(Runner, "_read_label_lines", lambda self, image: fake_label_lines(5))
+    monkeypatch.setattr(runner, "_scan_cells", _stub_single_screen_scan(runner, cells, 5))
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+
+    prep = runner._prepare_navigation(1, _state())
+
+    assert prep is not None and prep.mode == VIEWPORT_SINGLE_SCREEN
+    assert prep.total == 5
+    assert prep.scan[0] == cells
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def test_prepare_navigation_long_list_resets_top_once(offline_runner, monkeypatch):
+    """长列表（97 个）：只置顶一次；旧流程的第二次无条件置顶已删除。"""
+    runner = Runner(generated_preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    state = _state()
+
+    prep = runner._prepare_navigation(1, state)
+
+    assert prep is not None and prep.mode == VIEWPORT_SCROLLING
+    assert state.viewport_mode == VIEWPORT_SCROLLING
+    assert offline_runner["reset_to_top"].call_count == 1
+
+
+@pytest.mark.parametrize("count", [37, 300])
+def test_confirm_single_screen_rejects_over_capacity(offline_runner, monkeypatch, count):
+    runner = Runner(generated_preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    lines = fake_label_lines(count)
+
+    prep, note = runner._confirm_single_screen(_state(), image=blank_image(), lines=lines)
+
+    assert prep is None and "36" in note
+
+
+def test_confirm_single_screen_not_used_for_start_index(offline_runner, monkeypatch):
+    """测试跳号入口要把视口摆到列表深处，与「整屏可见」互斥，直接走长列表。"""
+    runner = Runner(generated_preset(accepted=None), hotkeys=False, start_index=100)
+    runner._profile = fake_profile()
+
+    prep, note = runner._confirm_single_screen(
+        _state(), image=blank_image(), lines=fake_label_lines(5)
+    )
+
+    assert prep is None and "跳号" in note
+
+
+def test_single_screen_job_runs_without_top_reset_or_scroll(offline_runner, monkeypatch):
+    """端到端：单屏任务处理完整屏结果，全程不置顶、不滚轮、不探底。"""
+    runner = Runner(Preset(max_discs=10, accepted=()), hotkeys=False)
+    cells = _single_screen_cells(5)
+    monkeypatch.setattr(
+        runner,
+        "_prepare_navigation",
+        lambda hwnd, state: runner_module.NavigationPrep(
+            profile=fake_profile(), mode=VIEWPORT_SINGLE_SCREEN, total=5, scan=(cells, [], {})
+        ),
+    )
+    scroll = Mock(
+        side_effect=lambda hwnd, rows, profile, **kw: ScrollSend(
+            rows, rows, rows, profile.event_interval_ms
+        )
+    )
+    monkeypatch.setattr(runner_module, "scroll_rows", scroll)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert runner.processed_disc_count == 5
+    offline_runner["reset_to_top"].assert_not_called()
+    scroll.assert_not_called()
+    offline_runner["press_key"].assert_not_called()
+
+
+# ----------------------------------------------- 强化后原地复核（改造方案 §5.2、§6）
+
+
+def _single_screen_state(cells_count: int, *, active_index: int) -> TraversalState:
+    state = _state()
+    state.restore_request_limit_rows = max_restore_rows(20)
+    state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=cells_count)
+    state.confirm_viewport(0, 0.0, row_pitch_px=175.0, at_top=True, at_bottom=True)
+    state.begin_upgrade(active_index)
+    return state
+
+
+def test_restore_single_screen_rechecks_in_place(offline_runner, monkeypatch):
+    """单屏强化后原地重读：只允许刚强化那件等级上升，无其他变化即通过并继续。
+
+    全程不切页（无 reset_to_top）、不滚轮；复核扫描结果缓存给主循环，不重复计数。
+    """
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    runner._origin_center_y = 267.0
+    state = _single_screen_state(5, active_index=2)
+    before = _single_screen_cells(5)
+    after = _single_screen_cells(5, levels={2: 15})  # 刚强化的第 3 格升到 15
+    monkeypatch.setattr(runner, "_grab_label_frame", lambda hwnd: (blank_image(), fake_label_lines(5)))
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+    monkeypatch.setattr(runner, "_scan_cells", _stub_single_screen_scan(runner, after, 5))
+
+    runner._restore_position(1, state, before)
+
+    assert state.resume_point is None
+    assert state.viewport_mode == VIEWPORT_SINGLE_SCREEN
+    assert runner._restored_scan[0] == after
+    offline_runner["reset_to_top"].assert_not_called()
+    assert any(
+        c.args[1] == "single_screen_recheck" for c in runner.trace.ok.call_args_list
+    )
+
+
+def test_restore_single_screen_stops_chain_on_member_change(offline_runner, monkeypatch):
+    """总数不变但别的格位也变了 = 列表成员/顺序变化：旧关联失效，停止任务链。
+
+    切页置顶不能恢复物品原来的身份，所以不许回退到置顶兜底。
+    """
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    runner._origin_center_y = 267.0
+    state = _single_screen_state(5, active_index=2)
+    before = _single_screen_cells(5)
+    after = _single_screen_cells(5, levels={2: 15, 4: 6})  # 第 5 格也变了
+    monkeypatch.setattr(runner, "_grab_label_frame", lambda hwnd: (blank_image(), fake_label_lines(5)))
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+    monkeypatch.setattr(runner, "_scan_cells", _stub_single_screen_scan(runner, after, 5))
+
+    with pytest.raises(RunnerError, match="成员变化"):
+        runner._restore_position(1, state, before)
+
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def test_restore_single_screen_falls_back_on_viewport_anomaly(offline_runner, monkeypatch):
+    """布局/相位读不出 = 视口异常：放弃快速路径，回退到既有置顶定位恢复。"""
+    from zzz_ddtool.navigation import NavigationError
+
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    runner._profile = fake_profile()
+    runner._row_pitch = 175.0
+    runner._origin_center_y = 267.0
+    state = _single_screen_state(5, active_index=2)
+    monkeypatch.setattr(runner, "_grab_label_frame", lambda hwnd: (blank_image(), fake_label_lines(5)))
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+    # 原地复核每次测布局都失败，回退路径第一次就成功。
+    monkeypatch.setattr(
+        runner_module,
+        "measure_layout",
+        Mock(side_effect=[NavigationError("no labels")] * 3 + [(267.0, 175.0)] * 4),
+    )
+    monkeypatch.setattr(runner, "_scan_cells", lambda state, **kw: ([make_cell(0, 0, 0)], [], {}))
+
+    runner._restore_position(1, state, _single_screen_cells(5))
+
+    # 回退到置顶恢复：切页一次，成功恢复后释放恢复点。
+    offline_runner["reset_to_top"].assert_called_once_with(1)
+    assert state.resume_point is None
+    assert any(c.args[1] == "restore_fallback" for c in runner.trace.warn.call_args_list)

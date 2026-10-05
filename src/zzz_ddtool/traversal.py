@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
-from zzz_ddtool.layout import GRID_COLS, GRID_LABEL_DY, GRID_ORIGIN, GRID_STEP, scale_point
+from zzz_ddtool.layout import GRID_COLS, GRID_LABEL_DY, GRID_ORIGIN, GRID_ROWS, GRID_STEP, scale_point
 
 # 既有布局的只读参考（1920×1080 设计坐标），只用于复核实测原点，不是运行时真值。
 REFERENCE_ORIGIN_Y = GRID_ORIGIN[1]
@@ -39,6 +39,13 @@ class CellStatus(str, Enum):
 
 #: 可推进 next_index 的状态集合。
 RESOLVED_STATUSES = frozenset({CellStatus.DONE, CellStatus.SKIPPED})
+
+
+#: 视口模式（方案 §4）：单屏 = 筛选结果整屏可见，不置顶、不探底；长列表 = 一次置顶后按视口遍历。
+VIEWPORT_UNKNOWN = "unknown"
+VIEWPORT_SINGLE_SCREEN = "single_screen"
+VIEWPORT_SCROLLING = "scrolling"
+VIEWPORT_MODES = frozenset({VIEWPORT_UNKNOWN, VIEWPORT_SINGLE_SCREEN, VIEWPORT_SCROLLING})
 
 
 # --------------------------------------------------------------------------
@@ -432,6 +439,122 @@ def tail_slots_confirmed(
     return not (confirmed_empty - tail)
 
 
+# --------------------------------------------------------------------------
+# 整屏判定与前后快照（改造方案《仓库导航与恢复优化改造方案》§4、§6）
+# --------------------------------------------------------------------------
+
+
+def single_screen_verdict(
+    cells: Sequence[GridCell],
+    confirmed_empty: set[tuple[int, int]],
+    unclear: Mapping[tuple[int, int], str],
+    *,
+    total_count: int | None,
+    rows: int = GRID_ROWS,
+    cols: int = GRID_COLS,
+) -> tuple[bool, str]:
+    """筛选结果是否「整屏可见」——可以省掉置顶、末行延期和探底（方案 §4）。
+
+    判定用的是**游戏仓库显示的筛选后总盘数**（含满级、装备、锁定、弃置），不是
+    「待处理数」「额度」或扣掉跳过项后的数量。四条同时成立才算：
+
+    1. 总数可靠识别，且 ``0 < N <= 单屏容量``；
+    2. 实体盘格位数与 N 相同（少一格就是漏识别，不能宣布整屏）；
+    3. 实体盘从首行首列起连续排列，其余格位没有「拿不准」的占位；
+    4. 其余格位全部确认为游戏空占位（`tail_slots_confirmed`，含满屏 36 个）。
+
+    恰好等于容量 36 时必须靠总数区分「只有 36 个」和「长列表的前 36 个」：
+    单看占位无法分辨，所以总数是硬条件，读不出来就一律不接受单屏。
+
+    返回 ``(是否成立, 给人看的原因)``；不成立的原因用于审计日志，不抛异常。
+    """
+    capacity = int(rows) * int(cols)
+    if total_count is None:
+        return False, "仓库数量没识别出来"
+    if total_count <= 0:
+        return False, f"仓库数量 {total_count}，按空结果处理"
+    if total_count > capacity:
+        return False, f"仓库数量 {total_count} 超过单屏容量 {capacity}"
+    if len(cells) != total_count:
+        return False, f"只识别到 {len(cells)} 格，与仓库总数 {total_count} 不一致"
+    if unclear:
+        row0, col0 = sorted(unclear)[0]
+        return False, f"屏幕第{row0 + 1}行第{col0 + 1}列占位不确定（{unclear[(row0, col0)]}）"
+    occupied = {(cell.screen_row0, cell.screen_col0) for cell in cells}
+    expected = [(index // cols, index % cols) for index in range(len(cells))]
+    if sorted(occupied) != expected:
+        return False, "实体盘不是从首行首列起的连续排列（有缺口或半行偏移）"
+    if not tail_slots_confirmed(occupied, set(confirmed_empty), rows=rows, cols=cols):
+        return False, "其余格位没有全部确认为游戏空占位"
+    return True, f"共 {total_count} 个盘整屏可见（{len(cells)} 格）"
+
+
+@dataclass(frozen=True)
+class GridSnapshot:
+    """一次网格读取的可观察量快照（方案 §6）。
+
+    只装「看得见」的量：仓库总数、每个格位的等级、确认的空占位。它用来发现
+    强化前后**可观察到的**变化，不能唯一识别外观相同的盘，所以不叫物品 ID。
+    """
+
+    total: int | None
+    levels: Mapping[int, int]
+    empty: frozenset[tuple[int, int]] = frozenset()
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "levels": {str(key): value for key, value in sorted(self.levels.items())},
+            "empty": sorted(self.empty),
+        }
+
+
+def grid_snapshot(
+    cells: Iterable[GridCell],
+    *,
+    total: int | None,
+    confirmed_empty: Iterable[tuple[int, int]] = (),
+) -> GridSnapshot:
+    """把一批扫描结果收成快照：总数 + 格位等级 + 确认空占位。"""
+    return GridSnapshot(
+        total=None if total is None else int(total),
+        levels={cell.global_index: int(cell.level) for cell in cells},
+        empty=frozenset(confirmed_empty),
+    )
+
+
+def snapshot_change(before: GridSnapshot, after: GridSnapshot, *, active_index: int | None = None) -> str | None:
+    """强化前后快照的可观察变化；没有变化返回 None（方案 §6）。
+
+    只有「刚强化的那一件」允许等级上升；其余任何等级变化、可见格位集合变化或
+    总数变化都说明列表成员/顺序动了，旧的格位进度不再有效——此时绝不能继续按
+    `next_index` 往下走（某盘退出筛选后，后面的盘会补位，直接沿用会漏盘）。
+
+    注意：切页置顶并不能恢复物品的身份关联，所以这里报出变化就必须停，不许用
+    「回退到置顶」把它盖过去。
+    """
+    if before.total != after.total:
+        return f"仓库数量 {before.total} → {after.total}"
+    if set(before.levels) != set(after.levels):
+        missing = sorted(set(before.levels) - set(after.levels))
+        extra = sorted(set(after.levels) - set(before.levels))
+        parts: list[str] = []
+        if missing:
+            parts.append(f"少了格位 {missing}")
+        if extra:
+            parts.append(f"多了格位 {extra}")
+        return "可见格位集合变化（" + "；".join(parts) + "）"
+    for index in sorted(before.levels):
+        old_level = before.levels[index]
+        new_level = after.levels[index]
+        if old_level == new_level:
+            continue
+        if index == active_index and new_level > old_level:
+            continue  # 刚强化完的那件盘，等级上升是预期变化
+        return f"第 {index} 格等级 {old_level} → {new_level}"
+    return None
+
+
 @dataclass
 class ScrollOperation:
     """一次批量滚动的发送进度；暂停期间保留（spec §5.2）。"""
@@ -497,6 +620,10 @@ class TraversalState:
     at_top: bool = False
     at_bottom: bool = False
     position_valid: bool = False
+    # 视口模式与单屏总数（方案 §4）：只有完整证据通过才提交 single_screen，
+    # 并同时把 top=0、phase=0、at_top/at_bottom 置位。任务之间不共享。
+    viewport_mode: str = VIEWPORT_UNKNOWN
+    single_screen_total: int | None = None
     active_index: int | None = None
     resume_point: ResumePoint | None = None
     navigation_profile: Mapping[str, Any] | None = None
@@ -581,6 +708,19 @@ class TraversalState:
     def invalidate_position(self) -> None:
         """定位失效：保留逻辑进度，只清掉位置可信度。"""
         self.position_valid = False
+
+    def mark_viewport_mode(self, mode: str, *, total: int | None = None) -> None:
+        """提交本任务的处理模式（方案 §4）。
+
+        只有完整证据通过才允许 `single_screen`，并带上当时确认的筛选后总数；
+        长列表走 `scrolling`，总数不参与定位，不记录。清成 `unknown` 时总数一并清掉。
+        """
+        if mode not in VIEWPORT_MODES:
+            raise PositionError(f"未知的视口模式：{mode}")
+        if mode == VIEWPORT_SINGLE_SCREEN and total is None:
+            raise PositionError("单屏模式必须带筛选后总数")
+        self.viewport_mode = mode
+        self.single_screen_total = None if mode != VIEWPORT_SINGLE_SCREEN else int(total)
 
     def offset_px(self) -> float:
         if self.viewport_top_row0 is None or self.row_phase_px is None or self.row_pitch_px is None:
@@ -716,6 +856,8 @@ class TraversalState:
             "row_phase_px": self.row_phase_px,
             "row_pitch_px": self.row_pitch_px,
             "position_valid": self.position_valid,
+            "viewport_mode": self.viewport_mode,
+            "single_screen_total": self.single_screen_total,
             "restore_target": None if self.resume_point is None else self.resume_point.as_payload(),
             "work_batch_id": self.work_batch_id,
             "work_batch_count": self.work_batch_count,

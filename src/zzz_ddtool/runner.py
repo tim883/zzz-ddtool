@@ -42,6 +42,7 @@ from zzz_ddtool.navigation import (
     load_profile,
     measure_layout,
     is_empty_warehouse,
+    parse_warehouse_count,
     probe_environment,
     save_profile,
     scroll_rows,
@@ -50,6 +51,7 @@ from zzz_ddtool.navigation import (
 )
 from zzz_ddtool.ocr import OcrError, parse_disc
 from zzz_ddtool.paths import stats_dir
+from zzz_ddtool.screen import DRIVE_DISC, is_page
 from zzz_ddtool.stats import (
     OUTCOME_DISCARDED,
     OUTCOME_FAILED,
@@ -61,6 +63,8 @@ from zzz_ddtool.stats import (
 from zzz_ddtool.trace import Trace, action_name as trace_action, page_name as trace_page
 from zzz_ddtool.traversal import (
     RESOLVED_STATUSES,
+    VIEWPORT_SCROLLING,
+    VIEWPORT_SINGLE_SCREEN,
     AnchorObservation,
     CellStatus,
     GridCell,
@@ -72,9 +76,12 @@ from zzz_ddtool.traversal import (
     check_layout_reference,
     forward_batch_for_top,
     global_row_col,
+    grid_snapshot,
     make_filter_signature,
     map_labels,
     max_restore_rows,
+    single_screen_verdict,
+    snapshot_change,
     split_stable_cells,
     tail_slots_confirmed,
 )
@@ -99,6 +106,21 @@ class RunResult:
     reason: str
     score: float
     level: int
+
+
+@dataclass(frozen=True)
+class NavigationPrep:
+    """筛选后的准备结果（改造方案 §5.1）。
+
+    mode=single_screen 时 ``scan`` 是判定成立那一帧的扫描结果，主循环直接复用：
+    既不置顶、也不探底，首批就是全部待处理行。mode=scrolling 时只置顶一次，
+    首批网格由主循环自己扫。
+    """
+
+    profile: NavProfile
+    mode: str
+    total: int | None = None
+    scan: tuple | None = None
 
 
 class Runner:
@@ -148,6 +170,11 @@ class Runner:
         # 最近一次扫描的末尾占位判定（spec §5.4）：只有它和锚点端点行为同时成立
         # 才允许把视口标记为到底。
         self._tail_slots_confirmed = False
+        # 最近一次扫描的原始可观察量：确认空占位、拿不准占位、筛选后总数。
+        # 单屏判定与强化前后快照对比都用这一份，不重复采样（方案 §7）。
+        self._last_empties: set[tuple[int, int]] = set()
+        self._last_unclear: dict[tuple[int, int], str] = {}
+        self._last_count: int | None = None
 
     @property
     def processed_disc_count(self) -> int:
@@ -319,6 +346,9 @@ class Runner:
         self._state = None
         self._restored_scan = None
         self._tail_slots_confirmed = False
+        self._last_empties = set()
+        self._last_unclear = {}
+        self._last_count = None
         self.outcome = "running"
         self.end_reason = ""
         jobs = self._jobs()
@@ -482,21 +512,36 @@ class Runner:
         state.restore_request_limit_rows = max_restore_rows(self.preset.max_pages)
         self._state = state
 
-        with self.stats.timed("导航", "切页置顶+布局复核"):
-            profile = self._prepare_navigation(hwnd, state)
-        if profile is None:
+        with self.stats.timed("导航", "筛选后准备"):
+            prep = self._prepare_navigation(hwnd, state)
+        if prep is None:
             self._set_status("job_empty", "筛选结果为空，继续下一任务")
             return
         # 先起第 1 批，再摆起点：跳号启动要按新视口覆盖批次计数（见 _seed_start_index）。
         state.start_first_batch()
-        if self.start_index > 0:
+        scan_snapshot = None
+        if prep.mode == VIEWPORT_SINGLE_SCREEN:
+            # 整屏可见：结果本来就都在当前画面里，上下端点同时成立，不置顶也不探底。
+            state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=prep.total)
+            state.confirm_viewport(
+                0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=True
+            )
+            scan_snapshot = prep.scan
+            self._set_status("batch", f"单屏：整屏 {prep.total} 个盘，直接处理")
+            self.log.info(
+                "viewport_mode=single_screen 筛选后总数=%s 完整可见格数=%d 相位=0 工作批次=%d",
+                prep.total,
+                len(scan_snapshot[0]) if scan_snapshot else 0,
+                state.work_batch_count,
+            )
+        elif self.start_index > 0:
             self._seed_start_index(hwnd, state, self.start_index)
+            self._set_status("batch", "首批网格起点")
         else:
             state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=False)
-        self._set_status("batch", "首批网格起点")
+            self._set_status("batch", "首批网格起点")
 
         up_counts: dict[int, int] = {}
-        scan_snapshot = None
 
         while True:
             self._checkpoint()
@@ -611,7 +656,7 @@ class Runner:
             if broke:
                 state.invalidate_position()
                 if restore_after_upgrade and not self._job_limit_reached():
-                    self._restore_position(hwnd, state)
+                    self._restore_position(hwnd, state, cells)
                 continue
             if self._job_limit_reached():
                 self._log_job_limit_reached()
@@ -673,43 +718,140 @@ class Runner:
             profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y
         )
 
-    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavProfile | None:
-        """置顶 → 以本轮实测布局复核 → 再次置顶（spec §5.1）。
+    def _read_label_lines(self, image):
+        """一次读列表区域（`LABEL_SCAN_AREA`），返回原始 OCR 行。
 
-        滚轮协议已由 `_ensure_profile` 在筛选前备好，这里只复核当次布局并再次置顶，
-        才获取正式首批网格。
+        数量解析、布局测量、单屏判定与首批扫描共用这一份结果：同一帧只识别一次，
+        避免准备、布局测量、正式扫描各抓一次图各认一次（改造方案 §7）。
         """
-        reset_to_top(hwnd)
+        from zzz_ddtool.ocr import read_rect
+
+        return read_rect(image, LABEL_SCAN_AREA)
+
+    def _grab_label_frame(self, hwnd: int):
+        """抓一帧并读出它的列表区域一次，返回 ``(image, lines)``。"""
         image, _method, _hwnd = grab_game_image(hwnd)
-        try:
-            origin, pitch = measure_layout(image)
-        except NavigationError:
-            if not is_empty_warehouse(image):
-                raise
-            self.log.info("筛选结果为空，正常结束当前任务")
-            self.trace.ok("drive_disc", "scan", "筛选结果为空（0 个盘），继续下一任务", image=image)
-            return None
+        return image, self._read_label_lines(image)
+
+    def _prepare_navigation(self, hwnd: int, state: TraversalState) -> NavigationPrep | None:
+        """筛选后准备（改造方案 §5.1）。
+
+        先读当前画面：结果整屏可见就直接返回单屏准备，不调用 `reset_to_top`、
+        不发送探底滚轮；否则只置顶一次建立已知顶部原点，再测一次布局进长列表遍历。
+
+        旧流程是「置顶 → 复核布局 → 再置顶」：两次置顶之间只有只读的布局测量与
+        参数更新，第二次没有独立效果，已删除。返回 None 表示筛选结果为空。
+        """
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("滚轮协议未就绪，停止任务链")
+
+        image, lines = self._grab_label_frame(hwnd)
+        origin: float | None = None
+        pitch: float | None = None
+        # 筛选面板刚关闭时画面可能还在动：读不到「等级」先重拍，别急着宣布空仓。
+        for attempt in range(max(1, self.preset.ocr_retry)):
+            try:
+                origin, pitch = measure_layout(image, lines=lines)
+                break
+            except NavigationError:
+                if is_empty_warehouse(image):
+                    self.log.info("筛选结果为空，正常结束当前任务")
+                    self.trace.ok(
+                        "drive_disc", "scan", "筛选结果为空（0 个盘），继续下一任务", image=image
+                    )
+                    return None
+                if attempt + 1 >= max(1, self.preset.ocr_retry):
+                    raise
+                self.log.warning("筛选后网格读不出「等级」标签，重拍第 %d 次", attempt + 1)
+                time.sleep(0.3)
+                image, lines = self._grab_label_frame(hwnd)
+        assert origin is not None and pitch is not None
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
         if reason:
             self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)
             raise RunnerError(f"网格布局不受支持：{reason}，停止任务链")
         self._origin_center_y = float(origin)
         self._row_pitch = float(pitch)
-
-        profile = self._profile
-        if profile is None:
-            raise RunnerError("滚轮协议未就绪，停止任务链")
         profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
         self._profile = profile
         state.navigation_profile = profile.as_dict()
-        reset_to_top(hwnd)
-        self.trace.ok(
-            "drive_disc",
-            "layout_check",
+
+        prep, note = self._confirm_single_screen(state, image=image, lines=lines)
+        if prep is not None:
+            self.trace.ok("drive_disc", "layout_check", self._layout_detail(profile), image=image)
+            self.trace.ok("drive_disc", "single_screen", note, image=image)
+            return prep
+
+        # 长列表：置顶一次建立已知顶部原点，再测一次布局取正式网格（方案 §5.1）。
+        with self.stats.timed("导航", "切页置顶"):
+            reset_to_top(hwnd)
+        image, lines = self._grab_label_frame(hwnd)
+        origin, pitch = measure_layout(image, lines=lines)
+        reason = check_layout_reference(origin, pitch, image.width(), image.height())
+        if reason:
+            self.trace.fail("drive_disc", "layout", f"网格布局不受支持：{reason}", image=image)
+            raise RunnerError(f"网格布局不受支持：{reason}，停止任务链")
+        self._origin_center_y = float(origin)
+        self._row_pitch = float(pitch)
+        profile = replace(profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y)
+        self._profile = profile
+        state.navigation_profile = profile.as_dict()
+        state.mark_viewport_mode(VIEWPORT_SCROLLING)
+        self.trace.ok("drive_disc", "layout_check", f"{self._layout_detail(profile)}；{note}", image=image)
+        return NavigationPrep(profile=profile, mode=VIEWPORT_SCROLLING)
+
+    def _layout_detail(self, profile: NavProfile) -> str:
+        return (
             f"原点 {self._origin_center_y:.1f} 行距 {self._row_pitch:.1f} "
-            f"协议 {profile.events_per_row}事件/行@{profile.event_interval_ms}ms",
+            f"协议 {profile.events_per_row}事件/行@{profile.event_interval_ms}ms"
         )
-        return profile
+
+    def _confirm_single_screen(
+        self, state: TraversalState, *, image, lines
+    ) -> tuple[NavigationPrep | None, str]:
+        """筛选结果是否整屏可见（改造方案 §4）。
+
+        成立返回 ``(单屏准备, 原因)``，准备里带上判定那一帧的扫描结果供主循环复用；
+        不成立返回 ``(None, 原因)``，调用方把原因写进审计日志后走长列表路径。
+        判定依据见 `traversal.single_screen_verdict`；数量优先从刚读的那一次 OCR 里取。
+        """
+        profile = self._profile
+        if profile is None:
+            raise RunnerError("滚轮协议未就绪，停止任务链")
+        capacity = GRID_COLS * GRID_ROWS
+        total = parse_warehouse_count(lines, width=image.width(), height=image.height())
+        if self.start_index > 0:
+            # 测试入口要求把视口摆到列表深处，与「整屏可见」互斥，直接走长列表路径。
+            return None, "测试跳号启动，跳过整屏判定"
+        if total is None:
+            return None, "仓库数量没识别出来，不确认整屏"
+        if total <= 0:
+            return None, f"仓库数量 {total}，按空结果处理"
+        if total > capacity:
+            return None, f"仓库数量 {total} 超过单屏容量 {capacity}"
+        if not is_page(image, DRIVE_DISC):
+            return None, "当前画面不是驱动盘仓库页，不确认整屏"
+        cells, problems, skips = self._scan_cells(state, image=image, lines=lines)
+        ok, reason = single_screen_verdict(
+            cells,
+            self._last_empties,
+            self._last_unclear,
+            total_count=total,
+        )
+        if ok and problems:
+            ok, reason = False, f"网格映射不完整：{problems[0]}"
+        if not ok:
+            return None, f"整屏判定不成立：{reason}"
+        return (
+            NavigationPrep(
+                profile=profile,
+                mode=VIEWPORT_SINGLE_SCREEN,
+                total=total,
+                scan=(cells, problems, skips),
+            ),
+            f"{reason}；未置顶、未探底，直接处理全部待处理行",
+        )
 
     def _seed_start_index(self, hwnd: int, state: TraversalState, start_index: int) -> None:
         """[测试入口] 把任务起点直接摆到指定内部序号，不真处理它前面的盘。
@@ -841,28 +983,36 @@ class Runner:
                     unclear[(row, col)] = "图标区占位不确定"
         return empties, unclear
 
-    def _scan_cells(self, state: TraversalState):
+    def _scan_cells(self, state: TraversalState, *, image=None, lines=None):
         """扫描当前视口 → (全部原始格位, 问题, 扫描跳过表)。
 
         行号由几何反推，不用 OCR 聚类序号；未映射/重复归列进 problems，调用方
         当作进度屏障重读（spec §5.5），不当空位。满级/装备/弃置格仍占全局格位，
         只记入 skips，不删号。
+
+        image/lines：调用方已经抓好图、读过列表区域时直接传进来，本函数不再抓图
+        不再识别（改造方案 §7：准备、布局测量与正式扫描共用同一份识别结果）。
         """
         from zzz_ddtool.equipped import (
             tile_has_discard_badge,
             tile_has_portrait,
         )
-        from zzz_ddtool.ocr import read_rect
 
-        image, page, _method, hwnd = self._grab(allow_esc=False)
-        if page != "drive_disc":
-            self.trace.fail(page, "scan", "当前不是驱动盘仓库，停止扫描", image=image)
-            raise RunnerError(f"扫描前页面错误：{page}，停止任务链")
+        if image is None:
+            image, page, _method, hwnd = self._grab(allow_esc=False)
+            if page != "drive_disc":
+                self.trace.fail(page, "scan", "当前不是驱动盘仓库，停止扫描", image=image)
+                raise RunnerError(f"扫描前页面错误：{page}，停止任务链")
         self._scan_image = image
+        if lines is None:
+            lines = self._read_label_lines(image)
+        self._last_count = parse_warehouse_count(
+            lines, width=image.width(), height=image.height()
+        )
 
         metrics = self._metrics(state, image)
         labels: list[tuple[float, float, int]] = []
-        for line in read_rect(image, LABEL_SCAN_AREA):
+        for line in lines:
             text = line.text.replace(" ", "")
             if not text.startswith("等级"):
                 continue
@@ -887,6 +1037,8 @@ class Runner:
         # 区原始占位，确认是游戏画的空格子才算合法空位；有盘漏读或占位拿不准都
         # 进 problems，作为进度屏障重读，重读耗尽后 failed，next_index 不越过缺口。
         empties, unclear = self._classify_empty_slots(metrics, state, image, cells)
+        self._last_empties = empties
+        self._last_unclear = unclear
         for (row, col), reason in sorted(unclear.items()):
             problems.append(f"屏幕第{row + 1}行第{col + 1}列{reason}")
         self._tail_slots_confirmed = tail_slots_confirmed(
@@ -1156,16 +1308,120 @@ class Runner:
 
     # ---------------------------------------------------------------- 强化后恢复
 
-    def _restore_position(self, hwnd: int, state: TraversalState) -> None:
-        """强化改变排序后，恢复保存的视口（spec §5.3、§6.3.5）。
+    def _restore_position(self, hwnd: int, state: TraversalState, cells=None) -> None:
+        """强化改变排序后回到仓库并继续（spec §5.3、§6.3.5；改造方案 §5.2、§6）。
 
-        「切页置顶 → 按保存视口批量返回」是完整的一次恢复尝试，最多两次；第二次
+        单屏任务走原地复核：列表本来就整屏可见，回到仓库后原地重读一次即可，
+        不切页、不滚轮。长列表仍走「切页置顶 → 按保存视口批量返回」。
+
+        cells：进入强化前那一批的扫描结果，用于强化前后快照对比（单屏路径用）。
+        """
+        if state.resume_point is None:
+            raise RunnerError("强化后没有保存的恢复点，停止任务链")
+        if state.viewport_mode == VIEWPORT_SINGLE_SCREEN and state.single_screen_total is not None:
+            self._restore_single_screen(hwnd, state, list(cells or ()))
+            return
+        self._restore_position_via_top(hwnd, state)
+
+    def _restore_single_screen(self, hwnd: int, state: TraversalState, cells) -> None:
+        """单屏任务强化后原地复核（改造方案 §5.2、§6）。
+
+        原地重读一次网格，四条同时成立才算复核通过：页面是驱动盘仓库、布局与相位
+        通过检查、总数与格位重新满足整屏判定、除刚强化那一件外没有其他可见变化。
+        通过就用新坐标继续（缓存新扫描给主循环，不新建工作批次、不重复计数）。
+
+        不通过分两种（方案 §6 表）：
+        - 布局或相位异常（含窗口尺寸变化、半行偏移）→ 放弃快速路径，回退到既有
+          置顶定位恢复；
+        - 总数减少、其他格位等级变化等成员/顺序变化 → 旧候选关联已失效，停止任务链。
+          切页置顶不能恢复物品原来的身份关联，所以不许把它当兜底。
+        """
+        before = grid_snapshot(cells, total=state.single_screen_total)
+        active_index = None if state.resume_point is None else state.resume_point.next_index - 1
+        attempts = max(1, self.preset.ocr_retry)
+        fallback_reason = ""
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
+            image, lines = self._grab_label_frame(hwnd)
+            if not is_page(image, DRIVE_DISC):
+                fallback_reason = "当前不是驱动盘仓库页"
+                break
+            try:
+                origin, pitch = measure_layout(image, lines=lines)
+            except NavigationError as exc:
+                fallback_reason = str(exc)
+                if attempt < attempts:
+                    time.sleep(0.3)
+                continue
+            reason = check_layout_reference(origin, pitch, image.width(), image.height())
+            if reason:
+                fallback_reason = reason
+                break
+            self._origin_center_y = float(origin)
+            self._row_pitch = float(pitch)
+            profile = self._profile
+            if profile is not None:
+                profile = replace(
+                    profile, row_pitch_px=self._row_pitch, origin_center_y=self._origin_center_y
+                )
+                self._profile = profile
+                state.navigation_profile = profile.as_dict()
+            cells_now, problems, skips = self._scan_cells(state, image=image, lines=lines)
+            total = self._last_count
+            ok, why = single_screen_verdict(
+                cells_now,
+                self._last_empties,
+                self._last_unclear,
+                total_count=total,
+            )
+            if ok and problems:
+                ok, why = False, f"网格映射不完整：{problems[0]}"
+            if not ok:
+                fallback_reason = why
+                self.log.warning("单屏原地复核第 %d 次不成立：%s", attempt, why)
+                if attempt < attempts:
+                    time.sleep(0.3)
+                continue
+            change = snapshot_change(
+                before, grid_snapshot(cells_now, total=total), active_index=active_index
+            )
+            if change:
+                # 成员或顺序变了：旧格位关联失效，绝不能按新序号继续（会漏盘）。
+                self.trace.fail(
+                    "drive_disc",
+                    "restore",
+                    f"强化后列表成员变化：{change}，旧候选关联失效，停止任务链",
+                    image=image,
+                )
+                raise RunnerError(f"强化后列表成员变化（{change}），停止任务链待关联规则完善")
+            self._restored_scan = (cells_now, problems, skips)
+            state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=total)
+            state.confirm_viewport(
+                0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=True
+            )
+            state.clear_resume()
+            self.trace.ok(
+                "drive_disc",
+                "single_screen_recheck",
+                f"原地复核通过：共 {total} 个盘整屏可见，其余格位无可见变化；未切页、未滚轮",
+                image=image,
+            )
+            return
+        self.log.warning("单屏原地复核未通过（%s），回退置顶定位恢复", fallback_reason)
+        self.trace.warn(
+            "drive_disc",
+            "restore_fallback",
+            f"单屏原地复核未通过：{fallback_reason}，回退置顶定位恢复",
+        )
+        self._restore_position_via_top(hwnd, state)
+
+    def _restore_position_via_top(self, hwnd: int, state: TraversalState) -> None:
+        """「切页置顶 → 按保存视口批量返回」是完整的一次恢复尝试，最多两次；第二次
         只用于可重试的运行误差（目标网格/相位暂时读不出、位移或端点不一致）。
         请求超上界、协议缺失、进入流程外错误页直接 failed，不做第二次。每次尝试
         后做一次目标网格校验扫描，成功即缓存给主循环，恢复流程不重复 OCR。
         """
-        if state.resume_point is None:
-            raise RunnerError("强化后没有保存的恢复点，停止任务链")
         if not state.within_restore_limit():
             raise RunnerError(
                 f"恢复请求 {state.restore_request_rows()} 行超过上界 "

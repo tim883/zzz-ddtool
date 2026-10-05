@@ -16,6 +16,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -282,14 +283,42 @@ def save_profile(profile: NavProfile) -> Path:
 
 # ---------------------------------------------------------------- 布局与锚点
 
+#: 仓库数量文字（「N/3000」里的 N）所在的小区域（1920×1080 设计坐标）。
+#: 它整块落在 `layout.LABEL_SCAN_AREA` 里，所以读列表那一次 OCR 就能顺带拿到数量，
+#: 不必为了判定整屏再补一次整屏识别。
+COUNT_AREA = (60, 105, 420, 175)
+_COUNT_PATTERN = re.compile(r"[\[【]?\s*(\d+)\s*[/／]\s*\d+")
+
+
+def parse_warehouse_count(lines, *, width: int, height: int) -> int | None:
+    """从已经读到的 OCR 行里取筛选后总盘数；读不到或读出多个不一致值返回 None。
+
+    区域限定在 `COUNT_AREA`，只用行中心落框内、且形如「N/总数」的行，避免把旁边
+    的按钮文字当成数量。返回 None 一律按「数量不可靠」处理——不能拿别的数（待处理
+    数、处理额度、卡片数量）顶替，整屏判定要求的是游戏显示的筛选后总数。
+    """
+    from zzz_ddtool.layout import scale_rect
+
+    left, top, right, bottom = scale_rect(*COUNT_AREA, width, height)
+    found: set[int] = set()
+    for line in lines:
+        center_x = (line.left + line.right) / 2.0
+        center_y = (line.top + line.bottom) / 2.0
+        if not (left <= center_x <= right and top <= center_y <= bottom):
+            continue
+        match = _COUNT_PATTERN.search(line.text.replace(" ", ""))
+        if match:
+            found.add(int(match.group(1)))
+    if len(found) != 1:
+        return None
+    return found.pop()
+
 
 def is_empty_warehouse(image) -> bool:
     """置顶后的驱动盘页：数量为零且全部格位为空才确认空结果。
 
     不把缺少等级标签或黑屏当作空列表。固定网格仅用于验证空占位，不替代布局测量。
     """
-    import re
-
     from zzz_ddtool.equipped import tile_is_empty
     from zzz_ddtool.layout import GRID_COLS, GRID_ROWS, GRID_ORIGIN, GRID_STEP, scale_point
     from zzz_ddtool.ocr import read_rect
@@ -297,8 +326,7 @@ def is_empty_warehouse(image) -> bool:
 
     if not is_page(image, DRIVE_DISC):
         return False
-    counts = [re.search(r"[\[【]?\s*(\d+)\s*[/／]\s*\d+", line.text)
-              for line in read_rect(image, (60, 105, 420, 175))]
+    counts = [_COUNT_PATTERN.search(line.text) for line in read_rect(image, COUNT_AREA)]
     if not any(match is not None and int(match.group(1)) == 0 for match in counts):
         return False
     return all(
@@ -310,19 +338,24 @@ def is_empty_warehouse(image) -> bool:
     )
 
 
-def measure_layout(image) -> tuple[float, float]:
+def measure_layout(image, *, lines=None) -> tuple[float, float]:
     """原点图测 (origin_center_y, row_pitch_px)（spec §4.1 第 1-2 条）。
 
     等级标签中心减去 `GRID_LABEL_DY` 得图标行中心，同行取中位数；相邻完整行
     中心差的中位数即行距。只有一行时用缩放后的既有布局值作只读参考，不做滚动
     标定。行距不由"请求移动一行"反推。
+
+    lines：已经读好的 `LABEL_SCAN_AREA` OCR 行。传了就不再抓一次、认一次——
+    准备阶段的数量解析、布局测量与首批扫描共用同一份识别结果（方案 §7）。
     """
     from zzz_ddtool.layout import GRID_LABEL_DY, LABEL_SCAN_AREA, scale_point
     from zzz_ddtool.ocr import read_rect
 
     width, height = image.width(), image.height()
+    if lines is None:
+        lines = read_rect(image, LABEL_SCAN_AREA)
     label_rows: list[float] = []
-    for line in read_rect(image, LABEL_SCAN_AREA):
+    for line in lines:
         text = line.text.replace(" ", "")
         if not text.startswith("等级"):
             continue
