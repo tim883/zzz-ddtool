@@ -344,23 +344,69 @@ def read_substats(
     return tuple(substats)
 
 
-def read_action_state(image: QImage) -> dict[str, bool]:
+#: R/T 提示的两个状态：提示关键词 + 「已生效」词。
+#: 真机实测（2026-10-05，86 帧仓库页截图，见 log/debug/action-text-summary.txt）：
+#: 未锁定 =「T 锁定」、已锁定 =「T 解除锁定」；未弃置 =「R 弃置」、已弃置 =「R 解除弃置」。
+#: **「解除」是两种状态共同的已生效词**，必须按它出现在哪个提示里归属——旧实现
+#: 「整行出现解除就判锁定」，把 26/26 帧已弃置盘判成了「已锁定、未弃置」。
+#: 「取消弃置」是旧文档记的写法，真机未见过，保留为兼容写法。
+_ACTION_PROMPTS = (
+    ("locked", "锁定", ("解除",)),
+    ("discarded", "弃置", ("解除", "取消")),
+)
+
+
+def _nearest_prompt(line, lines, anchors) -> str | None:
+    """把单独成行的「解除 / 取消」归到横向最近的提示；没有任何提示行时返回 None。
+
+    OCR 偶尔把「T」「解除锁定」拆成两行，更极端时会拆成「解除」「锁定」两行；
+    这时靠「解除」与哪组提示关键词在同一列附近来归属，而不是整行乱认。
+    """
+    best_key = None
+    best_dx = None
+    for key, indices in anchors.items():
+        for index in indices:
+            dx = abs(((line.left + line.right) - (lines[index].left + lines[index].right)) / 2.0)
+            if best_dx is None or dx < best_dx:
+                best_dx, best_key = dx, key
+    return best_key
+
+
+def read_action_state(image: QImage) -> dict[str, bool | None]:
     """读取仓库页右下角的 R/T 提示文字，判断锁定/弃置状态。
 
     未锁定显示「T 锁定」、已锁定显示「T 解除锁定」；未弃置显示「R 弃置」、
-    已弃置显示「R 取消弃置」。
+    已弃置显示「R 解除弃置」（真机实测写法，不是「取消弃置」）。
 
-    按「解除」「取消」这类**只在已生效状态出现**的词判断，不硬匹配整串：
-    OCR 经常把「T」和后面的词拆成两行（实测「T」「锁定」各一行），
-    整串匹配「解除锁定」会漏。未生效状态里不含这两个词，所以不会误判。
+    判读规则：
+    - 含「锁定」的行属于 T 提示、含「弃置」的行属于 R 提示，各自判断「解除 /
+      取消」是否出现在自己的提示里，互不串判；
+    - 认不出的提示返回 **None（未知）**，不默认成「未生效」。调用方据此重读，
+      仍未知时停止或拒绝盲按标签按键（未知不能当作未标记）。
+
+    真机 86 帧对账（面板文字 vs 格位标记）在本规则下 86/86 一致。
     """
-    state = {"locked": False, "discarded": False}
-    for line in read_rect(image, ACTION_ROW):
-        text = line.text
-        if "解除" in text:
-            state["locked"] = True
-        if "取消" in text or text == "已弃置":
-            state["discarded"] = True
+    lines = read_rect(image, ACTION_ROW)
+    texts = [line.text.replace(" ", "") for line in lines]
+    anchors = {
+        key: [index for index, text in enumerate(texts) if keyword in text]
+        for key, keyword, _words in _ACTION_PROMPTS
+    }
+    state: dict[str, bool | None] = {}
+    for key, keyword, active_words in _ACTION_PROMPTS:
+        group = anchors[key]
+        active = any(any(word in texts[index] for word in active_words) for index in group)
+        if not active:
+            # 「解除 / 取消」单独成行：按与哪组提示最近归属；自带提示词的行已按组处理。
+            for index, text in enumerate(texts):
+                if not any(word in text for word in active_words):
+                    continue
+                if any(prompt in text for _k, prompt, _w in _ACTION_PROMPTS):
+                    continue
+                if _nearest_prompt(lines[index], lines, anchors) == key:
+                    active = True
+                    break
+        state[key] = True if active else (False if group else None)
     return state
 
 

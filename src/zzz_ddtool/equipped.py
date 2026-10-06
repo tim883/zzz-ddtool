@@ -43,34 +43,79 @@ def tile_is_selected(image, cx: int, cy: int) -> bool:
     return abs((cx - left) - (right - cx)) <= 16
 
 
+# 格位「已装备」头像判据：右上角圆形角色头像。
+# 2026-10-05 用 4 帧真机截图、17 个格位（8 个有头像、9 个没有）逐一目视标定：
+# - 头像圆心约在格位图标中心 (cx+42, cy-50)、半径约 25px（1920×1080 设计坐标）；
+# - 判据一：头像窗口里「亮(pixel max>130)且非黄」像素占比——有头像 0.172~0.465、无头像 0~0.031；
+# - 判据二：头像内圈（8×8 设计像素）非黄像素平均亮度——有头像 55.9~182.4、无头像 20.3~41.0；
+# - 阈值取两档之间 0.10 / 48，两条同时成立才算有头像。
+# 旧判据（右上角 58%~98% 窗口里「饱和度>40」占比 ≥0.12）**会漏掉大部分头像**：
+# 实测 7/8 个有头像的格位被漏判（0.043~0.112 < 0.12），因为窗口只盖住头像左半边、
+# 又混进盘面立绘；也解释过为什么「跳过已装备」实际挡不住。
+# 黄色装饰角必须排除：实测它能把亮度类判据推到 0.22/121 的假阳性水平。
+PORTRAIT_BRIGHT_MIN = 130
+PORTRAIT_BRIGHT_FRACTION = 0.10
+PORTRAIT_INNER_MEAN = 48.0
+
+
+def _is_status_yellow(color) -> bool:
+    """盘面「S 徽章 / 黄色装饰角」的判据：高红高绿低蓝。"""
+    return color.red() > 180 and color.green() > 150 and color.blue() < 90
+
+
 def tile_has_portrait(image, left: int, top: int, right: int, bottom: int) -> bool:
-    """True if the tile's top-right corner has a circular character head (equipped)."""
+    """True if the tile's top-right corner has a circular character head (equipped).
+
+    入参是格位方框（调用方按图标中心 cx±56、cy±68 传）。头像窗口按同一套
+    相对几何取：x ∈ [left+78, left+118]、y ∈ [top-2, top+38]（1080p 实测），
+    内圈取 x ∈ [left+90, left+106]、y ∈ [top+10, top+26]。
+    """
     width = right - left
     height = bottom - top
     if width < 20 or height < 20:
         return False
-    x0 = left + int(width * 0.58)
-    y0 = top + int(height * 0.02)
-    x1 = left + int(width * 0.98)
-    y1 = top + int(height * 0.40)
-    colorful = 0
-    total = 0
-    step = max(1, (x1 - x0) // 16)
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
+    sx = width / 112.0
+    sy = height / 136.0
+
+    def _px(design_x: float, design_y: float) -> tuple[int, int]:
+        return left + round(design_x * sx), top + round(design_y * sy)
+
+    x0, y0 = _px(78, -2)
+    x1, y1 = _px(118, 38)
+    img_w, img_h = image.width(), image.height()
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(img_w, x1), min(img_h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return False
+
+    bright = total = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
             color = image.pixelColor(x, y)
+            if _is_status_yellow(color):
+                continue
             total += 1
-            r, g, b = color.red(), color.green(), color.blue()
-            mx, mn = max(r, g, b), min(r, g, b)
-            if mx - mn < 40:
-                continue
-            if r > 180 and g > 150 and b < 90:
-                continue
-            colorful += 1
-    return total > 0 and colorful / total >= 0.12
+            if max(color.red(), color.green(), color.blue()) > PORTRAIT_BRIGHT_MIN:
+                bright += 1
+    if total == 0 or bright / total < PORTRAIT_BRIGHT_FRACTION:
+        return False
+
+    ix0, iy0 = _px(90, 10)
+    ix1, iy1 = _px(106, 26)
+    ix0, iy0 = max(0, ix0), max(0, iy0)
+    ix1, iy1 = min(img_w, ix1), min(img_h, iy1)
+    values = [
+        max(image.pixelColor(x, y).red(), image.pixelColor(x, y).green(), image.pixelColor(x, y).blue())
+        for y in range(iy0, iy1)
+        for x in range(ix0, ix1)
+        if not _is_status_yellow(image.pixelColor(x, y))
+    ]
+    if not values:
+        return False
+    return sum(values) / len(values) >= PORTRAIT_INNER_MEAN
 
 
-def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
+def tile_has_discard_badge(image, cx: int, cy: int) -> bool | None:
     """格子右下角的纯红矩形小牌 = 已打弃置标。
 
     实拍标定（log/captures/verify-discard.png, 1920×1080）：
@@ -78,6 +123,9 @@ def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
     - 相对格子中心偏移约 (dx=+34, dy=+28)
     - 扫描区 (cx+20..cx+50, cy+15..cy+45)
     - 有标红像素 245+，无标 0；阈值 50 余量充足
+
+    返回 True（有红牌）/ False（没有）/ **None（拿不准，1~49 像素）**。拿不准时
+    调用方按配置决定：该状态配了跳过就重读、耗尽停止；没配就不阻塞。
     """
     red = 0
     w = image.width()
@@ -93,7 +141,53 @@ def tile_has_discard_badge(image, cx: int, cy: int) -> bool:
                 red += 1
                 if red >= 50:
                     return True
-    return False
+    return False if red == 0 else None
+
+
+# 格位「已锁定」标记：右下角与弃置标同槽位的**浅灰实心圆 + 黑色挂锁**。
+# 2026-10-05 标定（手册/参考图/驱动盘仓库/列表与侧栏.png 与 log/captures/20261005-161653/0007-扫描列表.png）：
+# - 圆盘 RGB(194,194,194)，直径约 26px，圆心相对格子图标中心约 (dx=+41, dy=+28)；
+# - 与紧随其后的详情帧 OCR「T 解除锁定」对照 43/43 一致；未锁定格无标记（灰像素 20~34）。
+# - 有标格灰像素 297~373、无标 20~34：≥120 判有、≤60 判没有，61~119 算**拿不准**（中间带无样本，保守处理）。
+LOCK_BADGE_GREY = 194
+LOCK_BADGE_GREY_TOLERANCE = 22
+LOCK_BADGE_NEUTRAL_TOLERANCE = 12
+LOCK_BADGE_MIN_HITS = 120
+LOCK_BADGE_MAX_NEGATIVE_HITS = 60
+
+
+def tile_has_lock_badge(image, cx: int, cy: int) -> bool | None:
+    """格子右下角的浅灰圆盘挂锁 = 已锁定。
+
+    与弃置标共用同一个槽位（弃置是红色圆盘），所以颜色判据必须分开：这里只数
+    「接近 194 的中性灰」像素，红盘不会被算成锁定。
+
+    返回 True（有锁标）/ False（没有）/ **None（拿不准）**。拿不准时调用方按配置
+    决定：该状态配了跳过就重读、耗尽停止；没配跳过就不阻塞（盘照常点开）。
+    """
+    hits = 0
+    w = image.width()
+    h = image.height()
+    for x in range(cx + 24, cx + 61):
+        if not (0 <= x < w):
+            continue
+        for y in range(cy + 12, cy + 47):
+            if not (0 <= y < h):
+                continue
+            color = image.pixelColor(x, y)
+            r, g, b = color.red(), color.green(), color.blue()
+            if (
+                abs(r - LOCK_BADGE_GREY) <= LOCK_BADGE_GREY_TOLERANCE
+                and abs(r - g) <= LOCK_BADGE_NEUTRAL_TOLERANCE
+                and abs(g - b) <= LOCK_BADGE_NEUTRAL_TOLERANCE
+            ):
+                hits += 1
+    if hits >= LOCK_BADGE_MIN_HITS:
+        return True
+    if hits <= LOCK_BADGE_MAX_NEGATIVE_HITS:
+        return False
+    return None
+
 
 
 

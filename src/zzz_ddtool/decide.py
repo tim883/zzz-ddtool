@@ -18,6 +18,12 @@ def decide(disc: Disc, preset: Preset, accepted_ids: Collection[str] | None = No
     score = score_disc(disc, weights)
     checkpoint = checkpoint_level(disc.level)
 
+    # 状态未知不能当「未标记」用（兄弟方案 §6）：要按该规则动作，就必须先确认真实状态。
+    # 调用方应先用重读确认；确认不了才走到这里，按 STOP 停链而不是静默放行。
+    if preset.skip_locked and disc.locked is None:
+        return _result(Action.STOP, "locked_state_unknown", score, useful_now, useful_max, checkpoint)
+    if preset.skip_discarded and disc.discarded is None:
+        return _result(Action.STOP, "discarded_state_unknown", score, useful_now, useful_max, checkpoint)
     if preset.skip_locked and disc.locked:
         return _result(Action.SKIP, "locked", score, useful_now, useful_max, checkpoint)
     if preset.skip_equipped and disc.equipped:

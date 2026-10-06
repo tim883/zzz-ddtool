@@ -17,7 +17,7 @@ import zzz_ddtool.screen as screen_module
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
-from zzz_ddtool.models import Action, Disc, Substat
+from zzz_ddtool.models import MAX_LEVEL, Action, Disc, Substat
 from zzz_ddtool.patterns import enumerate_filtered
 from zzz_ddtool.taskcards import effective_weights
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
@@ -1310,6 +1310,112 @@ def test_scan_flags_disc_without_level_label_as_barrier(monkeypatch):
 
     assert len(cells) == 34
     assert any("有盘但没读到等级" in problem for problem in problems)
+
+
+# ---------------------------------------------------------------- 状态识别与跳过（2026-10-05）
+
+
+def _stub_badges(monkeypatch, *, lock, discard, portrait):
+    """把三个格位判据换成替身；参数就是替身的返回值（None 表示拿不准）。"""
+    from zzz_ddtool import equipped as equipped_module
+
+    monkeypatch.setattr(equipped_module, "tile_has_lock_badge", lambda image, cx, cy: lock)
+    monkeypatch.setattr(equipped_module, "tile_has_discard_badge", lambda image, cx, cy: discard)
+    monkeypatch.setattr(equipped_module, "tile_has_portrait", lambda *args: portrait)
+
+
+def _scan_tail(monkeypatch, *, skip_locked=True, skip_discarded=False, skip_equipped=True, ocr_retry=3):
+    runner = tail_runner()
+    runner.trace = Mock()
+    runner.preset = replace(
+        runner.preset,
+        skip_locked=skip_locked,
+        skip_discarded=skip_discarded,
+        skip_equipped=skip_equipped,
+        ocr_retry=ocr_retry,
+    )
+    runner._grab = Mock(return_value=(tail_image(), "drive_disc", "test", 1))
+    return runner
+
+
+def test_scan_skips_locked_only_when_configured(monkeypatch):
+    """锁定：识别一律做，跳过由 YAML 的 skip_locked 决定（2026-10-05 计划 §3.2）。"""
+    _stub_badges(monkeypatch, lock=True, discard=False, portrait=False)
+
+    runner = _scan_tail(monkeypatch, skip_locked=True)
+    cells, problems, skips = runner._scan_cells(tail_state())
+    assert problems == []
+    expected = {cell.global_index for cell in cells if cell.level < MAX_LEVEL}
+    assert set(skips) == expected
+    assert all(reason == "已锁定" for index, reason in skips.items())
+
+    # 同一个识别结果，配置关闭 → 不跳过、不阻塞，照常进入后续处理
+    runner2 = _scan_tail(monkeypatch, skip_locked=False)
+    _cells2, problems2, skips2 = runner2._scan_cells(tail_state())
+    assert skips2 == {}
+    assert problems2 == []
+
+
+def test_scan_unclear_badge_blocks_only_when_configured(monkeypatch):
+    """拿不准：配了跳过才记问题走重读；没配跳过不阻塞（该盘照常点开）。"""
+    _stub_badges(monkeypatch, lock=None, discard=False, portrait=False)
+
+    runner = _scan_tail(monkeypatch, skip_locked=True)
+    _cells, problems, skips = runner._scan_cells(tail_state())
+    assert skips == {}
+    assert problems and all("锁定标记拿不准" in item for item in problems)
+
+    runner2 = _scan_tail(monkeypatch, skip_locked=False)
+    _cells2, problems2, _skips2 = runner2._scan_cells(tail_state())
+    assert not any("锁定标记拿不准" in item for item in problems2)
+
+
+def test_scan_unclear_badge_retries_then_fails(monkeypatch):
+    """拿不准配了跳过：重读 max(1, ocr_retry) 帧仍拿不准 → 整轮 failed，全程不点击。"""
+    _stub_badges(monkeypatch, lock=None, discard=False, portrait=False)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    runner = _scan_tail(monkeypatch, skip_locked=True, ocr_retry=2)
+    grabs = {"n": 0}
+
+    def grab(*args, **kwargs):
+        grabs["n"] += 1
+        return tail_image(), "drive_disc", "test", 1
+
+    runner._grab = grab
+    with pytest.raises(RunnerError, match="锁定标记拿不准"):
+        runner._scan_cells_with_retry(tail_state())
+    assert grabs["n"] == 2
+
+
+def test_equipped_skip_disabled_by_constant_and_restored(monkeypatch):
+    """装备判据由一处常量停用：默认不产生「已装备」跳过；常量翻回 True 旧行为恢复。"""
+    _stub_badges(monkeypatch, lock=False, discard=False, portrait=True)
+    runner = _scan_tail(monkeypatch, skip_equipped=True)
+
+    _cells, _problems, skips = runner._scan_cells(tail_state())
+    assert all(reason != "已装备" for reason in skips.values())
+    assert runner_module.SKIP_EQUIPPED_ENABLED is False
+
+    monkeypatch.setattr(runner_module, "SKIP_EQUIPPED_ENABLED", True)
+    _cells2, _problems2, skips2 = runner._scan_cells(tail_state())
+    assert skips2 and all(reason == "已装备" for reason in skips2.values())
+
+
+def test_already_discarded_is_counted_and_recorded(offline_runner, monkeypatch):
+    """口径（2026-10-05）：点开并读出盘面即计 1 件处理；"已弃置、维持不动"同样进结果
+    清单、记判定弃置，但不计"实际打标"（没按 R）。"""
+    runner = Runner(Preset(max_discs=1, accepted=()), hotkeys=False)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=4))
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: replace(sample_disc(), discarded=True))
+    monkeypatch.setattr(runner, "_act", Mock())
+    runner.run()
+
+    assert runner.outcome == "completed"
+    assert runner.processed_disc_count == 1
+    assert grid.visited == [(0, 0)]
+    assert [result.action for result in runner.results] == ["mark_discard"]
+    assert runner.stats.outcome_counts()["discarded"] == 1
+    assert runner.stats.discard_labels == 0
 
 
 def test_advance_requires_tail_placeholder_before_marking_bottom(monkeypatch):

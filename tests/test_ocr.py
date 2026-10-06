@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from PySide6.QtGui import QImage
@@ -20,12 +22,14 @@ from zzz_ddtool.ocr import (
     read_rect,
 )
 
-SAMPLE = "手册/样张/详情页.png"
+SAMPLE = Path(__file__).resolve().parents[1] / "手册" / "参考图" / "驱动盘详情" / "详情弹层.png"
 
 
 @pytest.fixture
 def sample_image() -> QImage:
-    return QImage(SAMPLE)
+    image = QImage(str(SAMPLE))
+    assert not image.isNull(), f"参考图缺失或无法解码：{SAMPLE}"
+    return image
 
 
 def test_fix_percent() -> None:
@@ -113,8 +117,8 @@ def test_ocr_fixes_resolve_to_the_right_substat() -> None:
 
 
 def test_read_level(sample_image: QImage) -> None:
-    # 详情页等级文字 OCR 有误差（03 可能读成 00），只验证能读到数字
-    assert read_level(sample_image) is not None
+    # 此归档图实际等级为 0；读到其他数字也必须失败。
+    assert read_level(sample_image) == 0
 
 
 def test_level_cap_decides_rarity(monkeypatch) -> None:
@@ -255,28 +259,44 @@ def test_upgrade_level_digit_bottom_not_clipped() -> None:
 
 
 def test_read_action_state_uses_words_only_present_when_active(monkeypatch) -> None:
-    """锁定/弃置按「解除」「取消」判断，不硬匹配整串。
+    """锁定/弃置各按「自己的提示里有没有生效词」判断，不整行乱认。
 
-    实拍仓库页 OCR 会把「T」和后面的词拆成两行（「T」「锁定」各一行），只匹配
-    「解除锁定」会漏掉已锁定的盘——这正是 B1 挂着的直接原因。未生效状态里不含
-    这两个词，所以放宽不会误判。
+    2026-10-05 真机 86 帧对账（log/debug/action-text-summary.txt）：未锁定 =
+    「T 锁定」、已锁定 =「T 解除锁定」；未弃置 =「R 弃置」、**已弃置 =「R 解除弃置」
+    （不是旧文档写的「取消弃置」）**。旧写法整行见「解除」就判锁定，把 26/26 帧
+    已弃置盘判成「已锁定、未弃置」——两个字都错。
     """
     from zzz_ddtool import ocr
 
-    def patch(texts):
-        monkeypatch.setattr(
-            ocr, "read_rect", lambda *args: [ocr.OcrLine(t, 1.0, 0, 0, 100, 20) for t in texts]
-        )
+    def patch(entries):
+        """entries: [(文本, 中心 x)]；模拟仓库页 R 提示在左、T 提示在右。"""
+        lines = [
+            ocr.OcrLine(text, 1.0, center_x - 40, 0, center_x + 40, 20)
+            for text, center_x in entries
+        ]
+        monkeypatch.setattr(ocr, "read_rect", lambda *args: lines)
 
-    patch(["R", "弃置", "T", "锁定", "UID: 32810691"])
+    patch([("R", 1650), ("弃置", 1710), ("T", 1850), ("锁定", 1900), ("UID: 32810691", 1780)])
     assert read_action_state(QImage()) == {"locked": False, "discarded": False}
 
-    patch(["R", "取消弃置", "T", "解除锁定"])
-    assert read_action_state(QImage()) == {"locked": True, "discarded": True}
+    # 真机写法：已弃置盘显示「R 解除弃置」，不能被判成已锁定。
+    patch([("R", 1650), ("解除弃置", 1710), ("T", 1850), ("锁定", 1900)])
+    assert read_action_state(QImage()) == {"locked": False, "discarded": True}
 
-    # 四个字被 OCR 拆开也要认出来
-    patch(["T", "解除", "R", "取消"])
-    assert read_action_state(QImage()) == {"locked": True, "discarded": True}
+    patch([("R", 1650), ("弃置", 1710), ("T", 1850), ("解除锁定", 1900)])
+    assert read_action_state(QImage()) == {"locked": True, "discarded": False}
+
+    # 旧文档写法「取消弃置」仍兼容。
+    patch([("R", 1650), ("取消弃置", 1710), ("T", 1850), ("锁定", 1900)])
+    assert read_action_state(QImage()) == {"locked": False, "discarded": True}
+
+    # 「解除」「锁定」被 OCR 拆成两行时，按与哪组提示同列归属。
+    patch([("T", 1850), ("解除", 1900), ("锁定", 1910)])
+    assert read_action_state(QImage()) == {"locked": True, "discarded": None}
+
+    # 连提示词都读不到：两个状态都未知，不能默认成「没标记」。
+    patch([("T", 1850), ("解除", 1880), ("R", 1650), ("取消", 1680)])
+    assert read_action_state(QImage()) == {"locked": None, "discarded": None}
 
 
 def test_warehouse_action_row_replay() -> None:
@@ -290,9 +310,9 @@ def test_parse_disc(sample_image: QImage) -> None:
     disc = parse_disc(sample_image)
     assert disc is not None
     names = [sub.name for sub in disc.substats]
-    assert "防御力" in names
-    assert "攻击力%" in names
-    assert "暴击率" in names
+    assert set(names) == {"防御力", "攻击力%", "暴击率"}
+    assert len(names) == 3
+    assert disc.level == 0
 
 
 def test_warehouse_sidebar_regression() -> None:
@@ -333,11 +353,7 @@ def test_zoom_level_area_regression() -> None:
     image = QImage("tests/fixtures/zoom-preview-level00.png")
     assert not image.isNull()
     texts = [line.text.replace(" ", "") for line in read_rect(image, Runner.ZOOM_LEVEL_AREA)]
-    assert any("等级" in text for text in texts), texts
-    # 2026-10-02：原先这里还有一条反面对照——断言旧区 (1100,150,1550,300) 读不出「等级」，
-    # 用「旧区确实坏」来反证收紧有效。c 优化把 Det.limit_side_len 由 736 降到 160 后，
-    # 旧区在同一张图上也能读出「等级00」（实得 ['15','等级00','主属性']），对照前提不再成立，故删除。
-    # 本回归的有效断言就是上面那条：收紧后的 ZOOM_LEVEL_AREA 能稳定读到「等级」。
+    assert read_level(image, Runner.ZOOM_LEVEL_AREA) == 0, texts
 
 
 def test_level_rejects_unrelated_numbers(monkeypatch) -> None:

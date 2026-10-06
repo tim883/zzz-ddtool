@@ -94,6 +94,11 @@ _FORWARD_ROWS = 2
 # 恢复批量滚动后的兜底稳定等待；标定给出 settle_wait_ms 时优先用它
 _SETTLE_FALLBACK_MS = 500
 
+# 装备判据暂不启用：判据缺独立答案卷、识别不准（2026-10-05 用户确认，后续要恢复）。
+# 恢复方法：本常量改回 True 即可；tile_has_portrait、YAML 的 skip_equipped 字段、界面控件
+# 与扫描分支全部原样保留，无需其他改动。
+SKIP_EQUIPPED_ENABLED = False
+
 
 class RunnerError(RuntimeError):
     pass
@@ -989,6 +994,7 @@ class Runner:
         """
         from zzz_ddtool.equipped import (
             tile_has_discard_badge,
+            tile_has_lock_badge,
             tile_has_portrait,
         )
 
@@ -1051,7 +1057,26 @@ class Runner:
             if self.preset.skip_max_level and cell.level >= MAX_LEVEL:
                 skips[cell.global_index] = f"等级 {cell.level} 已满"
                 continue
-            if self.preset.skip_equipped and tile_has_portrait(
+            # 状态识别一律做；**是否因此跳过由任务 YAML 决定**（识别与处理分开，2026-10-05 计划 §3.2）。
+            lock_state = tile_has_lock_badge(image, cell.center_x, cell.center_y)
+            discard_state = tile_has_discard_badge(image, cell.center_x, cell.center_y)
+            if self.preset.skip_locked and lock_state is True:
+                skips[cell.global_index] = "已锁定"
+                continue
+            if self.preset.skip_discarded and discard_state is True:
+                skips[cell.global_index] = "已打弃置标记"
+                continue
+            # 拿不准且该状态配了跳过（会改变处理决定）→ 记问题，交给重读；耗尽后停链。
+            # 没配跳过的状态即使拿不准也不阻塞：该盘照常点开，状态在点开后读。
+            if self.preset.skip_locked and lock_state is None:
+                problems.append(
+                    f"屏幕第{cell.screen_row0 + 1}行第{cell.screen_col0 + 1}列锁定标记拿不准"
+                )
+            if self.preset.skip_discarded and discard_state is None:
+                problems.append(
+                    f"屏幕第{cell.screen_row0 + 1}行第{cell.screen_col0 + 1}列弃置标记拿不准"
+                )
+            if SKIP_EQUIPPED_ENABLED and self.preset.skip_equipped and tile_has_portrait(
                 image,
                 cell.center_x - 56,
                 cell.center_y - 68,
@@ -1186,11 +1211,15 @@ class Runner:
             self._set_status("upgrade_done", f"next_index={state.next_index}", cell_tag)
             return "upgrade"
         if decision.action == Action.MARK_DISCARD and disc.discarded:
-            self.log.info("cell %s already discarded, re-judge keeps it (no count)", cell_tag)
-            self.trace.note(f"{where} 已经打过弃置标记，不动")
+            # 口径（2026-10-05）：点开并读出盘面就已计 1 件处理；这里维持弃置标记不动，
+            # 结果清单同样记一条——凡点击过的盘都出现在清单里，判定弃置计数照记、实际打标不记。
+            self._record(job, disc, decision)
+            self.log.info("cell %s already discarded, re-judge keeps it (counted as processed)", cell_tag)
+            self.trace.note(f"{where} 已经打过弃置标记，维持不动；本件已计 1 件处理")
         elif decision.action == Action.SKIP and disc.discarded:
-            self.log.info("cell %s has discard tag, skip (no count)", cell_tag)
-            self.trace.note(f"{where} 有弃置标记，跳过")
+            self._record(job, disc, decision)
+            self.log.info("cell %s has discard tag, skip (counted as processed)", cell_tag)
+            self.trace.note(f"{where} 有弃置标记，跳过；本件已计 1 件处理")
         else:
             self._record(job, disc, decision)
             self._act(hwnd, decision.action, disc)
