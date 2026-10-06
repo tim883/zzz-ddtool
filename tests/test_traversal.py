@@ -786,6 +786,53 @@ def test_snapshot_change_rejects_active_level_drop():
     assert snapshot_change(before, after, active_index=0) is not None
 
 
+@pytest.mark.parametrize("insert_at", [1, 2, 3])
+def test_snapshot_change_allows_verified_upgrade_prefix_insertion(insert_at):
+    old = [15, 9, 9, 6, 3, 0, 0]
+    new = old.copy()
+    new.pop(5)
+    new.insert(insert_at, 9)
+    before = GridSnapshot(7, dict(enumerate(old)))
+    after = GridSnapshot(7, dict(enumerate(new)))
+    assert snapshot_change(before, after, active_index=5, resolved_prefix=6, upgraded_level=9) is None
+    assert snapshot_change(before, after, active_index=5) is not None
+
+
+@pytest.mark.parametrize("case", [
+    "wrong_level", "wrong_same_slot", "unchanged", "suffix", "count",
+    "non_descending", "unfinished_prefix",
+])
+def test_snapshot_change_rejects_unexplained_upgrade_reorder(case):
+    old = [15, 9, 6, 0, 0]
+    new = [15, 9, 6, 3, 0]
+    level, prefix, count = 3, 4, 5
+    if case == "wrong_level":
+        new = [15, 9, 9, 6, 0]
+        # 强化结果为 3，画面却显示 9 的前移。
+        level = 3
+    elif case == "wrong_same_slot":
+        level = 9
+    elif case == "unchanged":
+        new = old.copy()
+    elif case == "suffix":
+        new[-1] = 3
+    elif case == "count":
+        count = 4
+        new.pop()
+    elif case == "non_descending":
+        old = [9, 15, 6, 0, 0]
+        new = [15, 9, 3, 6, 0]
+    else:
+        prefix = 3
+        new = [15, 9, 3, 6, 0]
+    reason = snapshot_change(
+        GridSnapshot(5, dict(enumerate(old))),
+        GridSnapshot(count, dict(enumerate(new))),
+        active_index=3, resolved_prefix=prefix, upgraded_level=level,
+    )
+    assert reason is not None
+
+
 def test_snapshot_change_detects_total_change():
     before = grid_snapshot([_cell(0, 0)], total=9)
     after = grid_snapshot([_cell(0, 0)], total=8)

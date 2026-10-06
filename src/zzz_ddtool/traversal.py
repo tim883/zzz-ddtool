@@ -523,12 +523,19 @@ def grid_snapshot(
     )
 
 
-def snapshot_change(before: GridSnapshot, after: GridSnapshot, *, active_index: int | None = None) -> str | None:
+def snapshot_change(
+    before: GridSnapshot,
+    after: GridSnapshot,
+    *,
+    active_index: int | None = None,
+    resolved_prefix: int | None = None,
+    upgraded_level: int | None = None,
+) -> str | None:
     """强化前后快照的可观察变化；没有变化返回 None（方案 §6）。
 
-    只有「刚强化的那一件」允许等级上升；其余任何等级变化、可见格位集合变化或
-    总数变化都说明列表成员/顺序动了，旧的格位进度不再有效——此时绝不能继续按
-    `next_index` 往下走（某盘退出筛选后，后面的盘会补位，直接沿用会漏盘）。
+    默认只允许当前格等级上升。调用方提供已提交前缀和强化页确认的最终等级时，
+    允许该盘按等级降序插入已解决前缀；数量、完整格位集合及未解决后缀必须不变。
+    不按图片认物品身份；依赖 G04 的其他盘相对顺序稳定，不支持成员退出。
 
     注意：切页置顶并不能恢复物品的身份关联，所以这里报出变化就必须停，不许用
     「回退到置顶」把它盖过去。
@@ -544,12 +551,38 @@ def snapshot_change(before: GridSnapshot, after: GridSnapshot, *, active_index: 
         if extra:
             parts.append(f"多了格位 {extra}")
         return "可见格位集合变化（" + "；".join(parts) + "）"
+    if (
+        active_index is not None
+        and resolved_prefix is not None
+        and upgraded_level is not None
+        and before.total is not None
+        and set(before.levels) == set(range(before.total))
+        and 0 <= active_index < resolved_prefix <= before.total
+        and upgraded_level > before.levels[active_index]
+    ):
+        old = [before.levels[index] for index in range(before.total)]
+        new = [after.levels[index] for index in range(before.total)]
+        prefix = old[:resolved_prefix]
+        prefix.pop(active_index)
+        prefix.append(upgraded_level)
+        if (
+            old == sorted(old, reverse=True)
+            and new[:resolved_prefix] == sorted(prefix, reverse=True)
+            and new[resolved_prefix:] == old[resolved_prefix:]
+        ):
+            return None
+    if (
+        upgraded_level is not None
+        and active_index in before.levels
+        and upgraded_level != before.levels[active_index]
+    ):
+        return f"列表变化无法由本件确认升至 {upgraded_level} 级解释"
     for index in sorted(before.levels):
         old_level = before.levels[index]
         new_level = after.levels[index]
         if old_level == new_level:
             continue
-        if index == active_index and new_level > old_level:
+        if index == active_index and new_level > old_level and upgraded_level is None:
             continue  # 刚强化完的那件盘，等级上升是预期变化
         return f"第 {index} 格等级 {old_level} → {new_level}"
     return None

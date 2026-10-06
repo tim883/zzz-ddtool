@@ -79,6 +79,8 @@ ACTION_NAMES = {
     # 整屏可见的快速路径：确认整屏（筛选后）、原地复核（强化后）、回退置顶恢复。
     "single_screen": "整屏确认",
     "single_screen_recheck": "强化后原地复核",
+    "recovery_cache": "复用未处理候选",
+    "scan_cache": "复用列表候选",
     "restore_fallback": "回退置顶恢复",
 }
 

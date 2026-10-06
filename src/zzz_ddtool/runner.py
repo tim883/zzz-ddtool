@@ -36,6 +36,7 @@ from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc, next_stage_level
 from zzz_ddtool.nav import NavError, goto_warehouse, reset_to_top
 from zzz_ddtool.navigation import (
+    COUNT_AREA,
     NavigationError,
     NavProfile,
     calibrate,
@@ -128,6 +129,19 @@ class NavigationPrep:
     scan: tuple | None = None
 
 
+@dataclass(frozen=True)
+class RecoveryCache:
+    """本批已验证的候选；只在同任务、同筛选、同尺寸下恢复使用。"""
+
+    job_id: str
+    filter_signature: str
+    width: int
+    height: int
+    total: int | None
+    cells: tuple[GridCell, ...]
+    skips: dict[int, str]
+
+
 class Runner:
     """执行一个 Preset。任务链为空时，用 preset 当前槽位合成一个默认任务。"""
 
@@ -172,6 +186,7 @@ class Runner:
         self._row_pitch: float = 175.0
         # 强化后恢复时的校验扫描结果，直接交给主循环复用（避免重复 OCR 目标列表）
         self._restored_scan: tuple | None = None
+        self._restored_scan_reused = False
         # 最近一次扫描的末尾占位判定（spec §5.4）：只有它和锚点端点行为同时成立
         # 才允许把视口标记为到底。
         self._tail_slots_confirmed = False
@@ -350,6 +365,7 @@ class Runner:
         self._status_lines = []
         self._state = None
         self._restored_scan = None
+        self._restored_scan_reused = False
         self._tail_slots_confirmed = False
         self._last_empties = set()
         self._last_unclear = {}
@@ -516,6 +532,8 @@ class Runner:
         )
         state.restore_request_limit_rows = max_restore_rows(self.preset.max_pages)
         self._state = state
+        self._restored_scan = None
+        self._restored_scan_reused = False
 
         with self.stats.timed("导航", "筛选后准备"):
             prep = self._prepare_navigation(hwnd, state)
@@ -559,23 +577,28 @@ class Runner:
                 )
                 break
 
+            reused = False
             if scan_snapshot is not None:
                 cells, problems, skips = scan_snapshot
                 scan_snapshot = None
             elif self._restored_scan is not None:
                 cells, problems, skips = self._restored_scan
+                reused = self._restored_scan_reused
                 self._restored_scan = None
+                self._restored_scan_reused = False
             else:
                 cells, problems, skips = self._scan_cells_with_retry(state)
+            recovery_cache = self._make_recovery_cache(state, cells, skips)
             ready, deferred = split_stable_cells(
                 cells, at_top=state.at_top, at_bottom=state.at_bottom
             )
-            self.stats.scan(
-                cells,
-                skips,
-                len(deferred),
-                max_index=max((cell.global_index for cell in cells), default=None),
-            )
+            if not reused:
+                self.stats.scan(
+                    cells,
+                    skips,
+                    len(deferred),
+                    max_index=max((cell.global_index for cell in cells), default=None),
+                )
             for cell in deferred:
                 state.block(cell.global_index, CellStatus.DEFERRED)
             for index, reason in skips.items():
@@ -608,11 +631,11 @@ class Runner:
             )
             self.trace.ok(
                 "drive_disc",
-                "scan",
+                "scan_cache" if reused else "scan",
                 f"第 {state.work_batch_count} 批：待处理 {len(pending)}，跳过 {len(skips)}",
                 image=self._scan_image,
             )
-            self._set_status("scanning", f"batch {state.work_batch_count}: {len(pending)} cells")
+            self._set_status("reusing" if reused else "scanning", f"batch {state.work_batch_count}: {len(pending)} cells")
 
             if not pending:
                 if state.at_bottom:
@@ -651,8 +674,8 @@ class Runner:
                 )
                 if result in ("rescan", "upgrade"):
                     broke = True
-                    # 强化改变排序：本批坐标作废（spec §6.3.5）。未达处理上限且未停止时，
-                    # 置顶并按保存视口恢复，再从 next_index 重建候选。
+                    # 升级前移只影响已解决前缀。未达额度时复用本批未处理候选；
+                    # 单屏直接简查，长列表恢复保存视口后换算坐标。
                     restore_after_upgrade = result == "upgrade"
                     break
                 state.set_status(cell.global_index, CellStatus.DONE)
@@ -661,7 +684,7 @@ class Runner:
             if broke:
                 state.invalidate_position()
                 if restore_after_upgrade and not self._job_limit_reached():
-                    self._restore_position(hwnd, state, cells)
+                    self._restore_position(hwnd, state, cells, cache=recovery_cache)
                 continue
             if self._job_limit_reached():
                 self._log_job_limit_reached()
@@ -1085,11 +1108,6 @@ class Runner:
             ):
                 skips[cell.global_index] = "已装备"
                 continue
-            if self.preset.skip_discarded and tile_has_discard_badge(
-                image, cell.center_x, cell.center_y
-            ):
-                skips[cell.global_index] = "已打弃置标记"
-                continue
         return cells, problems, skips
 
     def _scan_cells_with_retry(self, state: TraversalState):
@@ -1194,7 +1212,7 @@ class Runner:
             # 强化后的焦点不覆盖它。
             state.begin_upgrade(cell.global_index)
             if self._enter_upgrade_page(hwnd):
-                self._upgrade_loop(
+                self._verified_upgrade_level = self._upgrade_loop(
                     hwnd,
                     job,
                     cell.global_index,
@@ -1331,32 +1349,144 @@ class Runner:
 
     # ---------------------------------------------------------------- 强化后恢复
 
-    def _restore_position(self, hwnd: int, state: TraversalState, cells=None) -> None:
+    def _make_recovery_cache(self, state, cells, skips) -> RecoveryCache | None:
+        image = self._scan_image
+        if image is None or image.isNull() or not cells or not state.position_valid:
+            return None
+        if getattr(self, "_last_count", None) is None:
+            return None
+        ordered = sorted(cells, key=lambda cell: cell.global_index)
+        levels = [cell.level for cell in ordered]
+        if any(level < 0 for level in levels) or levels != sorted(levels, reverse=True):
+            return None
+        return RecoveryCache(
+            state.job_id, state.filter_signature, image.width(), image.height(),
+            self._last_count, tuple(ordered), dict(skips),
+        )
+
+    def _recovery_summary(self, image, state, cache) -> None:
+        """只核对页面、尺寸与标题数量；不读全网格等级/状态。"""
+        from zzz_ddtool.ocr import read_rect
+
+        if (state.job_id, state.filter_signature) != (cache.job_id, cache.filter_signature):
+            raise RunnerError("恢复缓存任务或筛选签名已变化，停止任务链")
+        if (image.width(), image.height()) != (cache.width, cache.height):
+            raise NavigationError("恢复时窗口尺寸改变，缓存坐标不可用")
+        if not is_page(image, DRIVE_DISC):
+            raise NavigationError("恢复时未确认驱动盘仓库页")
+        if cache.total is not None:
+            total = parse_warehouse_count(
+                read_rect(image, COUNT_AREA), width=image.width(), height=image.height()
+            )
+            if total is None:
+                raise NavigationError("恢复时标题数量读不清")
+            if total != cache.total:
+                raise RunnerError(f"恢复时仓库数量 {cache.total} → {total}，缓存编号失效，停止任务链")
+
+    # 单列位置检查只使用等级文字的位置，不读取等级数值、不生成候选或判断标记。
+    RECOVERY_COLUMN_AREA = (100, 200, 230, 945)
+
+    def _recovery_column_lines(self, image):
+        from zzz_ddtool.ocr import read_rect
+
+        return read_rect(image, self.RECOVERY_COLUMN_AREA)
+
+    def _recovery_position_reason(self, image, state) -> str | None:
+        metrics = self._metrics(state, image)
+        rows = []
+        for line in self._recovery_column_lines(image):
+            if not line.text.replace(" ", "").startswith("等级"):
+                continue
+            icon_y = metrics.icon_center_of_label((line.top + line.bottom) / 2)
+            row = metrics.screen_row_of(icon_y, state.row_phase_px or 0.0)
+            if row is None or not 0 <= row < GRID_ROWS:
+                return "恢复目标单列行位置/相位不匹配"
+            rows.append(row)
+        if len(set(rows)) < 2 or len(rows) != len(set(rows)):
+            return "恢复目标单列行位置证据不足"
+        return None
+
+    def _reuse_recovery_cache(self, state, cache, image) -> None:
+        self._checkpoint()
+        metrics = self._metrics(state, image)
+        top, phase = state.viewport_top_row0, state.row_phase_px
+        cells = [replace(
+            cell,
+            screen_row0=cell.global_row0 - top,
+            center_x=int(round(metrics.center_x_of(cell.global_col0))),
+            center_y=int(round(metrics.row_center_y(cell.global_row0, top, phase))),
+        ) for cell in cache.cells]
+        # 已解决前缀的旧等级/标记不再用于决策；保留格位几何仅供下一次前进选锚点。
+        skips = {index: reason for index, reason in cache.skips.items() if index >= state.next_index}
+        self._scan_image = image
+        self._restored_scan = (cells, [], skips)
+        self._restored_scan_reused = True
+        state.clear_resume()
+        self.trace.ok(
+            "drive_disc", "recovery_cache",
+            f"复用未处理候选：next_index={state.next_index}，未重扫等级/标签，工作批次不变",
+            image=image,
+        )
+
+    def _restore_position(self, hwnd: int, state: TraversalState, cells=None, *, cache=None) -> None:
         """强化改变排序后回到仓库并继续（spec §5.3、§6.3.5；改造方案 §5.2、§6）。
 
-        单屏任务走原地复核：列表本来就整屏可见，回到仓库后原地重读一次即可，
-        不切页、不滚轮。长列表仍走「切页置顶 → 按保存视口批量返回」。
+        有本批缓存时，单屏只确认页面/尺寸/数量，长列表置顶返回保存视口后只核对
+        单列标签位置；复用未处理候选，不再扫描全网格等级/状态。
+        缓存缺失或简查证据不足才走原有重扫分支；不支持成员退出。
 
-        cells：进入强化前那一批的扫描结果，用于强化前后快照对比（单屏路径用）。
+        cells：进入强化前的格位，供异常后备复核；cache 为本批已确认的恢复缓存。
         """
         if state.resume_point is None:
             raise RunnerError("强化后没有保存的恢复点，停止任务链")
+        self._checkpoint()
+        if cache is not None:
+            if (state.job_id, state.filter_signature) != (cache.job_id, cache.filter_signature):
+                raise RunnerError("恢复缓存任务或筛选签名已变化，停止任务链")
+            if state.viewport_mode != VIEWPORT_SINGLE_SCREEN:
+                self._restore_position_via_top(hwnd, state, cache=cache)
+                return
+            for attempt in range(max(1, self.preset.ocr_retry)):
+                self._checkpoint()
+                image = self._grab(allow_esc=False, need_page=False)[0]
+                try:
+                    self._recovery_summary(image, state, cache)
+                    reason = check_layout_reference(
+                        self._origin_center_y, self._row_pitch, image.width(), image.height()
+                    )
+                    if reason:
+                        raise NavigationError(reason)
+                except NavigationError as exc:
+                    self.log.warning("单屏恢复简查第 %d 次失败：%s", attempt + 1, exc)
+                    if attempt + 1 < max(1, self.preset.ocr_retry):
+                        time.sleep(0.3)
+                    continue
+                state.confirm_viewport(0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=True)
+                self._reuse_recovery_cache(state, cache, image)
+                return
+            self.trace.warn("drive_disc", "restore_fallback", "单屏页面/数量简查耗尽，异常路径重扫")
         if state.viewport_mode == VIEWPORT_SINGLE_SCREEN and state.single_screen_total is not None:
-            self._restore_single_screen(hwnd, state, list(cells or ()))
+            if cache is None:
+                self._restore_single_screen(hwnd, state, list(cells or ()))
+            else:
+                self._restore_single_screen(hwnd, state, list(cells or ()), cache=cache)
             return
         self._restore_position_via_top(hwnd, state)
 
-    def _restore_single_screen(self, hwnd: int, state: TraversalState, cells) -> None:
+    def _restore_single_screen(self, hwnd: int, state: TraversalState, cells, *, cache=None) -> None:
         """单屏任务强化后原地复核（改造方案 §5.2、§6）。
 
-        原地重读一次网格，四条同时成立才算复核通过：页面是驱动盘仓库、布局与相位
-        通过检查、总数与格位重新满足整屏判定、除刚强化那一件外没有其他可见变化。
+        仅在缓存缺失或正常简查失败时调用。页面、布局/相位与完整覆盖证据须成立；
+        缓存可用时只核对数量和未处理后缀，不比较已过时的前缀等级。
+        无缓存时保留原有强化前后快照核对。
         通过就用新坐标继续（缓存新扫描给主循环，不新建工作批次、不重复计数）。
 
-        不通过分两种（方案 §6 表）：
+        后备复核区分以下情况：
         - 布局或相位异常（含窗口尺寸变化、半行偏移）→ 放弃快速路径，回退到既有
           置顶定位恢复；
-        - 总数减少、其他格位等级变化等成员/顺序变化 → 旧候选关联已失效，停止任务链。
+        - 本件升级后在已解决前缀内按等级降序前移 → 核对强化页确认的最终等级及
+          未解决后缀，使用新坐标继续，next_index 不回退；
+        - 数量减少、无法由本件升级解释的等级/后缀变化 → 停止任务链。
           切页置顶不能恢复物品原来的身份关联，所以不许把它当兜底。
         """
         before = grid_snapshot(cells, total=state.single_screen_total)
@@ -1406,9 +1536,19 @@ class Runner:
                 if attempt < attempts:
                     time.sleep(0.3)
                 continue
-            change = snapshot_change(
-                before, grid_snapshot(cells_now, total=total), active_index=active_index
-            )
+            if cache is None:
+                change = snapshot_change(
+                    before,
+                    grid_snapshot(cells_now, total=total),
+                    active_index=active_index,
+                    resolved_prefix=state.next_index,
+                    upgraded_level=getattr(self, "_verified_upgrade_level", None),
+                )
+            else:
+                old_suffix = {cell.global_index: cell.level for cell in cache.cells if cell.global_index >= state.next_index}
+                new_suffix = {cell.global_index: cell.level for cell in cells_now if cell.global_index >= state.next_index}
+                change = ("仓库数量变化" if total != cache.total else
+                          "未处理后缀变化" if old_suffix != new_suffix else None)
             if change:
                 # 成员或顺序变了：旧格位关联失效，绝不能按新序号继续（会漏盘）。
                 self.trace.fail(
@@ -1419,6 +1559,7 @@ class Runner:
                 )
                 raise RunnerError(f"强化后列表成员变化（{change}），停止任务链待关联规则完善")
             self._restored_scan = (cells_now, problems, skips)
+            self._restored_scan_reused = False
             state.mark_viewport_mode(VIEWPORT_SINGLE_SCREEN, total=total)
             state.confirm_viewport(
                 0, 0.0, row_pitch_px=self._row_pitch, at_top=True, at_bottom=True
@@ -1427,7 +1568,8 @@ class Runner:
             self.trace.ok(
                 "drive_disc",
                 "single_screen_recheck",
-                f"原地复核通过：共 {total} 个盘整屏可见，其余格位无可见变化；未切页、未滚轮",
+                f"原地复核通过：共 {total} 个盘整屏可见，已解决区允许本件升级前移，"
+                f"未解决后缀保持不变；next_index={state.next_index}；未切页、未滚轮",
                 image=image,
             )
             return
@@ -1437,13 +1579,13 @@ class Runner:
             "restore_fallback",
             f"单屏原地复核未通过：{fallback_reason}，回退置顶定位恢复",
         )
-        self._restore_position_via_top(hwnd, state)
+        self._restore_position_via_top(hwnd, state, cache=cache)
 
-    def _restore_position_via_top(self, hwnd: int, state: TraversalState) -> None:
+    def _restore_position_via_top(self, hwnd: int, state: TraversalState, *, cache=None) -> None:
         """「切页置顶 → 按保存视口批量返回」是完整的一次恢复尝试，最多两次；第二次
         只用于可重试的运行误差（目标网格/相位暂时读不出、位移或端点不一致）。
         请求超上界、协议缺失、进入流程外错误页直接 failed，不做第二次。每次尝试
-        后做一次目标网格校验扫描，成功即缓存给主循环，恢复流程不重复 OCR。
+        后有缓存则只简查位置并复用候选；缓存缺失或定位证据不足才重扫。
         """
         if not state.within_restore_limit():
             raise RunnerError(
@@ -1459,10 +1601,38 @@ class Runner:
                 "restore",
                 f"第 {attempt} 次恢复：返回全局第 {saved.viewport_top_row0 + 1} 行视口",
             )
-            self._restore_once(hwnd, state, saved)
+            if cache is None:
+                self._restore_once(hwnd, state, saved)
+            else:
+                self._checkpoint()
+                try:
+                    self._restore_once(hwnd, state, saved, cache=cache)
+                    self._checkpoint()
+                    image = self._grab(allow_esc=False, need_page=False)[0]
+                    self._recovery_summary(image, state, cache)
+                    reason = self._recovery_position_reason(image, state)
+                except NavigationError as exc:
+                    last_reason = str(exc)
+                    state.invalidate_position()
+                    self.log.warning("恢复简查第 %d 次失败：%s", attempt, exc)
+                    continue
+                if reason is None:
+                    self._reuse_recovery_cache(state, cache, image)
+                    return
+                self.trace.warn("drive_disc", "restore_fallback", f"定位简查失败：{reason}，异常路径重扫")
             cells, problems, skips = self._scan_cells(state)
+            if cache is not None and not problems:
+                if self._last_count is None:
+                    problems.append("异常重扫的仓库总数仍未知")
+                elif self._last_count != cache.total:
+                    raise RunnerError("异常重扫发现仓库数量变化，停止任务链")
+                old = {cell.global_index: cell.level for cell in cache.cells if cell.global_index >= state.next_index}
+                new = {cell.global_index: cell.level for cell in cells if cell.global_index >= state.next_index}
+                if old != new:
+                    raise RunnerError("异常重扫发现未处理后缀变化，停止任务链")
             if not problems:
                 self._restored_scan = (cells, problems, skips)
+                self._restored_scan_reused = False
                 state.clear_resume()  # 已恢复到保存视口，恢复点可以释放
                 self.trace.ok(
                     "drive_disc",
@@ -1480,7 +1650,7 @@ class Runner:
         # 第二次仍不匹配：不能再重试（spec §5.3）。
         raise RunnerError(f"恢复保存视口失败（两次尝试）：{last_reason}，停止任务链")
 
-    def _restore_once(self, hwnd: int, state: TraversalState, saved) -> None:
+    def _restore_once(self, hwnd: int, state: TraversalState, saved, *, cache=None) -> None:
         """一次完整的「切页置顶 → 按保存视口批量返回」，并提交保存的实际位置。"""
         profile = self._profile
         if profile is None:
@@ -1489,7 +1659,11 @@ class Runner:
         with self.stats.timed("导航", "恢复：切页置顶"):
             reset_to_top(hwnd)
         image, _method, _hwnd = grab_game_image(hwnd)
-        origin, pitch = measure_layout(image)
+        if cache is None:
+            origin, pitch = measure_layout(image)
+        else:
+            self._recovery_summary(image, state, cache)
+            origin, pitch = measure_layout(image, lines=self._recovery_column_lines(image))
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
         if reason:
             raise RunnerError(f"恢复前原点复核不通过：{reason}，停止任务链")
@@ -1518,7 +1692,7 @@ class Runner:
         state.clear_scroll()
 
     def _await_scroll_settle(self, profile: NavProfile) -> None:
-        """恢复批量滚动后等列表缓动停稳，再让校验扫描抓图。
+        """恢复批量滚动后等列表缓动停稳，再抓图做定位检查或异常校验扫描。
 
         滚动事件发完只说明输入已送出，列表仍在缓动；此时抓到的「等级」标签会整体
         偏几像素，残差压过 §5.4 的 2% 映射容差（174.5px 行距时约 3.49px），把本来
@@ -1828,7 +2002,7 @@ class Runner:
         accepted_ids,
         up_counts: dict,
         disc_slot: int = -1,
-    ) -> None:
+    ) -> int:
         """在强化页循环判断+升级，直到弃置/升满/跳过，最后回到网格。
 
         判断在强化页做（左边卡片有副属性），判升级就「阶段添加」+「升级」原地
@@ -1836,6 +2010,7 @@ class Runner:
         每升一阶后复核等级有没有到下一档（3/6/9/12/15），到不了就是素材耗尽，
         报错停止整条任务链。
 
+        返回强化页最终确认的等级，供单屏复核验证本件前移，不能用期望档位代替。
         disc_slot：这件盘在 RunStats 里的下标，用来记各档升级耗时（-1 = 不统计）。
         """
         upgraded = 0
@@ -1928,7 +2103,7 @@ class Runner:
                     )
                     self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
                     self._esc_back_to_grid(hwnd)
-                    return
+                    return disc.level
                 if not self._upgrade_once(hwnd, self.material_slot):
                     raise RunnerError(f"{cell_tag} 强化按钮识别失败，停止任务链")
                 upgraded += 1
@@ -1953,7 +2128,7 @@ class Runner:
                 self._record(job, disc, decision)
                 self.stats.disc_end(disc_slot, OUTCOME_DISCARDED, disc.level, decision.score)
                 self._discard_from_upgrade(hwnd)
-                return
+                return disc.level
             # SKIP：不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
             self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
             self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
@@ -1962,7 +2137,7 @@ class Runner:
                 disc_slot, outcome_for_action(decision.action.value), disc.level, decision.score
             )
             self._esc_back_to_grid(hwnd)
-            return
+            return disc.level
 
     def _record(self, job: TaskJob, disc: Disc, decision: Decision) -> None:
         self.results.append(

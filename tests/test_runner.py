@@ -1861,6 +1861,45 @@ def test_restore_single_screen_rechecks_in_place(offline_runner, monkeypatch):
     )
 
 
+def test_restore_single_screen_upgrade_replay(monkeypatch):
+    """34 件真图：32 号升到 3 级前移至 28 号，33 号必须仍待处理。无游戏输入。"""
+    runner = Runner(Preset(accepted=None), hotkeys=False)
+    runner.trace = Mock()
+    runner._profile = fake_profile()
+    runner._origin_center_y = 268.5
+    runner._row_pitch = 174.5
+    state = _single_screen_state(34, active_index=32)
+    state.next_index = 32
+    state.finish_upgrade()
+    state.start_first_batch()
+    runner._processed = 7
+    runner._verified_upgrade_level = 3
+    paths = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘仓库"
+    before_image = QImage(str(paths / "升级前-34件-序号32.png"))
+    after_image = QImage(str(paths / "升级后-34件-序号28.png"))
+    assert not before_image.isNull() and not after_image.isNull()
+    before, problems, skips = runner._scan_cells(state, image=before_image)
+    assert problems == [] and len(before) == 34 and runner._last_count == 34
+    assert [cell.level for cell in before] == [15] * 23 + [9] + [3] * 4 + [0] * 6
+    cache = runner._make_recovery_cache(state, before, skips)
+    assert cache is not None
+    monkeypatch.setattr(runner, "_grab", lambda **kwargs: (after_image, "drive_disc", "test", 1))
+    monkeypatch.setattr(runner, "_scan_cells", Mock(side_effect=AssertionError("正常路径不得重扫")))
+    monkeypatch.setattr(runner, "_read_label_lines", Mock(side_effect=AssertionError("不得读取全网格 OCR")))
+    reset = Mock()
+    monkeypatch.setattr(runner_module, "reset_to_top", reset)
+    monkeypatch.setattr(runner_module, "scroll_rows", Mock(side_effect=AssertionError("不应滚轮")))
+
+    runner._restore_position(1, state, before, cache=cache)
+
+    assert state.next_index == 33 and state.resume_point is None and state.position_valid
+    assert runner._processed == 7 and state.work_batch_count == 1
+    cells = runner._restored_scan[0]
+    assert cells[-1].level == before[-1].level == 0  # 只复用未解决后缀；旧前缀等级不再判断。
+    assert [cell.global_index for cell in cells if cell.global_index >= state.next_index] == [33]
+    reset.assert_not_called()
+
+
 def test_restore_single_screen_stops_chain_on_member_change(offline_runner, monkeypatch):
     """总数不变但别的格位也变了 = 列表成员/顺序变化：旧关联失效，停止任务链。
 
@@ -1880,6 +1919,192 @@ def test_restore_single_screen_stops_chain_on_member_change(offline_runner, monk
     with pytest.raises(RunnerError, match="成员变化"):
         runner._restore_position(1, state, before)
 
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def _cached_recovery(runner, *, long=False):
+    runner._profile = fake_profile()
+    runner._origin_center_y = 267.0
+    runner._row_pitch = 175.0
+    runner._scan_image = blank_image()
+    if long:
+        state = _state()
+        state.restore_request_limit_rows = max_restore_rows(20)
+        state.mark_viewport_mode(VIEWPORT_SCROLLING)
+        state.confirm_viewport(10, 50.0, row_pitch_px=175.0)
+        state.next_index = 100
+        state.begin_upgrade(100)
+        cells = [make_cell(row, col, row - 10) for row in range(10, 14) for col in range(9)]
+        runner._last_count = 200
+        skips = {90: "已锁定", 103: "已锁定"}
+    else:
+        state = _single_screen_state(5, active_index=2)
+        state.next_index = 2
+        cells = _single_screen_cells(5)
+        runner._last_count = 5
+        skips = {0: "已锁定", 4: "已锁定"}
+    state.finish_upgrade()
+    state.start_first_batch()
+    cache = runner._make_recovery_cache(state, cells, skips)
+    assert cache is not None
+    return state, cells, cache
+
+
+def _position_column(phase):
+    return [ocr_module.OcrLine("等级0", 1, 110, int(344 + row * 175 - phase),
+                              220, int(364 + row * 175 - phase)) for row in range(4)]
+
+
+def test_recovery_column_position_replay():
+    """既有 1080p 参考图验证局部定位区域；不读取全网格，不进行游戏输入。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._origin_center_y = 268.5
+    runner._row_pitch = 174.5
+    state = _single_screen_state(34, active_index=32)
+    path = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘仓库/升级后-34件-序号28.png"
+    image = QImage(str(path))
+    assert not image.isNull()
+    assert runner._recovery_position_reason(image, state) is None
+
+
+def test_long_recovery_reuses_candidates_and_half_row_position(offline_runner, monkeypatch):
+    runner = Runner(Preset(), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner, long=True)
+    monkeypatch.setattr(runner, "_recovery_summary", Mock())
+    columns = iter([_position_column(0), _position_column(50)])
+    monkeypatch.setattr(runner, "_recovery_column_lines", lambda image: next(columns))
+    scan = Mock(side_effect=AssertionError("正常长页恢复不得重扫"))
+    monkeypatch.setattr(runner, "_scan_cells", scan)
+    sends = []
+    monkeypatch.setattr(runner_module, "scroll_rows", lambda hwnd, rows, profile, **kw:
+                        sends.append(rows) or ScrollSend(rows, rows, rows, 100))
+
+    runner._restore_position(1, state, cells, cache=cache)
+
+    assert sends == [11] and state.next_index == 101 and state.work_batch_count == 1
+    assert state.viewport_top_row0 == 10 and state.row_phase_px == 50.0
+    assert runner._restored_scan[2] == {103: "已锁定"}
+    assert runner._restored_scan[0][10].center_y == 392
+    offline_runner["reset_to_top"].assert_called_once_with(1)
+    scan.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["job", "filter"])
+def test_recovery_rejects_foreign_cache_before_input(offline_runner, change):
+    runner = Runner(Preset(), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner, long=True)
+    if change == "job":
+        state.job_id = "another-job"
+    else:
+        state.filter_signature = "another-filter"
+    with pytest.raises(RunnerError, match="缓存任务或筛选签名"):
+        runner._restore_position(1, state, cells, cache=cache)
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def test_cached_recovery_detects_count_change_without_grid_scan(offline_runner, monkeypatch):
+    runner = Runner(Preset(), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner)
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+    monkeypatch.setattr(ocr_module, "read_rect", lambda image, area: fake_label_lines(4))
+    scan = Mock(side_effect=AssertionError("数量明确变化不应继续沿用缓存"))
+    monkeypatch.setattr(runner, "_scan_cells", scan)
+    with pytest.raises(RunnerError, match="数量 5 → 4"):
+        runner._restore_position(1, state, cells, cache=cache)
+    assert runner._restored_scan is None and state.resume_point is not None
+    scan.assert_not_called()
+
+
+def test_cached_recovery_unclear_summary_falls_back_boundedly(offline_runner, monkeypatch):
+    from zzz_ddtool.navigation import NavigationError
+    runner = Runner(Preset(ocr_retry=2), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner)
+    summary = Mock(side_effect=NavigationError("数量读不清"))
+    monkeypatch.setattr(runner, "_recovery_summary", summary)
+    fallback = Mock()
+    monkeypatch.setattr(runner, "_restore_single_screen", fallback)
+    runner._restore_position(1, state, cells, cache=cache)
+    assert summary.call_count == 2
+    fallback.assert_called_once_with(1, state, cells, cache=cache)
+
+
+def test_cached_recovery_f10_stops_before_restore_input(offline_runner):
+    runner = Runner(Preset(), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner, long=True)
+    runner.hotkeys = Mock(paused=False)
+    runner.hotkeys.checkpoint.side_effect = RunnerStopped("用户停止")
+    with pytest.raises(RunnerStopped):
+        runner._restore_position(1, state, cells, cache=cache)
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def test_cache_fallback_ignores_previously_upgraded_prefix(offline_runner, monkeypatch):
+    from zzz_ddtool.navigation import NavigationError
+    runner = Runner(Preset(ocr_retry=1), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner)
+    # 三件已经解决且升档；前缀不再是旧扫描里的 0 级，后缀仍不变。
+    after = _single_screen_cells(5, levels={0: 3, 1: 3, 2: 3})
+    monkeypatch.setattr(runner, "_recovery_summary", Mock(side_effect=NavigationError("标题读不清")))
+    monkeypatch.setattr(runner, "_grab_label_frame", lambda hwnd: (blank_image(), fake_label_lines(5)))
+    monkeypatch.setattr(runner_module, "is_page", lambda *args: True)
+    scan = Mock(side_effect=_stub_single_screen_scan(runner, after, 5))
+    monkeypatch.setattr(runner, "_scan_cells", scan)
+    runner._restore_position(1, state, cells, cache=cache)
+    assert state.next_index == 3 and state.resume_point is None
+    assert runner._restored_scan[0] == after and not runner._restored_scan_reused
+    scan.assert_called_once()
+    offline_runner["reset_to_top"].assert_not_called()
+
+
+def test_cached_recovery_f9_resume_does_not_repeat_top_reset(offline_runner, monkeypatch):
+    runner = Runner(Preset(), hotkeys=False)
+    state, cells, cache = _cached_recovery(runner, long=True)
+    control = Mock(paused=False)
+    control.checkpoint.side_effect = lambda: setattr(control, "paused", False)
+    runner.hotkeys = control
+    monkeypatch.setattr(runner, "_recovery_summary", lambda *args: setattr(control, "paused", True))
+    columns = iter([_position_column(0), _position_column(50)])
+    monkeypatch.setattr(runner, "_recovery_column_lines", lambda image: next(columns))
+    monkeypatch.setattr(runner, "_scan_cells", Mock(side_effect=AssertionError("不应重扫")))
+    runner._restore_position(1, state, cells, cache=cache)
+    offline_runner["reset_to_top"].assert_called_once_with(1)
+    phases = [call.args[0] for call in runner._set_status.call_args_list]
+    assert "paused" in phases and "running" in phases
+    assert state.next_index == 101 and state.resume_point is None
+
+
+def test_single_screen_consecutive_upgrades_keep_initial_candidates(offline_runner, monkeypatch):
+    runner = Runner(Preset(max_discs=10), hotkeys=False)
+    runner._profile = fake_profile()
+    runner._origin_center_y = 267.0
+    runner._row_pitch = 175.0
+    runner._scan_image = blank_image()
+    runner._last_count = 5
+    cells = _single_screen_cells(5)
+    prep = runner_module.NavigationPrep(fake_profile(), VIEWPORT_SINGLE_SCREEN, 5, (cells, [], {}))
+    monkeypatch.setattr(runner, "_prepare_navigation", lambda *args: prep)
+    monkeypatch.setattr(runner, "_recovery_summary", Mock())
+    scan = Mock(side_effect=AssertionError("连续升级不得重新扫描"))
+    monkeypatch.setattr(runner, "_scan_cells", scan)
+    visited = []
+
+    def process(hwnd, job, state, cell, *args):
+        visited.append(cell.global_index)
+        runner._processed += 1
+        state.begin_upgrade(cell.global_index)
+        runner._verified_upgrade_level = 3
+        state.finish_upgrade()
+        return "upgrade"
+
+    monkeypatch.setattr(runner, "_process_cell", process)
+    job = generated_job(slot=1)
+    runner.stats.job_begin(1, job.slot, job.sets, job.mainstats)
+    runner._run_job(job)
+    assert visited == [0, 1, 2, 3, 4] and runner._processed == 5
+    assert runner._state.next_index == 5 and runner._state.work_batch_count == 1
+    assert runner._recovery_summary.call_count == 5
+    assert runner.stats.jobs[0].batches == 1
+    scan.assert_not_called()
     offline_runner["reset_to_top"].assert_not_called()
 
 
