@@ -7,7 +7,7 @@ from typing import Any, Mapping
 import yaml
 
 from zzz_ddtool.chain import TaskJob, parse_task_chain
-from zzz_ddtool.gamedata import SLOTS, blocked_substats
+from zzz_ddtool.gamedata import SLOTS, blocked_substats, normalize_required_substats
 from zzz_ddtool.models import UPGRADE_STEP
 from zzz_ddtool.origin import Origin
 
@@ -49,6 +49,7 @@ class Preset:
     accepted: tuple[str, ...] | None = None
     max_pages: int = 20
     labels: LabelPolicy = field(default_factory=LabelPolicy)
+    required_substats: tuple[str, ...] = ()
 
     def useful_names(self) -> frozenset[str]:
         return frozenset(name for name, weight in self.effective_weights().items() if weight > 0)
@@ -115,6 +116,7 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
         active.setdefault("accepted", accepted)
         active.setdefault("mainstats", mains)
         active.setdefault("min_useful_types", min_useful)
+        active.setdefault("required_substats", normalize_required_substats(data.get("required_substats") or (), weights))
         slot_plans[filter_slot] = active
     active_weights = dict(active.get("weights") or weights)
     active_require = dict(active.get("stage_require") or stage_require)
@@ -142,6 +144,7 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
         ocr_retry=int(data.get("ocr_retry") or 3),
         accepted=active_accepted,
         labels=LabelPolicy(discard=bool(labels.get("discard", True)), save=bool(labels.get("save", True))),
+        required_substats=normalize_required_substats(active.get("required_substats", data.get("required_substats") or ()), active_weights),
     )
 
 
@@ -174,6 +177,7 @@ def _parse_slot_plans(raw: Mapping[Any, Any]) -> dict[int, dict[str, Any]]:
             "mainstats": mains,
             "sets": sets,
             "min_useful_types": int(value.get("min_useful_types") or 0),
+            "required_substats": normalize_required_substats(value.get("required_substats") or (), weights),
         }
     return plans
 
@@ -202,6 +206,7 @@ def preset_to_dict(preset: Preset) -> dict[str, Any]:
                 "sets": list(plan.get("sets") or ()),
                 "min_useful_types": int(plan.get("min_useful_types") or 0),
                 **({"accepted": list(plan["accepted"])} if plan.get("accepted") is not None else {}),
+                **({"required_substats": list(plan["required_substats"])} if plan.get("required_substats") else {}),
             }
             for slot, plan in sorted((preset.slot_plans or {}).items())
             if int(slot) in SLOTS
@@ -221,6 +226,8 @@ def preset_to_dict(preset: Preset) -> dict[str, Any]:
     }
     if preset.accepted is not None:
         data["accepted"] = list(preset.accepted)
+    if preset.required_substats:
+        data["required_substats"] = list(preset.required_substats)
     return data
 
 

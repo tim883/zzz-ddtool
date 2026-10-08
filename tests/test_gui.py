@@ -1661,6 +1661,183 @@ def test_shared_mainstat_controls_follow_the_active_slot(qapp, tmp_path):
     window.close()
 
 
+def test_slot5_wind_mainstat_survives_save_reload_and_fits_page(qapp, tmp_path):
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.gamedata import MAINSTAT_NAMES, SLOT_MAINSTATS, SUBSTAT_NAMES
+
+    name = "风属性伤害"
+    assert name in MAINSTAT_NAMES and name in SLOT_MAINSTATS[5]
+    assert name not in SUBSTAT_NAMES
+    window = MainWindow(config_path=tmp_path / "wind.yaml")
+    window._add_job()
+    window._on_slot_clicked(5)
+    window.show()
+    qapp.processEvents()
+    box = window.filter_main_boxes[name]
+    assert box.isVisible()
+    assert box.height() >= box.sizeHint().height()
+    assert box.parentWidget().rect().contains(box.geometry())
+    box.click()
+    window.save_current()
+    saved = load_preset(window._path)
+    assert saved.task_chain[0].mainstats == (name,)
+    window._apply_preset(saved)
+    assert window.filter_main_boxes[name].isChecked()
+    for slot in (4, 6):
+        window._on_slot_clicked(slot)
+        assert name not in window.filter_main_boxes
+    window.close()
+
+
+def required_box(editor, name):
+    return next(editor._required_by_row[row] for combo, _spin, row in editor._rows
+                if combo.currentText() == name)
+
+
+def test_required_filter_reduces_existing_selection_without_enumeration_and_saves(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import gui
+    from zzz_ddtool.config import load_preset
+    from zzz_ddtool.decide import decide
+    from zzz_ddtool.runner import Runner
+    from zzz_ddtool.taskcards import task_counts
+
+    window = MainWindow(config_path=tmp_path / "required.yaml")
+    try:
+        window._add_job()
+        window._on_slot_clicked(5)
+        window.weight_editor.set_weights({"攻击力%": 1, "暴击率": 1, "暴击伤害": 0.5, "穿透值": 0.5})
+        refresh_cards(window, qapp)
+        all_ids = sorted(window._selection_seed)
+        unselected = next(pid for pid in all_ids if "攻击力%" in pid and "暴击率" in pid)
+        original = tuple(pid for pid in all_ids if pid != unselected)[:100]
+        assert len(original) == 100
+        window._selection_seed = original
+        refresh_cards(window, qapp)
+        generation = window._preview_generation
+        monkeypatch.setattr(gui, "enumerate_patterns", lambda *a, **k: pytest.fail("必带筛选不应重新穷举"))
+        required_box(window.weight_editor, "攻击力%").click()
+        assert not window._preview_dirty and window._preview_generation == generation
+        first = set(window._accepted_ids())
+        assert 0 < len(first) < 100
+        assert all("攻击力%" in pid for pid in first)
+        assert all("攻击力%" in pattern.pattern_id for section in window.sections.values()
+                   for pattern in (section.patterns[i] for i in section._visible_indices))
+        required_box(window.weight_editor, "攻击力%").click()
+        assert set(window._accepted_ids()) == set(original)
+        required_box(window.weight_editor, "攻击力%").click()
+        required_box(window.weight_editor, "暴击率").click()
+        expected = {pid for pid in original if "攻击力%" in pid and "暴击率" in pid}
+        assert expected and set(window._accepted_ids()) == expected
+        assert unselected not in window._accepted_ids()
+        window.save_current()
+        saved = load_preset(window._path)
+        job = saved.task_chain[0]
+        assert job.required_substats == ("攻击力%", "暴击率")
+        assert set(job.accepted) == expected
+        grouped = window._pattern_catalog.peek(job.weights)
+        wait_task_counts(window, qapp)
+        from zzz_ddtool.gui import _JOB_COUNTS_ROLE
+        assert window.chain_list.item(0).data(_JOB_COUNTS_ROLE) == task_counts(job, grouped)
+        runner = Runner(saved)
+        missing = Disc(level=0, substats=tuple(Substat(n) for n in ("攻击力%", "暴击伤害", "穿透值", "生命值")))
+        assert decide(missing, runner._sub_preset(job), job.accepted).action is Action.MARK_DISCARD
+        window._apply_preset(saved)
+        refresh_cards(window, qapp)
+        assert required_box(window.weight_editor, "攻击力%").isChecked()
+        assert required_box(window.weight_editor, "暴击率").isChecked()
+        assert set(window._accepted_ids()) == expected
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_required_filter_is_task_specific_and_bulk_selection_obeys_it(qapp, tmp_path):
+    from zzz_ddtool.config import preset_from_dict, load_preset
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    window = MainWindow(config_path=tmp_path / "bulk-required.yaml")
+    try:
+        window._apply_preset(preset_from_dict({"task_chain": [
+            {"slot": 5, "weights": {"暴击率": 1, "攻击力%": 1}, "required_substats": ["暴击率"]},
+            {"slot": 5, "weights": {"暴击率": 1, "攻击力%": 1}, "required_substats": ["攻击力%"]},
+        ]}))
+        window._confirm_select_all_jobs = lambda: True
+        window._select_all_jobs()
+        wait_until(qapp, lambda: window._utility_thread is None)
+        for job in window._jobs:
+            assert job.accepted == qualifying_pattern_ids(job.slot, job.mainstats, job.weights,
+                                                         job.stage_require, required_substats=job.required_substats)
+            assert job.accepted and all(job.required_substats[0] in pid for pid in job.accepted)
+        window.chain_list.setCurrentRow(1)
+        assert required_box(window.weight_editor, "攻击力%").isChecked()
+        assert not required_box(window.weight_editor, "暴击率").isChecked()
+        window.chain_list.setCurrentRow(0)
+        assert required_box(window.weight_editor, "暴击率").isChecked()
+        window._copy_job()
+        assert window._editing_job().required_substats == ("暴击率",)
+        window._apply_weights_to_all()
+        assert all(job.required_substats == ("暴击率",) for job in window._jobs)
+        window._add_job()
+        assert window._jobs[-1].required_substats == ()
+        window.save_current()
+        loaded = load_preset(window._path)
+        assert [job.required_substats for job in loaded.task_chain] == [("暴击率",)] * 3 + [()]
+        assert loaded.task_chain[-1].accepted is None
+    finally:
+        close_count_window(window, qapp)
+
+
+def test_required_editor_tracks_rename_remove_and_emits_filter_signal(qapp):
+    editor = WeightEditor()
+    try:
+        editor.set_weights({"攻击力%": 1, "暴击率": 1})
+        changed, filtered = [], []
+        editor.changed.connect(lambda: changed.append(1))
+        editor.required_changed.connect(lambda: filtered.append(1))
+        required_box(editor, "攻击力%").click()
+        assert editor.required_substats() == ("攻击力%",)
+        assert changed == [] and filtered == [1]
+        combo, _spin, row = editor._rows[0]
+        combo.setCurrentText("异常精通")
+        editor._notify_changed()
+        assert editor.required_substats() == ("异常精通",)
+        assert changed == [1]
+        editor._delete(row)
+        assert editor.required_substats() == ()
+        assert changed == [1, 1]
+        editor.set_weights({"暴击率": 1}, ("暴击率",))
+        assert editor.required_substats() == ("暴击率",)
+        assert changed == [1, 1] and filtered == [1]
+    finally:
+        editor.close()
+
+
+def test_required_filter_respects_current_bulk_selection_and_ungenerated_state(qapp, tmp_path):
+    window = MainWindow(config_path=tmp_path / "required-empty.yaml")
+    try:
+        window._add_job()
+        window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1})
+        required_box(window.weight_editor, "暴击率").click()
+        assert window.collect_preset().task_chain[0].accepted is None
+        refresh_cards(window, qapp)
+        window.tabs.setCurrentIndex(2)
+        window._check_visible(False)
+        assert window.collect_preset().task_chain[0].accepted == ()
+        window._check_visible(True)
+        expected = {section._ids[i] for section in window.sections.values() for i in section._visible_indices}
+        assert expected and set(window.collect_preset().task_chain[0].accepted) == expected
+        assert all("暴击率" in pid for pid in expected)
+        window.sections[("four", 0)].require.setValue(2)
+        assert all("暴击伤害" in pid for pid in window.sections[("four", 0)].visible_accepted())
+        required_box(window.weight_editor, "暴击伤害").click()
+        spin = next(spin for combo, spin, _ in window.weight_editor._rows if combo.currentText() == "暴击伤害")
+        spin.setValue(0)
+        assert window.collect_preset().task_chain[0].accepted == ()
+        refresh_cards(window, qapp)
+        assert all(not section._visible_indices for section in window.sections.values())
+    finally:
+        close_count_window(window, qapp)
+
+
 def test_gui_disables_legacy_useful_quota_for_all_tasks(qapp, tmp_path):
     from PySide6.QtWidgets import QLabel
     from zzz_ddtool.config import preset_from_dict

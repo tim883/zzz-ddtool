@@ -9,6 +9,57 @@ from zzz_ddtool.patterns import CHECKPOINTS, EMPTY, JUNK, enumerate_filtered
 from zzz_ddtool.taskcards import PatternCatalog, effective_weights, rebase_selection, task_counts
 
 
+def test_required_substats_intersect_manual_choices_counts_and_bulk_qualifying():
+    from zzz_ddtool.gui import qualifying_pattern_ids
+    from zzz_ddtool.taskcards import counts_signature, has_required_substats
+
+    job = TaskJob(slot=5, weights={"攻击力%": 1, "暴击率": 1, "暴击伤害": 0.5},
+                  required_substats=("攻击力%", "暴击率"),
+                  stage_require={"four": {0: 2.5}})
+    catalog = PatternCatalog()
+    grouped = catalog.get(job.weights, lambda: False)
+    all_cards = [p for cards in grouped.values() for p in cards]
+    expected = {p.pattern_id for p in all_cards if has_required_substats(p, job.required_substats)
+                and p.score + 1e-9 >= job.stage_require.get(p.origin.value, {}).get(p.checkpoint, 0)}
+    assert expected and len(expected) < len(all_cards)
+    assert set(qualifying_pattern_ids(job.slot, job.mainstats, job.weights, job.stage_require,
+                                     required_substats=job.required_substats)) == expected
+    assert set(qualifying_pattern_ids(job.slot, job.mainstats, job.weights, job.stage_require, catalog,
+                                     required_substats=job.required_substats)) == expected
+    unchecked = next(iter(expected))
+    job.accepted = tuple(p.pattern_id for p in all_cards if p.pattern_id != unchecked)
+    assert set(rebase_selection(job)) == expected - {unchecked}
+    assert set(rebase_selection(job, filtered=False)) == set(job.accepted)
+    for origin, (picked, qualified) in task_counts(job, grouped).items():
+        assert picked == sum(pid.startswith(origin + ":") for pid in expected - {unchecked})
+        assert qualified == sum(pid.startswith(origin + ":") for pid in expected)
+    assert counts_signature(job) != counts_signature(replace(job, required_substats=()))
+    assert rebase_selection(replace(job, accepted=None)) is None
+    assert rebase_selection(replace(job, accepted=())) == ()
+
+
+def test_required_substat_zero_or_blocked_by_mainstat_has_no_matches():
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    for mainstats, weights in (((), {"攻击力%": 0, "暴击率": 1}),
+                              (("攻击力%",), {"攻击力%": 1, "暴击率": 1})):
+        job = TaskJob(slot=4, mainstats=mainstats, weights=weights,
+                      required_substats=("攻击力%",), accepted=("four:0:暴击率|废词条|废词条|废词条",))
+        assert rebase_selection(job) == ()
+        assert qualifying_pattern_ids(4, mainstats, weights, required_substats=job.required_substats) == ()
+
+
+def test_four_required_substats_exclude_initial_three_zero_level():
+    from zzz_ddtool.gui import qualifying_pattern_ids
+
+    names = ("暴击率", "暴击伤害", "攻击力%", "穿透值")
+    accepted = qualifying_pattern_ids(5, (), dict.fromkeys(names, 1), required_substats=names)
+    assert accepted
+    assert not any(pid.startswith("three:0:") for pid in accepted)
+    assert any(pid.startswith("four:0:") for pid in accepted)
+    assert any(pid.startswith("three:3:") for pid in accepted)
+
+
 def test_multi_mainstats_preserve_cross_main_substat_weights_and_filter_impossible_cards():
     from zzz_ddtool.gui import qualifying_pattern_ids
     from zzz_ddtool.taskcards import counts_signature

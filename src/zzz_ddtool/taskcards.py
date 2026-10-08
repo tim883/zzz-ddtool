@@ -20,6 +20,10 @@ def effective_weights(job: TaskJob) -> dict[str, float]:
     return {name: value for name, value in job.weights.items() if name not in blocked}
 
 
+def has_required_substats(pattern: Pattern, required_substats: tuple[str, ...]) -> bool:
+    return not required_substats or set(required_substats).issubset(slot.name for slot in pattern.slots)
+
+
 def rebase_selection(job: TaskJob, *, filtered: bool = True,
                      cancelled: Callable[[], bool] | None = None) -> tuple[str, ...] | None:
     """The same effective whitelist for editing, counts, saving and execution.
@@ -55,6 +59,8 @@ def rebase_selection(job: TaskJob, *, filtered: bool = True,
         if not possible_substats(job.slot, job.mainstats, (token.split("+", 1)[0] for token in body.split("|"))):
             continue
         if filtered:
+            if not has_required_substats(pattern, job.required_substats):
+                continue
             if pattern.checkpoint not in CHECKPOINTS:
                 continue
             need = (job.stage_require.get(origin) or {}).get(pattern.checkpoint, 0.0)
@@ -73,6 +79,7 @@ def counts_signature(job: TaskJob) -> tuple:
         tuple(float((job.stage_require.get(origin.value) or {}).get(level, 0))
               for origin in Origin for level in CHECKPOINTS),
         job.accepted,
+        tuple(sorted(job.required_substats)),
     )
 
 
@@ -147,7 +154,7 @@ def task_counts(job: TaskJob, grouped: Mapping[tuple[str, int], tuple[Pattern, .
             for i, pattern in enumerate(grouped[(origin.value, level)]):
                 if i % 128 == 0 and cancelled():
                     return None
-                if pattern.score + 1e-9 >= need and possible_substats(
+                if has_required_substats(pattern, job.required_substats) and pattern.score + 1e-9 >= need and possible_substats(
                     job.slot, job.mainstats, (slot.name for slot in pattern.slots)
                 ):
                     qualified += 1

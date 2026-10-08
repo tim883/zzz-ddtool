@@ -33,6 +33,12 @@ SLOT_MAINSTATS: dict[int, tuple[str, ...]] = {
 }
 
 
+def normalize_required_substats(names: Iterable[str], weights: Iterable[str]) -> tuple[str, ...]:
+    """必带条件只属于单价表中存在的合法副词条，保留顺序并去重。"""
+    available = set(weights) & set(SUBSTAT_NAMES)
+    return tuple(dict.fromkeys(name for item in names if (name := str(item).strip()) in available))
+
+
 def blocked_substats(slot: int, mainstats: Iterable[str] = ()) -> set[str]:
     fixed = FIXED_MAINSTATS.get(slot)
     if fixed is not None:
@@ -72,6 +78,7 @@ def empty_slot_plan(slot: int) -> dict:
         "accepted": None,
         "mainstats": (),
         "sets": (),
+        "required_substats": (),
         "min_useful_types": 0,
     }
 

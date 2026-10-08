@@ -4,6 +4,26 @@ from zzz_ddtool.config import load_preset, preset_from_dict, preset_to_dict, sav
 from zzz_ddtool.gamedata import MAINSTATS, SETS, selectable_mainstats
 
 
+def test_required_substats_roundtrip_and_legacy_defaults(tmp_path):
+    preset = preset_from_dict({
+        "weights": {"暴击率": 1, "攻击力%": 0},
+        "required_substats": ["暴击率", "攻击力%"],
+        "slot_plans": {5: {"weights": {"异常精通": 1}, "required_substats": ["异常精通"]}},
+        "task_chain": [
+            {"slot": 5, "weights": {"穿透值": 1}, "required_substats": ["穿透值", "穿透值", "不存在", "攻击力%"]},
+            {"slot": 4, "weights": {"暴击率": 1}},
+        ],
+    })
+    path = tmp_path / "required.yaml"
+    save_preset(path, preset)
+    loaded = load_preset(path)
+    assert loaded.required_substats == ("暴击率", "攻击力%")
+    assert loaded.slot_plans[5]["required_substats"] == ("异常精通",)
+    assert [job.required_substats for job in loaded.task_chain] == [("穿透值",), ()]
+    assert preset_from_dict({}).required_substats == ()
+    assert loaded.task_chain[1].to_dict().get("required_substats", []) == []
+
+
 def test_roundtrip_keeps_stage_require_and_accepted(tmp_path: Path) -> None:
     preset = preset_from_dict(
         {

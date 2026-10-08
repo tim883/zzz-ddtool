@@ -312,6 +312,7 @@ class Runner:
             accepted=self.preset.accepted,
             min_useful_types=self.preset.min_useful_types,
             max_discs=self.preset.max_discs,
+            required_substats=self.preset.required_substats,
         )
 
     def _jobs(self) -> tuple[TaskJob, ...]:
@@ -346,6 +347,7 @@ class Runner:
             skip_discarded=self.preset.skip_discarded,
             accepted=job.accepted,
             labels=self.preset.labels,
+            required_substats=job.required_substats,
         )
 
     def run(self) -> list[RunResult]:

@@ -67,7 +67,7 @@ from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
-from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_weights, rebase_selection, task_counts
+from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_weights, has_required_substats, rebase_selection, task_counts
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern,
@@ -101,7 +101,7 @@ KNOWN_SUBSTATS = tuple(
 )
 
 # 游戏内筛选-主词条按槽位固定网格，每页尺寸一致，切部位不抖动。
-# 左栏窄，排两列：5 号位那 9 个选项在三列里会被挤掉半边。
+# 左栏窄，排两列：5 号位的选项在三列里会被挤掉半边。
 _MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
     4: ("生命值%", "攻击力%", "防御力%", "暴击率", "暴击伤害", "异常精通"),
     5: (
@@ -114,12 +114,13 @@ _MAINSTAT_PAGES: dict[int, tuple[str, ...]] = {
         "冰属性伤害",
         "电属性伤害",
         "以太伤害",
+        "风属性伤害",
     ),
     6: ("生命值%", "攻击力%", "防御力%", "能量自动回复", "冲击力", "异常掌控"),
 }
 _MAINSTAT_COLS = 2
-# 各部位的主词条页取同一个高度：最高的是 5 号位（1 个「不限」+ 9 个选项 = 5 行）。
-_MAINSTAT_PAGE_HEIGHT = 132
+# 各部位的主词条页取同一个高度：最高的是 5 号位（1 个「不限」+ 10 个选项 = 6 行）。
+_MAINSTAT_PAGE_HEIGHT = 160
 
 # 全局字体：字号必须**同时**写进样式表（见下面 STYLESHEET 末尾那条 QAbstractItemView）。
 # 列表类控件（任务链的 QListWidget、下拉框弹出的 QListView）只要被样式表命中，
@@ -681,6 +682,7 @@ class StageSection(QWidget):
         self._ids: list[str] = []
         self._checked: set[str] = set()
         self._visible_indices: list[int] = []
+        self.required_substats: tuple[str, ...] = ()
         self._page = 0
 
         self.require = NoWheelDoubleSpinBox()
@@ -813,7 +815,8 @@ class StageSection(QWidget):
     def apply_filter(self) -> None:
         need = self.require.value()
         self._visible_indices = [
-            i for i, pattern in enumerate(self.patterns) if pattern.score + 1e-9 >= need
+            i for i, pattern in enumerate(self.patterns)
+            if pattern.score + 1e-9 >= need and has_required_substats(pattern, self.required_substats)
         ]
         self._page = 0
         self.count_label.setText(f"{len(self._visible_indices)} / {len(self.patterns)} 张")
@@ -849,11 +852,14 @@ class StageSection(QWidget):
 
 class WeightEditor(QWidget):
     changed = Signal()
+    required_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._rows: list[tuple[QComboBox, NoWheelDoubleSpinBox, QWidget]] = []
         self._last_weights: dict[str, float] = {}
+        self._required_by_row: dict[QWidget, QCheckBox] = {}
+        self._last_required: tuple[str, ...] = ()
         self._box = QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._rows_box = QVBoxLayout()
@@ -869,22 +875,34 @@ class WeightEditor(QWidget):
         add_row.addWidget(add_btn)
         self._box.addLayout(add_row)
 
-    def set_weights(self, weights: dict[str, float]) -> None:
+    def set_weights(self, weights: dict[str, float], required_substats: tuple[str, ...] = ()) -> None:
         previous_block = self.blockSignals(True)
         while self._rows:
             self._remove_row(self._rows[0][2])
         for name, value in weights.items():
             if name not in SUBSTAT_NAMES:
                 continue
-            self._add_row(name, value)
+            self._add_row(name, value, required=name in required_substats)
         self._last_weights = self.weights()
+        self._last_required = self.required_substats()
         self.blockSignals(previous_block)
 
     def _notify_changed(self) -> None:
         current = self.weights()
-        if current != self._last_weights:
-            self._last_weights = current
+        required = self.required_substats()
+        weights_changed = current != self._last_weights
+        required_changed = required != self._last_required
+        self._last_weights, self._last_required = current, required
+        if weights_changed:
             self.changed.emit()
+        elif required_changed:
+            self.required_changed.emit()
+
+    def required_substats(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            combo.currentText().strip() for combo, _spin, row in self._rows
+            if self._required_by_row[row].isChecked() and combo.currentText().strip() in SUBSTAT_NAMES
+        ))
 
     def weights(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -912,7 +930,7 @@ class WeightEditor(QWidget):
         self._add_row(name, 1.0)
         self._notify_changed()
 
-    def _add_row(self, name: str, value: float) -> None:
+    def _add_row(self, name: str, value: float, *, required: bool = False) -> None:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -934,6 +952,14 @@ class WeightEditor(QWidget):
         remove = QPushButton("×")
         remove.setFixedWidth(28)
         remove.clicked.connect(lambda: self._delete(row))
+        required_box = QCheckBox("必带")
+        required_box.setToolTip(
+            "卡片必须同时包含全部勾选词条，并满足本档分数要求；保存时仅保留符合条件的已勾选卡片。"
+            "单价为 0 或词条被主属性排除时，没有符合该必带条件的卡片。"
+        )
+        required_box.setChecked(required)
+        required_box.toggled.connect(lambda *_: self._notify_changed())
+        self._required_by_row[row] = required_box
         # 词条名同理：这是个可编辑下拉框，正在输入名字时不必每敲一个字就重算。
         # 从下拉列表里选中（activated）和输入完按回车/失焦（editingFinished）都要认。
         combo.activated.connect(lambda *_: self._notify_changed())
@@ -943,6 +969,7 @@ class WeightEditor(QWidget):
         layout.addWidget(combo)
         layout.addWidget(spin)
         layout.addWidget(remove)
+        layout.addWidget(required_box)
         layout.addStretch()
         self._rows_box.addWidget(row)
         self._rows.append((combo, spin, row))
@@ -960,6 +987,7 @@ class WeightEditor(QWidget):
         视觉上立即消失），再排队销毁。
         """
         self._rows = [item for item in self._rows if item[2] is not row]
+        self._required_by_row.pop(row, None)
         self._rows_box.removeWidget(row)
         row.setParent(None)
         row.deleteLater()
@@ -1186,6 +1214,7 @@ def qualifying_pattern_ids(
     weights: Mapping[str, float],
     stage_require: Mapping[str, Mapping[int, float]] | None = None,
     catalog: PatternCatalog | None = None,
+    *, required_substats: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """一个任务「生成组合 + 全选当前可见」等价的可勾选图案全集。
 
@@ -1193,6 +1222,7 @@ def qualifying_pattern_ids(
       1. 部位/主词条屏蔽掉的副词条不参与（同 _effective_weights）；
       2. 用剩下的权重穷举（等价于点「生成组合」）；
       3. 再按每档要求过滤 score >= 本档要求（等价于「符合门槛」）。
+      4. 卡片必须同时包含 required_substats 中的全部词条。
 
     没有正权重词条时返回空集——那种任务界面本来就不出卡。
     """
@@ -1204,11 +1234,13 @@ def qualifying_pattern_ids(
         grouped = catalog.get(effective, lambda: False)
         return tuple(pattern.pattern_id for (origin, level), patterns in grouped.items()
                      for pattern in patterns
+                     if has_required_substats(pattern, required_substats)
                      if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
                      if pattern.score + 1e-9 >= float(((stage_require or {}).get(origin) or {}).get(level, 0)))
     return tuple(
         pattern.pattern_id
         for pattern in enumerate_filtered(effective, stage_require=stage_require)
+        if has_required_substats(pattern, required_substats)
         if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
     )
 
@@ -1562,9 +1594,10 @@ class MainWindow(QMainWindow):
         weights_layout = QVBoxLayout(weights_box)
         self.weight_editor = WeightEditor()
         self.weight_editor.changed.connect(self._schedule_rebuild)
+        self.weight_editor.required_changed.connect(self._on_required_changed)
         weights_layout.addWidget(self.weight_editor)
         self.apply_weights_btn = apply_weights = QPushButton("应用于所有任务")
-        apply_weights.setToolTip("把当前单价铺到任务链里已存在的每个任务；之后新建的任务不受影响。")
+        apply_weights.setToolTip("把当前单价和必带勾选铺到任务链里已存在的每个任务；之后新建的任务不受影响。")
         apply_weights.clicked.connect(self._apply_weights_to_all)
         weights_layout.addWidget(apply_weights, 0, Qt.AlignmentFlag.AlignLeft)
         self._apply_buttons.append(apply_weights)
@@ -1801,6 +1834,7 @@ class MainWindow(QMainWindow):
             job_id=job.job_id, slot=self._active_slot, sets=tuple(self._filter_sets),
             mainstats=tuple(self._selected_mains()),
             weights=self.weight_editor.weights(), accepted=self._selection_seed,
+            required_substats=self.weight_editor.required_substats(),
             stage_require={origin.value: {level: float(self.sections[(origin.value, level)].require.value())
                                           for level in CHECKPOINTS} for origin in Origin},
         )
@@ -2005,6 +2039,7 @@ class MainWindow(QMainWindow):
                 for origin, table in (snap.get("stage_require") or {}).items()
             },
             accepted=snap.get("accepted"),
+            required_substats=tuple(snap.get("required_substats") or ()),
             min_useful_types=int(snap.get("min_useful_types") or 0),
             max_discs=int(snap["max_discs"]),
         )
@@ -2025,6 +2060,7 @@ class MainWindow(QMainWindow):
                 str(origin): dict(table) for origin, table in (job.stage_require or {}).items()
             },
             "accepted": job.accepted,
+            "required_substats": job.required_substats,
             "mainstats": tuple(job.mainstats),
             "min_useful_types": 0,
             "max_discs": job.max_discs if job.max_discs is not None else self._legacy_max_discs,
@@ -2194,7 +2230,13 @@ class MainWindow(QMainWindow):
 
     def _apply_weights_to_all(self) -> None:
         weights = dict(self.weight_editor.weights())
-        self._apply_to_all("词条单价", lambda job: setattr(job, "weights", dict(weights)))
+        required = self.weight_editor.required_substats()
+
+        def apply(job):
+            job.weights = dict(weights)
+            job.required_substats = required
+
+        self._apply_to_all("词条单价与必带", apply)
 
     def _apply_limit_to_all(self) -> None:
         limit = int(self.max_discs.value())
@@ -2231,6 +2273,7 @@ class MainWindow(QMainWindow):
                 job.slot,
                 tuple(job.mainstats),
                 dict(job.weights),
+                tuple(job.required_substats),
                 {
                     str(origin): dict(table)
                     for origin, table in (job.stage_require or {}).items()
@@ -2240,8 +2283,9 @@ class MainWindow(QMainWindow):
         ]
         self._start_utility(
             lambda: [
-                (job_id, qualifying_pattern_ids(slot, mains, weights, require, self._pattern_catalog))
-                for job_id, slot, mains, weights, require in plans
+                (job_id, qualifying_pattern_ids(slot, mains, weights, require, self._pattern_catalog,
+                                               required_substats=required))
+                for job_id, slot, mains, weights, required, require in plans
             ],
             self._apply_select_all,
             "正在为全部任务生成组合并勾选合格卡片…",
@@ -2316,6 +2360,7 @@ class MainWindow(QMainWindow):
             stage_require[origin][checkpoint] = float(section.require.value())
         return {
             "weights": self.weight_editor.weights(),
+            "required_substats": self.weight_editor.required_substats(),
             "stage_require": stage_require,
             "accepted": self._rebased_selection(filtered=True),
             "mainstats": tuple(self._selected_mains()),
@@ -2336,7 +2381,7 @@ class MainWindow(QMainWindow):
     def _apply_slot_widgets(self, plan: dict) -> None:
         self.max_discs.setValue(int(plan.get("max_discs") or 100))
         self._refresh_main_boxes(set(plan.get("mainstats") or ()))
-        self.weight_editor.set_weights(dict(plan.get("weights") or {}))
+        self.weight_editor.set_weights(dict(plan.get("weights") or {}), tuple(plan.get("required_substats") or ()))
         self._apply_stage_require(plan.get("stage_require") or {})
 
     def _propagate_require(self, section: StageSection) -> None:
@@ -2825,6 +2870,7 @@ class MainWindow(QMainWindow):
                     str(origin): dict(table) for origin, table in (first.stage_require or {}).items()
                 },
                 "accepted": first.accepted,
+                "required_substats": first.required_substats,
                 "mainstats": tuple(first.mainstats),
                 "sets": tuple(first.sets),
                 "min_useful_types": 0,
@@ -2862,6 +2908,18 @@ class MainWindow(QMainWindow):
         self._invalidate_preview()
         self._mark_unsaved()
         self.trial.set_name_choices(self._blocked_substats())
+        self._update_status()
+        self._refresh_current_counts()
+
+    def _on_required_changed(self) -> None:
+        if self._loading:
+            return
+        required = self.weight_editor.required_substats()
+        for section in self.sections.values():
+            section.required_substats = required
+            if not self._preview_dirty:
+                section.apply_filter()
+        self._mark_unsaved()
         self._update_status()
         self._refresh_current_counts()
 
@@ -2938,6 +2996,7 @@ class MainWindow(QMainWindow):
             self._active_slot, mains, (slot.name for slot in pattern.slots)
         )]
         section = self.sections[key]
+        section.required_substats = self.weight_editor.required_substats()
         if section.can_reuse(patterns):
             section.reuse_cards(patterns, self._preview_policy)
         else:
@@ -2984,6 +3043,7 @@ class MainWindow(QMainWindow):
         job = TaskJob(
             slot=self._active_slot, mainstats=tuple(self._selected_mains()),
             weights=self.weight_editor.weights(), accepted=self._selection_seed,
+            required_substats=self.weight_editor.required_substats(),
             stage_require={origin.value: {level: float(self.sections[(origin.value, level)].require.value())
                                           for level in CHECKPOINTS} for origin in Origin},
         )
@@ -3027,6 +3087,7 @@ class MainWindow(QMainWindow):
             {
                 "name": self.name_edit.text().strip() or "default",
                 "weights": current.get("weights") or {},
+                "required_substats": list(current.get("required_substats") or ()),
                 "stage_require": current.get("stage_require") or {"three": {}, "four": {}},
                 "min_useful_types": int(current.get("min_useful_types") or 0),
                 "run": {"max_discs": int(self.max_discs.value())},
@@ -3040,6 +3101,7 @@ class MainWindow(QMainWindow):
                 "slot_plans": {
                     str(slot): {
                         "weights": plan.get("weights") or {},
+                        "required_substats": list(plan.get("required_substats") or ()),
                         "stage_require": plan.get("stage_require") or {"three": {}, "four": {}},
                         "mainstats": list(plan.get("mainstats") or ()),
                         "sets": list(plan.get("sets") or ()),
@@ -3087,9 +3149,10 @@ class MainWindow(QMainWindow):
         total = sum(len(section.patterns) for section in sections)
         picked = sum(len(section.visible_accepted()) for section in sections)
         scope = self.tabs.tabText(self.tabs.currentIndex()) if self.tabs.currentIndex() < 2 else "全部组合"
+        condition = "符合条件" if self.weight_editor.required_substats() else "符合门槛"
         self.status.setText(
             f"任务链 {len(self._jobs)} 节 · 正在编 {self._active_slot} 号 · "
-            f"{scope}：组合共 {total} 种，符合门槛 {visible}，已勾选 {picked}"
+            f"{scope}：组合共 {total} 种，{condition} {visible}，已勾选 {picked}"
         )
 
     def _toggle_on_top(self, on: bool) -> None:

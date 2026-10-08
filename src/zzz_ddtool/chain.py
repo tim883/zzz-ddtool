@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from zzz_ddtool.gamedata import SLOTS
+from zzz_ddtool.gamedata import SLOTS, normalize_required_substats
 
 
 def new_job_id() -> str:
@@ -22,6 +22,7 @@ class TaskJob:
     accepted: tuple[str, ...] | None = None
     min_useful_types: int = 0
     max_discs: int | None = None
+    required_substats: tuple[str, ...] = ()
 
     def title(self) -> str:
         """内容摘要，也是这条任务在界面上唯一的标识（没有单独的任务名）。"""
@@ -48,6 +49,8 @@ class TaskJob:
             data["accepted"] = list(self.accepted)
         if self.max_discs is not None:
             data["max_discs"] = self.max_discs
+        if self.required_substats:
+            data["required_substats"] = list(self.required_substats)
         return data
 
 
@@ -73,6 +76,7 @@ def job_from_dict(data: dict[str, Any]) -> TaskJob | None:
         accepted=accepted,
         min_useful_types=int(data.get("min_useful_types") or 0),
         max_discs=max(1, int(data["max_discs"])) if data.get("max_discs") is not None else None,
+        required_substats=normalize_required_substats(data.get("required_substats") or (), data.get("weights") or {}),
     )
 
 
