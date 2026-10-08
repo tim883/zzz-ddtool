@@ -1510,6 +1510,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:  # noqa: ANN001
         super().resizeEvent(event)
+        # 套装摘要按当前可用宽度重算省略号（宽度变了但文本没变也要刷新）。
+        if getattr(self, "set_summary", None) is not None:
+            self._update_set_summary()
         # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
         if self._layout_ready and not self._dragging_main_splitter:
             QTimer.singleShot(0, self._remember_lower_height)
@@ -1667,6 +1670,10 @@ class MainWindow(QMainWindow):
         self.set_summary = QLabel("未选")
         self.set_summary.setWordWrap(False)
         self.set_summary.setObjectName("hint")
+        # 套装名可以很长：必须允许这个标签被压到任意窄，否则它的 sizeHint
+        # 会把同一行的“选择套装”按钮顶出面板（右侧整块看不见）。
+        self.set_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.set_summary.setMinimumWidth(0)
         set_row.addWidget(self.set_summary, 1)
         pick_sets = QPushButton("选择套装")
         pick_sets.setToolTip("打开套装列表勾选；一个都不勾＝不限套装。")
@@ -2177,8 +2184,10 @@ class MainWindow(QMainWindow):
         else:
             text = "、".join(self._filter_sets)
         fm = QFontMetrics(self.set_summary.font())
-        width = max(self.set_summary.width(), 180)
+        # 用标签当前的真实宽度收省略号（未布局时 width 为 0，兜底 180）。
+        width = self.set_summary.width() or 180
         self.set_summary.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
+        self.set_summary.setToolTip(text)
 
     def _open_set_picker(self) -> None:
         extra = [name for name in self._filter_sets if name not in SETS]
