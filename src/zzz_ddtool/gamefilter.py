@@ -344,7 +344,8 @@ def _picker_name_bands(
     """粗 OCR 只定位行高；四列均读整条名称带，最多三行十二格。"""
     if (image.width(), image.height()) != (1920, 1080):
         return ()
-    area = layout.list_area
+    area = (max(layout.list_area[0], 800), max(layout.list_area[1], 354),
+            min(layout.list_area[2], 1490), min(layout.list_area[3], 827))
     centers = (900, 1064, 1228, 1392)
     seeds = []
     for line in lines:
@@ -362,6 +363,9 @@ def _picker_name_bands(
             rows[-1].append(line)
         else:
             rows.append([line])
+    rows = [row for row in rows
+            if area[1] <= min(x.top for x in row) - 4
+            and max(x.bottom for x in row) + 4 <= area[3]]
     if len(rows) > 3:
         raise FilterClickError("套装名称行几何存在歧义，停止")
     bands = []

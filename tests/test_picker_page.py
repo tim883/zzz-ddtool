@@ -130,3 +130,31 @@ def test_batch_result_count_mismatch_is_not_silently_zipped(monkeypatch):
     image = QImage(1920,1080,QImage.Format.Format_RGB32)
     with pytest.raises(ocr.OcrError,match="数量"):
         ocr.read_name_bands(image,[(826,480,974,520)])
+
+
+def test_real_scroll_edge_excludes_clipped_bottom_row():
+    image = QImage(str(BASE / "套装弹窗-滚动边缘四行.png"))
+    assert not image.isNull()
+    layout = gf._calibrated_layout(1920, 1080)
+    bands = gf._picker_name_bands(image, ocr.read_rect(image, layout.list_area), layout)
+    names = ocr.read_name_bands(image, bands)
+    assert [line.text if line else None for line in names] == [
+        "囚徒手记", "雪兔梦游仙境", "流光咏叹", "沧浪行歌",
+        "月光骑士颂", "拂晓生花", "山大王", "云岿如我",
+        "法厄同之歌", "如影相随", "折枝剑歌", "静听嘉音",
+    ]
+
+
+def test_edge_rows_are_removed_before_complete_row_count():
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    lines = [ocr.OcrLine("文字", 1, 860, y, 940, y + 20)
+             for y in (350, 480, 630, 780, 812)]
+    assert len(gf._picker_name_bands(image, lines, gf._calibrated_layout(1920, 1080))) == 12
+
+
+def test_four_complete_rows_still_fail():
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    lines = [ocr.OcrLine("文字", 1, 860, y, 940, y + 20)
+             for y in (400, 500, 600, 700)]
+    with pytest.raises(gf.FilterClickError, match="几何"):
+        gf._picker_name_bands(image, lines, gf._calibrated_layout(1920, 1080))
