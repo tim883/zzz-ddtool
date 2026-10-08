@@ -72,10 +72,12 @@ def test_global_polling_edges_pause_resume_stop(monkeypatch):
         wait_for(lambda: ctrl.paused)
         time.sleep(0.05)
         assert ctrl.paused  # 按住只触发一次
+        assert ctrl.pause_generation == 1
         pressed.clear()
         wait_for(lambda: hotkeys.VK_F9 not in ctrl._pressed)
         pressed.add(hotkeys.VK_F9)
         wait_for(lambda: not ctrl.paused)
+        assert ctrl.checkpoint() == 2
         pressed.add(hotkeys.VK_F10)
         wait_for(lambda: ctrl.stopped)
         with pytest.raises(RunnerStopped):

@@ -12,6 +12,8 @@ import threading
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from collections.abc import Sequence
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -320,6 +322,54 @@ def read_name_span(image: QImage, line: OcrLine, *, name: str) -> OcrLine | None
         right=span_right,
         bottom=span_bottom,
     )
+
+
+def read_name_bands(
+    image: QImage, bands: Sequence[tuple[int, int, int, int]]
+) -> list[OcrLine | None]:
+    """整页完整名称带一次批识别；字符框来自识别引擎，不使用粗检测的残缺 x 框。"""
+    from rapidocr.ch_ppocr_rec import TextRecInput
+
+    if not bands:
+        return []
+    crops = []
+    quadrilaterals = []
+    for left, top, right, bottom in bands:
+        if not (0 <= left < right <= image.width() and 0 <= top < bottom <= image.height()):
+            raise OcrError("完整名称带超出图像边界")
+        crops.append(qimage_to_bgr(image.copy(left, top, right - left, bottom - top)))
+        quadrilaterals.append([[left, top], [right, top], [right, bottom], [left, bottom]])
+    engine = _get_engine()
+    with _WORD_BOX_LOCK:
+        result = engine.text_rec(TextRecInput(img=crops, return_word_box=True))
+        if (result.txts is None or result.word_results is None or
+                len(result.txts) != len(bands) or len(result.word_results) != len(bands)):
+            raise OcrError("整页名称识别返回数量与输入名称带不一致")
+        # 直接传单字参数，不修改 RapidOCR 的全局 return_* 开关。
+        result = engine.cal_rec_boxes(crops, np.asarray(quadrilaterals, dtype=np.float32), result, True)
+    if len(result.word_results) != len(bands):
+        raise OcrError("整页名称字符框数量与输入名称带不一致")
+    output: list[OcrLine | None] = []
+    for band, words in zip(bands, result.word_results):
+        chars = [c for c in _char_boxes(SimpleNamespace(word_results=(words,)), 0, 0) if c.text.strip()]
+        text = "".join(c.text for c in chars)
+        match = re.fullmatch(r"([\u3400-\u9fff]+)(?:×?[0-9]+)?", text)
+        if match is None or any(len(c.text) != 1 for c in chars):
+            output.append(None)
+            continue
+        name = match[1]
+        targets, others = chars[:len(name)], chars[len(name):]
+        left, top = min(c.left for c in targets), min(c.top for c in targets)
+        right, bottom = max(c.right for c in targets), max(c.bottom for c in targets)
+        if not (band[0] <= left < right <= band[2] and band[1] <= top < bottom <= band[3]):
+            output.append(None)
+            continue
+        if any(min(right, c.right) > max(left, c.left) and min(bottom, c.bottom) > max(top, c.top)
+               for c in others):
+            output.append(None)
+            continue
+        output.append(OcrLine(name, min(c.score for c in targets), left, top, right, bottom))
+    return output
 
 
 def _fix_percent(text: str) -> str:

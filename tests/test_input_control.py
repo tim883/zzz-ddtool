@@ -96,3 +96,39 @@ def test_task_control_does_not_leak_to_another_thread():
         assert done.wait(2)
         thread.join(2)
     checkpoint.assert_not_called()
+
+
+def test_single_action_reuses_observation_only_for_same_pause_generation():
+    generation = [0]
+    validate = Mock()
+    with controlled_inputs(lambda: generation[0]), validated_inputs(validate, reuse_unchanged=True):
+        checkpoint_input()
+        checkpoint_input()
+        assert validate.call_count == 1
+        generation[0] += 2  # 暂停、恢复发生在两检查点之间，也必须重新观察
+        checkpoint_input()
+        assert validate.call_count == 2
+    with controlled_inputs(lambda: generation[0]), validated_inputs(validate, reuse_unchanged=True):
+        checkpoint_input()  # 下一个动作绝不能复用前一个动作的观察
+    assert validate.call_count == 3
+
+
+def test_unknown_generation_keeps_every_boundary_validation():
+    validate = Mock()
+    with controlled_inputs(lambda: None), validated_inputs(validate, reuse_unchanged=True):
+        checkpoint_input()
+        checkpoint_input()
+    assert validate.call_count == 2
+
+
+def test_generation_change_rejects_internal_boundary_before_native_input():
+    generation = [0]
+    validate = Mock(side_effect=[None, ValueError("changed page")])
+    native = Mock()
+    with controlled_inputs(lambda: generation[0]), validated_inputs(validate, reuse_unchanged=True):
+        checkpoint_input()
+        generation[0] = 2
+        with pytest.raises(ValueError, match="changed page"):
+            checkpoint_input()
+            native()
+    native.assert_not_called()

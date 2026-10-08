@@ -53,6 +53,7 @@ REVIEW_ENTRY_FIELDS = ("round", "path", "task", "sets_exact", "counts_exact",
 # §9 步骤6：固定清单（含 wininput.py；新增文件按清单检查，不依赖 git 索引/未跟踪状态）
 STATIC_FILES = (
     "src/zzz_ddtool/control.py",
+    "src/zzz_ddtool/hotkeys.py",
     "src/zzz_ddtool/filter_replay.py",
     "src/zzz_ddtool/gamefilter.py",
     "src/zzz_ddtool/ocr.py",
@@ -64,6 +65,8 @@ STATIC_FILES = (
     "tests/test_input_capture.py",
     "tests/test_gamefilter_substat.py",
     "tests/test_runner.py",
+    "tests/test_kept_upgrade.py",
+    "tests/test_picker_page.py",
     "tests/test_stats.py",
     "tests/live_filter_replay.py",
     "tests/check_filter_replay_artifacts.py",

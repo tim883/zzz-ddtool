@@ -270,14 +270,14 @@ class Acceptance:
         self.log.info("控制标记 %s run=%s", kind, self.recorder.run)
         return t_ns
 
-    def checkpoint(self) -> None:
+    def checkpoint(self) -> int:
         controller = self.controller
         assert controller is not None
         if controller.paused and not self._paused_seen:
             self._paused_seen = True
             self.note_control("paused")
         try:
-            controller.checkpoint()
+            generation = controller.checkpoint()
         except RunnerStopped:
             if not self.stop_seen:
                 self.stop_seen = True
@@ -286,6 +286,7 @@ class Acceptance:
         if self._paused_seen and not self._resumed_seen and not controller.paused:
             self._resumed_seen = True
             self.note_control("resumed")
+        return generation
 
     # ---- 前提与守卫 ----
     def guard(self) -> None:

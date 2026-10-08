@@ -35,7 +35,7 @@ from zzz_ddtool.layout import (
     scale_rect,
 )
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.ocr import OcrLine, read_name_span, read_rect
+from zzz_ddtool.ocr import OcrLine, read_name_bands, read_name_span, read_rect
 from zzz_ddtool.wininput import (
     VK_ESCAPE,
     click_client,
@@ -135,11 +135,11 @@ def _window_dpi(hwnd: int) -> int:
 
 
 def _calibrated_layout(width: int, height: int) -> SetPickerLayout | None:
-    """生产标定布局（模块内数据；与 tests/fixtures/filter-replay/manifest.json 的 1920x1080-v6 同值）。"""
+    """生产标定布局（模块内数据；与静态清单的 1920x1080-v7 同值）。"""
     if (width, height) != (1920, 1080):
         return None
     return SetPickerLayout(
-        layout_id="1920x1080-v6",
+        layout_id="1920x1080-v7",
         list_area=(800, 340, 1490, 840),
         confirm_area=(1040, 838, 1260, 900),
         origin_mode="reopen_top",
@@ -338,6 +338,41 @@ def _read_picker_name_span(
     return read_name_span(image, search_line, name=name)
 
 
+def _picker_name_bands(
+    image: QImage, lines: Sequence[OcrLine], layout: SetPickerLayout,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """粗 OCR 只定位行高；四列均读整条名称带，最多三行十二格。"""
+    if (image.width(), image.height()) != (1920, 1080):
+        return ()
+    area = layout.list_area
+    centers = (900, 1064, 1228, 1392)
+    seeds = []
+    for line in lines:
+        if len(re.findall(r"[\u3400-\u9fff]", line.text)) < 2 or not 0 < line.bottom - line.top <= 40:
+            continue
+        column = min(centers, key=lambda x: abs(x - (line.left + line.right) / 2))
+        if not (column - 74 <= line.left < line.right <= column + 74):
+            continue
+        if area[1] <= line.top and line.bottom <= area[3]:
+            seeds.append(line)
+    rows: list[list[OcrLine]] = []
+    for line in sorted(seeds, key=lambda item: (item.top + item.bottom) / 2):
+        if rows and abs((line.top + line.bottom) / 2 -
+                        (rows[-1][0].top + rows[-1][0].bottom) / 2) <= 12:
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+    if len(rows) > 3:
+        raise FilterClickError("套装名称行几何存在歧义，停止")
+    bands = []
+    for row in rows:
+        top, bottom = min(x.top for x in row) - 4, max(x.bottom for x in row) + 4
+        if not (area[1] <= top < bottom <= area[3]) or bottom - top > 48:
+            continue
+        bands.extend((x - 74, top, x + 74, bottom) for x in centers)
+    return tuple(bands)
+
+
 def _select_sets_learn(
     hwnd: int,
     names: Sequence[str],
@@ -361,6 +396,12 @@ def _select_sets_learn(
     for round_index in range(_PICKER_MAX_ROUNDS):
         lines = read_rect(image, layout.list_area)
         metrics.search_ocr_calls += 1
+        bands = _picker_name_bands(image, lines, layout)
+        if bands:
+            lines = [line for line in read_name_bands(image, bands) if line is not None]
+            metrics.search_ocr_calls += 1
+        else:
+            lines = []
         matched = _match_targets(lines, pending)
         if matched is None:
             raise FilterClickError("套装名称匹配到冲突框（同分或同框），停止。")
@@ -372,9 +413,9 @@ def _select_sets_learn(
         # §5.1.3 / R21：本帧**所有**候选的名称框与指纹先全部就绪，任何一项失败都在任何点击之前停止
         for name in [n for n in names if n in matched]:
             line = matched[name]
-            span = _read_picker_name_span(image, line, name=name, layout=layout, metrics=metrics)
-            if span is None:
+            if _normalize_match_text(line.text) != _normalize_match_text(name):
                 raise FilterClickError(f"套装名 {name!r} 无法隔离精确文字框，停止。")
+            span = line
             box = (span.left, span.top, span.right, span.bottom)
             if any(_boxes_overlap(box, other) for _n, _c, other in prepared_boxes):
                 raise FilterClickError("两个目标的名称框重叠，停止。")
@@ -539,7 +580,7 @@ def _checked_picker_input(
         if verdict is not True:
             raise FilterClickError(f"{message}（{verdict}），停止。")
 
-    with validated_inputs(validate):
+    with validated_inputs(validate, reuse_unchanged=True):
         yield
 
 

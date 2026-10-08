@@ -17,10 +17,10 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool.capture import find_game_hwnd, grab_game_image, window_pid
+from zzz_ddtool.capture import CaptureError, find_game_hwnd, grab_game_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
-from zzz_ddtool.control import controlled_inputs
+from zzz_ddtool.control import controlled_inputs, validated_inputs
 from zzz_ddtool.decide import decide
 from zzz_ddtool.filter_replay import FilterReplaySession
 from zzz_ddtool.gamefilter import apply_game_filter, reset_game_filter
@@ -87,7 +87,7 @@ from zzz_ddtool.traversal import (
     split_stable_cells,
     tail_slots_confirmed,
 )
-from zzz_ddtool.wininput import VK_ESCAPE, VK_R, click_client, press_key, press_key_once
+from zzz_ddtool.wininput import InputError, VK_ESCAPE, VK_R, VK_T, click_client, press_key, press_key_once
 
 # 单个盘子连续升阶上限（0→15 最多 5 阶，留余量防 OCR 读级错误导致死循环）
 _MAX_STAGE_UPGRADES = 6
@@ -201,15 +201,17 @@ class Runner:
     def processed_disc_count(self) -> int:
         return self._processed
 
-    def _checkpoint(self) -> None:
+    def _checkpoint(self) -> int | None:
         """F9 暂停 / F10 停止的安全检查点（未启用热键时为空操作）。"""
         if self.hotkeys is not None:
             paused = self.hotkeys.paused
             if paused:
                 self._set_status("paused", "已暂停，F9 或恢复按钮继续")
-            self.hotkeys.checkpoint()
+            generation = self.hotkeys.checkpoint()
             if paused:
                 self._set_status("running", "已恢复")
+            return generation if type(generation) is int else None
+        return None
 
     _status_lines: list[str] = []
 
@@ -1815,6 +1817,56 @@ class Runner:
             self.stats.note_discard_label()
         return True
 
+    def _finish_kept_upgrade(self, hwnd: int, disc: Disc) -> None:
+        """在当前盘仍被选中时完成保留标签；不能在切页置顶后补按 T。"""
+        self._esc_back_to_grid(hwnd)
+        if not self.preset.labels.allows("save"):
+            self.log.info("保存标签设置关闭：升满保留，不修改锁定标签")
+            return
+
+        def read_current() -> tuple[Disc, QImage]:
+            for attempt in range(max(1, self.preset.ocr_retry)):
+                self._checkpoint()
+                image, page, *_ = self._grab(allow_esc=False)
+                if page != "drive_disc":
+                    raise RunnerError("保留锁定时已离开驱动盘仓库，停止任务链")
+                try:
+                    current = parse_disc(image)
+                except OcrError as exc:
+                    self.log.warning("保留锁定盘面 OCR 失败（%d/%d）：%s", attempt + 1,
+                                     max(1, self.preset.ocr_retry), exc)
+                    current = None
+                if current is not None:
+                    expected_stats = sorted((s.name, s.rolls) for s in disc.substats)
+                    actual_stats = sorted((s.name, s.rolls) for s in current.substats)
+                    if (current.level, current.rarity, actual_stats) != (disc.level, disc.rarity, expected_stats):
+                        raise RunnerError("保留锁定时盘面与刚升级的盘不一致，停止任务链")
+                    if current.locked is not None:
+                        return current, image
+                if attempt + 1 < max(1, self.preset.ocr_retry):
+                    time.sleep(0.2)
+            raise RunnerError("保留锁定时锁定状态无法确认，停止任务链")
+
+        current, image = read_current()
+        if current.locked is True:
+            self.log.info("升满保留：盘已锁定，不重复按 T")
+            self.trace.ok("detail", "lock", "升满保留，已锁定", image=image)
+            return
+
+        def validate_unlocked() -> None:
+            checked, _ = read_current()
+            if checked.locked is not False or checked.discarded is not False:
+                raise RunnerError("锁定输入前标签状态改变或未知，停止任务链")
+
+        with validated_inputs(validate_unlocked):
+            press_key_once(hwnd, VK_T)
+        time.sleep(0.3)
+        current, image = read_current()
+        if current.locked is not True:
+            raise RunnerError("按 T 后未确认锁定成功，不重复按键，停止任务链")
+        self.log.info("升满保留：已确认锁定标签 (T)")
+        self.trace.ok("detail", "lock", "升满保留，已确认 T 锁定", image=image)
+
     def _act(self, hwnd: int, action: Action, disc: Disc) -> None:
         # UPGRADE 在 _process_cell 里内联处理（需要 rescan/计数联动），这里只管其余动作。
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
@@ -2158,7 +2210,20 @@ class Runner:
                 self.stats.disc_end(disc_slot, OUTCOME_DISCARDED, disc.level, decision.score)
                 self._discard_from_upgrade(hwnd)
                 return disc.level
-            # SKIP：不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
+            if decision.reason == "keep_max_level" and upgraded > 0:
+                try:
+                    self._finish_kept_upgrade(hwnd, disc)
+                except RunnerStopped:
+                    raise
+                except (RunnerError, CaptureError, OcrError, InputError) as exc:
+                    self.stats.disc_end(disc_slot, OUTCOME_FAILED, disc.level, decision.score)
+                    if isinstance(exc, RunnerError):
+                        raise
+                    raise RunnerError(f"保留锁定收尾失败：{exc}，停止任务链") from exc
+                self._record(job, disc, decision)
+                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
+                return disc.level
+            # 其他 SKIP 不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
             self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)
             self.trace.ok("upgrade", "decide", f"判为跳过：{decision.reason}")
             self._record(job, disc, decision)

@@ -185,6 +185,8 @@ def offline_runner(monkeypatch):
     default_cells = ([make_cell(0, 0, 0), make_cell(1, 0, 1)], [], {})
     monkeypatch.setattr(Runner, "_scan_cells", lambda self, state, **kw: default_cells)
     monkeypatch.setattr(Runner, "_grab", lambda *a, **kw: (image, "unknown", "test", 1))
+    # 该文件的替身链不提供真实仓库标签图；标签收尾本体独立由 test_kept_upgrade 验证。
+    monkeypatch.setattr(Runner, "_finish_kept_upgrade", lambda self, hwnd, disc: self._esc_back_to_grid(hwnd))
     monkeypatch.setattr(Runner, "_advance", lambda self, hwnd, state, cells, *, rows: True)
 
     inputs = {

@@ -368,6 +368,7 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch, stub: _PickerStub, *, passthr
     monkeypatch.setattr(gf, "window_pid", lambda _hwnd: 200)
     monkeypatch.setattr(gf.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(gf, "read_rect", lambda _image, area: (stub.reads.append(tuple(area)), stub.lines_for(tuple(area)))[1])
+    monkeypatch.setattr(gf, "read_name_bands", lambda _image, _bands: stub.lines_for(_layout().list_area))
 
     def _span(_image, line, *, name):
         stub.span_names.append(name)
@@ -1081,14 +1082,13 @@ def test_span_failure_stops_before_any_click(monkeypatch: pytest.MonkeyPatch) ->
     """R21：名称框隔离失败 → 整段零选项点击失败，即使同帧还有别的可用目标。"""
     stub = _PickerStub([["静听嘉音", "河豚电音"]])
     _install_stub(monkeypatch, stub)
-    real_span = gf.read_name_span
+    original = gf.read_name_bands
 
-    def span(_image, line, *, name):
-        if name == "河豚电音":
-            return None
-        return real_span(_image, line, name=name)
+    def batch(image, bands):
+        return [replace(line, text="河豚电台") if line.text == "河豚电音" else line
+                for line in original(image, bands)]
 
-    monkeypatch.setattr(gf, "read_name_span", span)
+    monkeypatch.setattr(gf, "read_name_bands", batch)
     session = FilterReplaySession()
     with pytest.raises(gf.FilterClickError, match="无法隔离精确文字框"):
         _run(session, stub, ("河豚电音", "静听嘉音"))
@@ -1598,9 +1598,10 @@ def test_confirm_observation_budget(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("mode", ["learn", "replay"])
 @pytest.mark.parametrize("action", ["option", "confirm", "scroll", "wheel_top"])
 @pytest.mark.parametrize("boundary", ["entry", "focus"])
-def test_changed_page_at_native_checkpoint(monkeypatch, mode, action, boundary):
+@pytest.mark.parametrize("known_generation", [False, True])
+def test_changed_page_at_native_checkpoint(monkeypatch, mode, action, boundary, known_generation):
     """C01：走真实 click/wheel/focus 检查点，变化后追加原生输入为零；不能假成功。"""
-    screens = [[], ["alpha"]] if action == "scroll" else [["alpha"]]
+    screens = [[], ["河豚电音"]] if action == "scroll" else [["河豚电音"]]
     stub = _PickerStub(screens)
     _install_stub(monkeypatch, stub, passthrough=True)
     windows = Mock()
@@ -1615,7 +1616,7 @@ def test_changed_page_at_native_checkpoint(monkeypatch, mode, action, boundary):
         monkeypatch.setattr(gf, "_calibrated_layout", lambda width, height: layout)
     session = FilterReplaySession()
     if mode == "replay":
-        _run(session, stub, ("alpha",))
+        _run(session, stub, ("河豚电音",))
         stub.reset_log()
         windows.reset_mock()
     state = {"active": False, "changed": False, "sent_before": None}
@@ -1637,8 +1638,12 @@ def test_changed_page_at_native_checkpoint(monkeypatch, mode, action, boundary):
         stub.identity_ok = False
         monkeypatch.setattr(gf, "_picker_stage_matches", lambda image, layout: False)
 
-    with wininput.capture_inputs(record), controlled_inputs(checkpoint), pytest.raises(gf.FilterClickError):
-        _run(session, stub, ("alpha",))
+    def with_generation():
+        checkpoint()
+        return (2 if state["changed"] else 0) if known_generation else None
+
+    with wininput.capture_inputs(record), controlled_inputs(with_generation), pytest.raises(gf.FilterClickError):
+        _run(session, stub, ("河豚电音",))
     assert state["changed"]
     assert len(windows.mouse_event.mock_calls) == state["sent_before"]
     assert len(stub.clicks) == (1 if action == "confirm" else 0)
@@ -1683,11 +1688,11 @@ def test_reference_image_missing_or_corrupt_fails(tmp_path, monkeypatch, exists)
 @pytest.mark.parametrize("mode", ["learn", "replay"])
 @pytest.mark.parametrize("field", ["hwnd", "pid", "size", "dpi"])
 def test_environment_changed_at_input_checkpoint(monkeypatch, mode, field):
-    stub = _PickerStub([["alpha"]])
+    stub = _PickerStub([["河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
     if mode == "replay":
-        _run(session, stub, ("alpha",))
+        _run(session, stub, ("河豚电音",))
         stub.reset_log()
 
     def checkpoint():
@@ -1703,7 +1708,7 @@ def test_environment_changed_at_input_checkpoint(monkeypatch, mode, field):
             monkeypatch.setattr(gf, "_grab", lambda: (image, stub.hwnd))
 
     with controlled_inputs(checkpoint), pytest.raises(gf.FilterClickError):
-        _run(session, stub, ("alpha",))
+        _run(session, stub, ("河豚电音",))
     assert stub.clicks == [] and stub.wheels == []
     assert session.routes == {} and session.last_metrics["success"] is False
 
@@ -1712,7 +1717,7 @@ def test_environment_changed_at_input_checkpoint(monkeypatch, mode, field):
 @pytest.mark.parametrize("changed", [False, True])
 def test_blocked_focus_checkpoint_resume(monkeypatch, mode, changed):
     """检查点实际阻塞时无原生输入；恢复不变则继续，页面变化则停止。"""
-    stub = _PickerStub([["alpha"]])
+    stub = _PickerStub([["河豚电音"]])
     _install_stub(monkeypatch, stub, passthrough=True)
     windows = Mock()
     monkeypatch.setattr(wininput, "user32", windows)
@@ -1722,7 +1727,7 @@ def test_blocked_focus_checkpoint_resume(monkeypatch, mode, changed):
     monkeypatch.setattr(wininput, "pause", lambda *args: None)
     session = FilterReplaySession()
     if mode == "replay":
-        _run(session, stub, ("alpha",))
+        _run(session, stub, ("河豚电音",))
         stub.reset_log()
         windows.reset_mock()
     entered, resume = threading.Event(), threading.Event()
@@ -1741,7 +1746,7 @@ def test_blocked_focus_checkpoint_resume(monkeypatch, mode, changed):
     def worker():
         try:
             with wininput.capture_inputs(record), controlled_inputs(checkpoint):
-                _run(session, stub, ("alpha",))
+                _run(session, stub, ("河豚电音",))
         except Exception as exc:
             errors.append(exc)
 
@@ -1881,7 +1886,7 @@ def test_real_frame_learning_and_replay_after_truncated_candidate(monkeypatch):
     confirm_line = next(ln for ln in read_rect(image, LAYOUT.confirm_area) if ln.text == "确认筛选")
     confirm_span = read_name_span(image, confirm_line, name="确认筛选")
     assert confirm_span is not None
-    originals = {name: getattr(gf, name) for name in ("read_rect", "read_name_span", "make_identity", "identity_matches")}
+    originals = {name: getattr(gf, name) for name in ("read_rect", "read_name_span", "read_name_bands", "make_identity", "identity_matches")}
     stub = _PickerStub([["震星迪斯科", "激素朋克"]],
         boxes={"震星迪斯科": (858, 738, 945, 760), "激素朋克": (1192, 738, 1261, 761)},
         confirm_box=(confirm_span.left, confirm_span.top, confirm_span.right, confirm_span.bottom))

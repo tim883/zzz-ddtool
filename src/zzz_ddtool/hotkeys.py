@@ -34,6 +34,7 @@ class HotkeyController:
     def __init__(self, poll_interval: float = 0.05) -> None:
         self.poll_interval = poll_interval
         self.paused = False
+        self.pause_generation = 0
         self.stopped = False
         self._pressed: set[int] = set()
         self._lock = threading.Lock()
@@ -50,6 +51,7 @@ class HotkeyController:
                     if down and vk not in self._pressed and not self.stopped:
                         if vk == VK_F9:
                             self.paused = not self.paused
+                            self.pause_generation += 1
                             self.log.info("热键 F9：暂停=%s", self.paused)
                         else:
                             self.stopped = True
@@ -60,17 +62,21 @@ class HotkeyController:
                         self._pressed.discard(vk)
             self._closed.wait(self.poll_interval)
 
-    def checkpoint(self) -> None:
+    def checkpoint(self) -> int:
         """安全检查点：暂停则阻塞，停止则抛 RunnerStopped。"""
-        while self.paused and not self.stopped:
+        while True:
+            with self._lock:
+                if self.stopped:
+                    raise RunnerStopped("F10 请求停止")
+                if not self.paused:
+                    return self.pause_generation
             time.sleep(0.1)
-        if self.stopped:
-            raise RunnerStopped("F10 请求停止")
 
     def toggle_pause(self) -> bool:
         with self._lock:
             if not self.stopped:
                 self.paused = not self.paused
+                self.pause_generation += 1
             paused = self.paused
         self.log.info("控制请求：暂停=%s", paused)
         return paused
