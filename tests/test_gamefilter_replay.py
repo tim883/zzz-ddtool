@@ -441,7 +441,7 @@ def _layout() -> SetPickerLayout:
 
 
 def test_learn_route(monkeypatch: pytest.MonkeyPatch) -> None:
-    """R01：空首屏不入路径；两段各 1 条 -3 滚动，三个目标各点一次，成功后 routes 数量为 1。"""
+    """R01：空首屏不入路径；两段各 1 条 -8 滚动，三个目标各点一次，成功后 routes 数量为 1。"""
     stub = _PickerStub([[], ["静听嘉音", "折枝剑歌"], ["河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
@@ -451,7 +451,7 @@ def test_learn_route(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(session.routes) == 1
     route = next(iter(session.routes.values()))
     assert [stage.wheel_events for stage in route.stages] == [1, 1]
-    assert [stage.delta_units for stage in route.stages] == [-3, -3]
+    assert [stage.delta_units for stage in route.stages] == [-8, -8]
     assert [[click.name for click in stage.clicks] for stage in route.stages] == [
         ["静听嘉音", "折枝剑歌"],
         ["河豚电音"],

@@ -198,3 +198,25 @@ def test_name_batch_removes_chroma_without_rewriting_recognized_text(monkeypatch
     assert np.array_equal(observed[0][:, :, 0], observed[0][:, :, 1])
     assert np.array_equal(observed[0][:, :, 1], observed[0][:, :, 2])
     assert line == ocr.OcrLine("撩牙重金属", .9, 100, 200, 150, 220)
+
+
+def test_measured_three_row_pages_cover_contiguous_rows():
+    expected = [
+        "荆棘玫瑰", "谶羽之誓", "拂晓行纪", "呼啸沙龙",
+        "囚徒手记", "雪兔梦游仙境", "流光咏叹", "沧浪行歌",
+        "月光骑士颂", "拂晓生花", "山大王", "云岿如我",
+        "法厄同之歌", "如影相随", "折枝剑歌", "静听嘉音",
+        "混沌爵士", "原始朋克", "啄木鸟电音", "河豚电音",
+        "震星迪斯科", "自由蓝调", "激素朋克", "灵魂摇滚",
+        "摇摆爵士", "炎狱重金属", "混沌重金属", "雷暴重金属",
+        "极地重金属", "獠牙重金属",
+    ]
+    layout = gf._calibrated_layout(1920, 1080)
+    assert layout.layout_id == "1920x1080-v8"
+    assert (gf._PICKER_SCROLL_EVENTS, gf._PICKER_SCROLL_DELTA) == (1, -8)
+    for suffix, start, stop in [("顶部", 0, 12), ("中部", 12, 24), ("底部", 20, 30)]:
+        image = QImage(str(BASE / f"套装弹窗-三行翻页-{suffix}.png"))
+        assert not image.isNull()
+        bands = gf._picker_name_bands(image, ocr.read_rect(image, layout.list_area), layout)
+        names = ocr.read_name_bands(image, bands)
+        assert [line.text for line in names if line] == expected[start:stop]

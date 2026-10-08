@@ -84,11 +84,10 @@ class FilterClickError(RuntimeError):
 
 # ---------------- 套装路径：分派、学习、指标（spec §5） ----------------
 
-# 每轮为找下一屏目标发出的滚动：一次 wheel_client（delta=-3，一条 -360 原始事件）。
-# R01 的期望路径把每个 stage 的 wheel_events 固定为 1，因此这里每轮只发一条；
-# 实测一条约 200px、行距约 150px（≈1.3 行），相邻两屏有重叠，不会漏行。
+# 每轮一次 wheel_client（delta=-8，一条 -960 原始事件）。
+# 本机实测约 447px、行距约 150px，即三行；底部由游戏截断，保留重叠行。
 _PICKER_SCROLL_EVENTS = 1
-_PICKER_SCROLL_DELTA = -3
+_PICKER_SCROLL_DELTA = -8
 _PICKER_MATCH_CUTOFF = 0.75
 _PICKER_MAX_ROUNDS = 8
 _PICKER_OBSERVE_FRAMES = 3
@@ -135,11 +134,11 @@ def _window_dpi(hwnd: int) -> int:
 
 
 def _calibrated_layout(width: int, height: int) -> SetPickerLayout | None:
-    """生产标定布局（模块内数据；与静态清单的 1920x1080-v7 同值）。"""
+    """生产标定布局（模块内数据；与静态清单的 1920x1080-v8 同值）。"""
     if (width, height) != (1920, 1080):
         return None
     return SetPickerLayout(
-        layout_id="1920x1080-v7",
+        layout_id="1920x1080-v8",
         list_area=(800, 340, 1490, 840),
         confirm_area=(1040, 838, 1260, 900),
         origin_mode="reopen_top",
