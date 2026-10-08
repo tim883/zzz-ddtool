@@ -337,7 +337,9 @@ def read_name_bands(
     for left, top, right, bottom in bands:
         if not (0 <= left < right <= image.width() and 0 <= top < bottom <= image.height()):
             raise OcrError("完整名称带超出图像边界")
-        crops.append(qimage_to_bgr(image.copy(left, top, right - left, bottom - top)))
+        crop = qimage_to_bgr(image.copy(left, top, right - left, bottom - top))
+        # 名称灰字的彩色抗锯齿会干扰偏旁识别；保持尺寸和坐标，仅去掉色度。
+        crops.append(cv2.cvtColor(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR))
         quadrilaterals.append([[left, top], [right, top], [right, bottom], [left, bottom]])
     engine = _get_engine()
     with _WORD_BOX_LOCK:

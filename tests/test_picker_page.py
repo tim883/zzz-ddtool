@@ -158,3 +158,43 @@ def test_four_complete_rows_still_fail():
              for y in (400, 500, 600, 700)]
     with pytest.raises(gf.FilterClickError, match="几何"):
         gf._picker_name_bands(image, lines, gf._calibrated_layout(1920, 1080))
+
+
+def test_real_bottom_name_precision():
+    image = QImage(str(BASE / "套装弹窗-底部獠牙错字.png"))
+    assert not image.isNull()
+    layout = gf._calibrated_layout(1920, 1080)
+    bands = gf._picker_name_bands(image, ocr.read_rect(image, layout.list_area), layout)
+    names = ocr.read_name_bands(image, bands)
+    assert names[9].text == "獠牙重金属"
+    assert len(names) == 12 and names[10:] == [None, None]
+    matched = gf._match_targets([line for line in names if line], ["獠牙重金属"])
+    assert matched["獠牙重金属"] == names[9]
+    line = names[9]
+    identity = make_identity(image, (line.left, line.top, line.right, line.bottom))
+    assert identity is not None and identity_matches(image, identity) is True
+    assert gf._pre_click_state(image, line, identity) is True
+
+
+def test_name_batch_removes_chroma_without_rewriting_recognized_text(monkeypatch):
+    import numpy as np
+    result = SimpleNamespace(txts=["撩牙重金属"], word_results=[()])
+    observed = []
+
+    def recognize(request):
+        crop, = request.img
+        observed.append(crop)
+        return result
+
+    engine = SimpleNamespace(text_rec=recognize, cal_rec_boxes=lambda *args: result)
+    chars = [ocr.OcrLine(c, .9, 100 + i * 10, 200, 110 + i * 10, 220)
+             for i, c in enumerate("撩牙重金属")]
+    monkeypatch.setattr(ocr, "_get_engine", lambda: engine)
+    monkeypatch.setattr(ocr, "_char_boxes", lambda *args: chars)
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(0xff224488)
+    line, = ocr.read_name_bands(image, [(90, 190, 250, 230)])
+    assert len(observed) == 1 and observed[0].shape == (40, 160, 3)
+    assert np.array_equal(observed[0][:, :, 0], observed[0][:, :, 1])
+    assert np.array_equal(observed[0][:, :, 1], observed[0][:, :, 2])
+    assert line == ocr.OcrLine("撩牙重金属", .9, 100, 200, 150, 220)
