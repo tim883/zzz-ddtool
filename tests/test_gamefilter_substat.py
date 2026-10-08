@@ -1,24 +1,32 @@
+import json
+from pathlib import Path
+
 import pytest
 from PySide6.QtGui import QColor, QImage
 
 from zzz_ddtool import gamefilter as gf
 from zzz_ddtool.ocr import OcrLine
 
+BASE = Path(__file__).resolve().parents[1]
+MANIFEST = BASE / "tests" / "fixtures" / "filter-replay" / "manifest.json"
 
-def line(text, x, y, half_width=45):
-    return OcrLine(text=text, score=0.99, left=x - half_width, right=x + half_width, top=y - 12, bottom=y + 12)
+
+def line(text, x, y, half_width=45, half_height=12):
+    return OcrLine(text=text, score=0.99, left=x - half_width, right=x + half_width,
+                   top=y - half_height, bottom=y + half_height)
 
 
-def fake_panel(monkeypatch, *, selected=(), fail_click=False, hide_counts=False, paged=False, bottom_band=False):
+def fake_panel(monkeypatch, *, selected=(), fail_click=False, hide_counts=False, paged=False,
+               bottom_band=False, partial_first=False, tall_dead_zone=False):
     options = [line("暴击率", 1425, 620), line("暴击伤害", 1700, 620), line("攻击力百分比", 1425, 680)]
-    state = {"open": False, "selected": set(map(str, selected)), "page": 0, "scrolls": 0}
+    state = {"open": False, "selected": set(map(str, selected)), "page": 0, "scrolls": 0, "log": []}
 
     def counts():
         # bottom_band=True 时数字行初始 y=960（在面板搜索区内，但底边 972 落在底部
-        # 「点击无效带」里），每滚一次上移 220px；真实实现「一次滑到底」= 一次调用把
-        # page 推到 1，数字行随即进入可点区。
+        # 「点击无效带」里），每滚一次上移 60px（972 → 912，进入可点区）；真实实现
+        # 「一次滑到底」= 一次调用把 page 推到 1，数字行随即进入可点区。
         base = 960 if bottom_band else 820
-        return [line(str(i), 1380 + i * 100, base - state["page"] * 220, half_width=15) for i in range(1, 5)]
+        return [line(str(i), 1380 + i * 100, base - state["page"] * 60, half_width=15) for i in range(1, 5)]
 
     def items():
         return options + counts()
@@ -40,14 +48,24 @@ def fake_panel(monkeypatch, *, selected=(), fail_click=False, hide_counts=False,
         # 主属性同名项目不应被点击。
         lines.extend([line(gf.MAINSTAT_TITLE, 1400, 300), line("点击展开", 1560, 350), line("暴击率", 1425, 400)])
         if state["open"]:
-            if not paged or state["page"] == 0:
-                lines += options
+            visible = options
+            if partial_first and state["page"] == 0:
+                # S02：初帧只有部分目标露出，滚到底后完整可见
+                visible = [item for item in options if item.text == "攻击力百分比"]
+            if tall_dead_zone and state["page"] == 0:
+                # S03：中心在可点区内但底边越过禁区（bottom=940 > 920），不得点击
+                visible = [
+                    line("暴击率", 1425, 820, half_height=120) if item.text == "暴击率" else item
+                    for item in options
+                ]
+            lines += visible
             if not hide_counts and (not paged or state["page"] > 0):
                 lines += counts()
         return lines
 
     def click(hwnd, x, y):
         clicks.append((x, y))
+        state["log"].append(("click", x, y))
         if y == 565:
             state["open"] = True
             return
@@ -60,13 +78,23 @@ def fake_panel(monkeypatch, *, selected=(), fail_click=False, hide_counts=False,
     def scroll(*args, **kwargs):
         state["page"] += 1
         state["scrolls"] += 1
+        state["log"].append(("scroll", state["page"]))
+
+    reads = {"n": 0}
+    real_read_panel = gf._read_panel
+
+    def counting_read_panel():
+        reads["n"] += 1
+        return real_read_panel()
 
     monkeypatch.setattr(gf, "_grab", grab)
     monkeypatch.setattr(gf, "read_rect", read)
     monkeypatch.setattr(gf, "click_client", click)
     monkeypatch.setattr(gf, "wheel_client", scroll)
     monkeypatch.setattr(gf, "_scroll_panel_to_bottom", scroll)
+    monkeypatch.setattr(gf, "_read_panel", counting_read_panel)
     monkeypatch.setattr(gf.time, "sleep", lambda *a: None)
+    state["panel_reads"] = reads
     return state, clicks
 
 
@@ -93,8 +121,93 @@ def test_failed_selection_stops_before_scanning(monkeypatch):
 
 def test_missing_count_stops_instead_of_using_partial_condition(monkeypatch):
     fake_panel(monkeypatch, hide_counts=True)
-    with pytest.raises(gf.FilterClickError, match="找不到选项"):
+    with pytest.raises(gf.FilterClickError, match="副属性目标未就位"):
         gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1, 2, 3, 4))
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["ready_no_rescan", "position_before_selection", "bottom_dead_zone", "still_missing",
+     "selection_failure", "substat_reference_manifest"],
+)
+def test_substat_acceptance(monkeypatch, case: str) -> None:
+    """spec §8.2 S01—S06：就位契约、禁区标准、观察上限与判读共用。"""
+    if case == "ready_no_rescan":  # S01：已就位 → 不滚、不重复面板 OCR、只点该点的
+        state, clicks = fake_panel(monkeypatch, selected=(3, 4))
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(3, 4))
+        assert state["scrolls"] == 0
+        assert state["panel_reads"]["n"] == 2  # 展开阶段两帧（初检+确认展开）；完成段不再读面板
+        assert state["selected"] == {"暴击率", "3", "4"}
+        option_clicks = [item for item in clicks if item[1] != 565]  # 排除展开那一击
+        assert len(option_clicks) == 1 and option_clicks[0][1] == 620  # 已满足的 1/2/3/4 都不点
+    elif case == "position_before_selection":  # S02：先一次滑到底，再开始选择
+        state, clicks = fake_panel(monkeypatch, partial_first=True)
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率", "攻击力%"), counts=(3, 4))
+        assert state["scrolls"] == 1
+        first_click = next(
+            index for index, item in enumerate(state["log"]) if item[0] == "click" and item[2] != 565
+        )
+        first_scroll = next(index for index, item in enumerate(state["log"]) if item[0] == "scroll")
+        assert first_scroll < first_click  # 所有选项点击之前先就位
+        assert state["selected"] == {"暴击率", "攻击力百分比", "3", "4"}
+    elif case == "bottom_dead_zone":  # S03：底部禁区按 bottom>920 判定，不用中心
+        state, clicks = fake_panel(monkeypatch, bottom_band=True, tall_dead_zone=True)
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(3, 4))
+        assert (1480, 960) not in clicks  # 初始数字行压在禁区，中心判断不能替代
+        assert (1425, 820) not in clicks  # 高框底边 940 越过禁区，即使中心在区内也不点
+        assert state["selected"] == {"暴击率", "3", "4"}
+    elif case == "still_missing":  # S04：滚到底仍缺 → 只观察不再滚，不选部分条件
+        state, clicks = fake_panel(monkeypatch, hide_counts=True)
+        presses: list = []
+        monkeypatch.setattr(gf, "press_key", lambda *a: presses.append(a))
+        with pytest.raises(gf.FilterClickError, match="副属性目标未就位"):
+            gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1, 2, 3, 4))
+        assert state["scrolls"] == 1  # 不追加无限滚动
+        assert state["panel_reads"]["n"] == 2 + 3  # 展开 2 帧 + 滚后就位观察最多 3 帧
+        assert [item for item in clicks if item[1] != 565] == []  # 不选择部分条件
+        assert presses == []  # 不关闭为成功
+    elif case == "substat_reference_manifest":  # S06：真图 + 判读函数逐项比对
+        data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        cases = [item for item in data["substat_cases"]]
+        assert cases, "清单缺 substat_cases"
+        failures: list[str] = []
+        for item in cases:
+            path = BASE / item["image"]
+            assert path.exists(), f"清单引用的副属性样本不存在：{item['image']}"
+            image = QImage(str(path))
+            assert not image.isNull(), f"副属性样本不可读：{item['image']}"
+            lines = gf._panel_lines(image)
+            ready, found = gf._inspect_substat_targets(
+                image, lines, names=item["names"], counts=item["counts"]
+            )
+            if ready != item["expected_ready"]:
+                failures.append(f"{item['id']}: 就位期望 {item['expected_ready']!r}，实得 {ready!r}")
+            keys = sorted(found, key=lambda key: (isinstance(key, int), key))
+            if keys != sorted(item["expected_keys"], key=lambda key: (isinstance(key, int), key)):
+                failures.append(f"{item['id']}: 键期望 {item['expected_keys']}，实得 {keys}")
+            if ready is True:
+                for key, line in found.items():
+                    if line.bottom > image.height() - gf._PANEL_CLICK_BOTTOM_GAP:
+                        failures.append(f"{item['id']}: 已就位却把 {key} 判在点击禁区")
+        assert not failures, "副属性样本不符：\n" + "\n".join(failures)
+        # 生产执行必须复用同一个判读函数（不接受用就位值替身）
+        state, _clicks = fake_panel(monkeypatch, selected=(3, 4))
+        calls: list = []
+        real_inspect = gf._inspect_substat_targets
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return real_inspect(*args, **kwargs)
+
+        monkeypatch.setattr(gf, "_inspect_substat_targets", spy)
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(3, 4))
+        assert calls, "apply_substat_filter 没有调用共享判读函数"
+    else:  # S05：点击后判读仍 False → 不重做面板 OCR、不继续余项
+        state, clicks = fake_panel(monkeypatch, fail_click=True)
+        with pytest.raises(gf.FilterClickError, match="未确认选中"):
+            gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1, 2, 3, 4))
+        assert state["panel_reads"]["n"] == 2  # 不用重做面板 OCR 覆盖失败
+        assert len([item for item in clicks if item[1] != 565]) == 1  # 不继续余项
 
 
 @pytest.mark.parametrize("counts", [(), (0, 1, 2, 3, 4), (1,), (2,), (2, 4)])
@@ -109,6 +222,51 @@ def test_unsafe_exact_count_conditions_refused_before_input(monkeypatch, counts)
 def test_mainstat_or_zero_count_cannot_be_selected():
     with pytest.raises(gf.FilterClickError):
         gf._validate_substat_filter(("穿透率",), (1, 2, 3, 4))
+
+
+def test_substats_evidence_reuses_last_frame(monkeypatch):
+    """§8.4：完成即发一次 substats_selected（Esc 前），复用最后检查帧，未启用时不多拍。"""
+    state, _clicks = fake_panel(monkeypatch, selected=(1,))
+    real_grab = gf._grab
+    grabs = {"n": 0}
+
+    def counting_grab():
+        grabs["n"] += 1
+        return real_grab()
+
+    monkeypatch.setattr(gf, "_grab", counting_grab)
+    names = ("暴击率", "暴击伤害")
+    counts = (2, 3, 4)
+
+    def reset_state() -> None:
+        state["selected"] = {"1"}
+        state["open"] = False
+        state["page"] = 0
+
+    reset_state()
+    before = grabs["n"]
+    gf.apply_substat_filter(1, 1920, 1080, names=names, counts=counts)
+    plain = grabs["n"] - before
+    reset_state()
+    events: list = []
+    before = grabs["n"]
+    with gf._capture_filter_evidence(events.append):
+        gf.apply_substat_filter(1, 1920, 1080, names=names, counts=counts)
+    assert grabs["n"] - before == plain  # 同起点对比：复用最后检查帧，取证不多拍
+    assert len(events) == 1
+    event = events[0]
+    assert event.event == "substats_selected" and event.stage_index is None
+    assert list(event.targets) == [*names, 1, 2, 3, 4]
+    assert len(event.boxes) == len(event.targets)
+    assert all(box[2] > box[0] and box[3] > box[1] for box in event.boxes)  # 真实框不是占位
+
+
+def test_no_substats_evidence_on_failure(monkeypatch):
+    fake_panel(monkeypatch, fail_click=True)
+    events: list = []
+    with gf._capture_filter_evidence(events.append), pytest.raises(gf.FilterClickError):
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1, 2, 3, 4))
+    assert events == []
 
 
 def test_apply_game_filter_applies_substats_before_closing(monkeypatch):

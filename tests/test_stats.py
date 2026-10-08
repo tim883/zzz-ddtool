@@ -260,6 +260,35 @@ def test_report_fixes_all_five_stages_including_12() -> None:
         assert f"升到 {level} 级" in text
 
 
+def test_report_and_log_include_actual_nonstandard_reached_levels(caplog) -> None:
+    st = S.RunStats(tag="t")
+    slot = st.disc_begin("j", 0, 0)
+    st.disc_stage(slot, 0, 4, 5.0)
+    st.disc_stage(slot, 4, 6, 7.0)
+    st.disc_end(slot, S.OUTCOME_DISCARDED, 6)
+    data = st.summary()
+    assert {k: v["n"] for k, v in data["stage_seconds"].items()} == {"4": 1, "6": 1}
+    text = st.report_text()
+    assert "| 升到 4 级 | 1 | 5.0s" in text
+    assert "| 升到 6 级 | 1 | 7.0s" in text
+    assert text.index("| 升到 3 级") < text.index("| 升到 4 级") < text.index("| 升到 6 级")
+    with caplog.at_level(logging.INFO):
+        st.log_summary(logging.getLogger("nonstandard_stage"))
+    assert any("升到 4 级：1 次" in record.getMessage() for record in caplog.records)
+
+
+def test_report_distinguishes_scan_skips_from_processed_skips() -> None:
+    st = S.RunStats(tag="t")
+    st.job_begin(1, 1, (), ())
+    st.scan([], {0: "满级", 1: "弃置"}, 0, max_index=2)
+    slot = st.disc_begin("j", 2, 0)
+    st.disc_end(slot, S.OUTCOME_SKIPPED, 0)
+    st.job_end(1.0, processed=1)
+    text = st.report_text()
+    assert "| 扫描跳过 | 2 个 |" in text
+    assert "| 进入处理后跳过 | 1 | 已读取盘面，未改动 |" in text
+
+
 def test_discard_label_count_can_differ_from_judged_discard() -> None:
     """「判定弃置」报判定数；盘上已有标记时不会真打，所以实打数 ≤ 判定数。"""
     st = S.RunStats(tag="t")

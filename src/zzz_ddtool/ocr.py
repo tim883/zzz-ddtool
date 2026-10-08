@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -35,6 +36,20 @@ from zzz_ddtool.gamedata import SUBSTAT_NAMES as _SUBSTAT_NAMES
 
 _engine = None
 _engine_lock = threading.Lock()
+
+# rapidocr 的 return_word_box / return_single_char_box 是**引擎实例上的属性**
+# （rapidocr/main.py 的 update_params 直接 setattr(self, ...)），调用一次就会留
+# 在实例上，下一次不传参也照样算字符框。名称字符范围识别必须临时打开这两个开关，
+# 于是所有走同一引擎的识别都用这把锁串行化：普通 read_rect 不会在别人开着字符框
+# 模式的窗口里跑，读到的引擎状态也不会带着临时开关。
+_WORD_BOX_LOCK = threading.Lock()
+#: 会被 __call__ 写进引擎实例的两个开关。
+_WORD_BOX_ATTRS = ("return_word_box", "return_single_char_box")
+#: 进入时读不到该属性（属性本来不存在）——退出时同样把属性删掉。
+_ATTR_MISSING = object()
+
+#: 件数后缀语法（第 3.3 节）：可选的「×」加阿拉伯数字，别的写法一律不接受。
+_COUNT_SUFFIX_RE = re.compile(r"(?:×)?[0-9]+")
 
 
 @dataclass(frozen=True)
@@ -121,7 +136,9 @@ def read_rect(image: QImage, rect: tuple[int, int, int, int]) -> list[OcrLine]:
     # 先按矩形裁出子图再转 BGR：整图 1920x1080 转换约 12ms，裁完再转只要 0.02ms。
     # 下面的 box 是 crop 局部坐标，仍按 + (left, top) 还原到全图。
     crop = image.copy(left, top, right - left, bottom - top)
-    result = _get_engine()(qimage_to_bgr(crop))
+    # 与 read_name_span 互斥：字符框开关是引擎实例属性，不能并发观察到临时状态。
+    with _WORD_BOX_LOCK:
+        result = _get_engine()(qimage_to_bgr(crop))
     if result is None or not result.txts:
         _log_rect(image, rect, 0, started)
         return []
@@ -143,6 +160,166 @@ def read_rect(image: QImage, rect: tuple[int, int, int, int]) -> list[OcrLine]:
     lines.sort(key=lambda line: (round(line.top / 12), line.left))
     _log_rect(image, rect, len(lines), started)
     return lines
+
+
+def _normalize_ocr_name(text: str) -> str:
+    """第 5.1 节同一规则：去首尾空白、删除 U+0020 空格。"""
+    return text.strip().replace(" ", "")
+
+
+@dataclass(frozen=True)
+class _CharBox:
+    """识别出的单个字符：内容、置信度、客户区像素矩形。"""
+
+    text: str
+    score: float
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+
+def _char_boxes(result, offset_x: int, offset_y: int) -> list[_CharBox]:
+    """按引擎的单行阅读顺序取字符框（坐标加裁剪偏移），不跨行拼接。
+
+    rapidocr 的 `word_results` 是「每检测行一个元组，行内每个字符一个
+    (内容, 置信度, 四点框)」；`return_single_char_box=True` 时行内元素就是逐字符
+    （英文数字也按单字符拆），内容顺序与文本顺序一致。框是传入图（即裁剪图）的
+    像素坐标，所以要加裁剪偏移才能还原到客户区。
+
+    多条非空行或结构不符合预期（元素不是三元组、框缺失）时返回空列表——调用方按「无字符框」
+    返回 None，不做任何宽度推算。
+    """
+    word_results = getattr(result, "word_results", None)
+    if not word_results:
+        return []
+    # 单行隔离不跨行拼接；字符框 top 可以因检测倾斜相差 1px，
+    # 不能按 top 重排引擎已经给出的行内文字顺序（§14.1）。
+    if sum(bool(line_words) for line_words in word_results) != 1:
+        return []
+    chars: list[_CharBox] = []
+    for line_words in word_results:
+        if not line_words:
+            continue
+        for item in line_words:
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                return []
+            text, score, box = item
+            if box is None or len(box) == 0:
+                return []
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+            chars.append(
+                _CharBox(
+                    text=str(text),
+                    score=float(score),
+                    left=int(math.floor(min(xs))) + offset_x,
+                    top=int(math.floor(min(ys))) + offset_y,
+                    right=int(math.ceil(max(xs))) + offset_x,
+                    bottom=int(math.ceil(max(ys))) + offset_y,
+                )
+            )
+    return chars
+
+
+def read_name_span(image: QImage, line: OcrLine, *, name: str) -> OcrLine | None:
+    """在候选整行框里隔离出「目标套装名」的字符范围（第 3.3 节）。
+
+    行框可能含件数后缀或其他文字，所以不能按行宽 / 字符数 / 中文等宽推算分割点：
+    这里只裁剪 `line` 与图像的交集，对裁剪图用本机 RapidOCR 的
+    `return_word_box=True, return_single_char_box=True` 读**逐字符**内容与四点框，
+    加裁剪偏移还原到客户区像素，再按精确语法取目标名的字符范围。
+
+    接受的完整文本只有两种：归一化后等于 `name`，或等于 `name` + 件数后缀
+    `(?:×)?[0-9]+`。目标名之前的文字、其他中文后缀、相似名称（不做
+    SequenceMatcher 近似）一律不接受。
+
+    目标字符必须唯一、连续、与框一一对应；对目标字符框并集取外接矩形，左/上向下
+    取整、右/下向上取整，裁剪到图像内，且与非目标字符框无正面积交叠。
+
+    返回 `OcrLine(text=name, score=目标字符最小置信度, 坐标为上述矩形)`；
+    无字符框、文本不满足精确语法、范围不唯一或边界无法隔离时返回 None。
+    """
+    normalized_name = _normalize_ocr_name(name)
+    if not normalized_name:
+        return None
+
+    # 只裁 line 与图像的交集；交集为空就没有可识别的区域。
+    left = max(0, int(line.left))
+    top = max(0, int(line.top))
+    right = min(image.width(), int(line.right))
+    bottom = min(image.height(), int(line.bottom))
+    if right <= left or bottom <= top:
+        return None
+
+    crop = image.copy(left, top, right - left, bottom - top)
+    engine = _get_engine()
+
+    # 引擎状态隔离（R25）：进入前记下两个开关的原值，正常/异常退出都恢复；
+    # 原异常照原样往外抛，不吞。
+    with _WORD_BOX_LOCK:
+        saved = {}
+        for attr in _WORD_BOX_ATTRS:
+            try:
+                saved[attr] = getattr(engine, attr)
+            except AttributeError:
+                saved[attr] = _ATTR_MISSING
+        try:
+            result = engine(
+                qimage_to_bgr(crop),
+                return_word_box=True,
+                return_single_char_box=True,
+            )
+        finally:
+            for attr, value in saved.items():
+                if value is _ATTR_MISSING:
+                    if hasattr(engine, attr):
+                        delattr(engine, attr)
+                else:
+                    setattr(engine, attr, value)
+
+    # 归一化：删除空白字符，同时删掉它对应的框，保持字符↔框一一对应。
+    chars = [char for char in _char_boxes(result, left, top) if char.text.strip()]
+    text = "".join(char.text for char in chars)
+    if not text:
+        return None
+
+    if text == normalized_name:
+        target_count = len(chars)
+    elif text.startswith(normalized_name) and _COUNT_SUFFIX_RE.fullmatch(
+        text[len(normalized_name) :]
+    ):
+        target_count = len(normalized_name)
+    else:
+        return None
+
+    targets = chars[:target_count]
+    others = chars[target_count:]
+    if not targets or any(len(char.text) != 1 for char in targets):
+        # 字符与框必须一一对应：一个框里塞了多个字符就不算隔离成功。
+        return None
+
+    span_left = max(0, min(min(char.left for char in targets), image.width()))
+    span_top = max(0, min(min(char.top for char in targets), image.height()))
+    span_right = max(0, min(max(char.right for char in targets), image.width()))
+    span_bottom = max(0, min(max(char.bottom for char in targets), image.height()))
+    if span_right <= span_left or span_bottom <= span_top:
+        return None
+
+    for char in others:
+        overlap_x = min(span_right, char.right) - max(span_left, char.left)
+        overlap_y = min(span_bottom, char.bottom) - max(span_top, char.top)
+        if overlap_x > 0 and overlap_y > 0:
+            return None
+
+    return OcrLine(
+        text=name,
+        score=min(char.score for char in targets),
+        left=span_left,
+        top=span_top,
+        right=span_right,
+        bottom=span_bottom,
+    )
 
 
 def _fix_percent(text: str) -> str:

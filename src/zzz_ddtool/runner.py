@@ -22,6 +22,7 @@ from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.control import controlled_inputs
 from zzz_ddtool.decide import decide
+from zzz_ddtool.filter_replay import FilterReplaySession
 from zzz_ddtool.gamefilter import apply_game_filter, reset_game_filter
 from zzz_ddtool.substatfilter import plan_substat_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
@@ -372,6 +373,8 @@ class Runner:
         self._last_count = None
         self.outcome = "running"
         self.end_reason = ""
+        # spec §3.6：每次 _run 新建会话，本次 _run 的多个 _run_job 共享该实例。
+        replay_session = FilterReplaySession()
         jobs = self._jobs()
         import logging
 
@@ -407,7 +410,7 @@ class Runner:
                     continue
                 job_started = time.monotonic()
                 try:
-                    self._run_job(job)
+                    self._run_job(job, replay_session)
                 finally:
                     # 进模型前就记上用量：任务中途抛错也要能看到它花了多久。
                     self.stats.job_end(
@@ -428,6 +431,8 @@ class Runner:
             self.log.exception("run failed")
             self.trace.fail("unknown", "run", self.end_reason)
         finally:
+            # spec §3.6：正常结束、异常、F10 三种收尾都清空路由（连同文字指纹一并释放）。
+            replay_session.routes.clear()
             if self.hotkeys is not None:
                 self.hotkeys.close()
             self.trace.finish()
@@ -469,7 +474,7 @@ class Runner:
 
     # ---------------------------------------------------------------- 主任务
 
-    def _run_job(self, job: TaskJob) -> None:
+    def _run_job(self, job: TaskJob, replay_session: FilterReplaySession | None = None) -> None:
         if job.accepted is None:
             self.log.info("任务 %s 未生成卡片名单，跳过", job.job_id)
             return
@@ -508,6 +513,7 @@ class Runner:
                 slots=[job.slot],
                 sets=job.sets,
                 mainstats=job.mainstats,
+                replay_session=replay_session,
                 **extra_filter,
             )
         self.trace.ok(
@@ -682,6 +688,15 @@ class Runner:
                 state.commit_prefix()
                 self._set_status("progress", f"next_index={state.next_index}", self._cell_tag(cell))
             if broke:
+                if (
+                    restore_after_upgrade
+                    and state.viewport_mode == VIEWPORT_SINGLE_SCREEN
+                    and state.single_screen_total is not None
+                    and state.single_screen_total > 0
+                    and state.next_index == state.single_screen_total
+                ):
+                    self.log.info("单屏全部格位已解决，本任务结束，省略末件候选恢复")
+                    break
                 state.invalidate_position()
                 if restore_after_upgrade and not self._job_limit_reached():
                     self._restore_position(hwnd, state, cells, cache=recovery_cache)
@@ -1142,7 +1157,7 @@ class Runner:
         accepted_ids,
         up_counts: dict,
     ) -> str:
-        """处理一个格位。返回 done / rescan。"""
+        """处理一个格位。返回 done / rescan / upgrade。"""
         row, col = cell.display()
         cell_tag = self._cell_tag(cell)
         where = f"全局第{row}行第{col}列（序号 {cell.global_index}）"
@@ -1221,6 +1236,7 @@ class Runner:
                     accepted_ids,
                     up_counts,
                     disc_slot,
+                    initial_disc=disc,
                 )
             else:
                 raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
@@ -1887,8 +1903,9 @@ class Runner:
         # 1) 详情页大按钮（0 级也显示「查看」）
         image, *_ = self._grab(allow_esc=False, need_page=False)
         hit = None
+        button_lines = read_rect(image, self.UPGRADE_BTN_AREA)
         for text in ("查看", "强化"):
-            for line in read_rect(image, self.UPGRADE_BTN_AREA):
+            for line in button_lines:
                 if text in line.text.replace(" ", ""):
                     hit = line
                     break
@@ -2002,6 +2019,8 @@ class Runner:
         accepted_ids,
         up_counts: dict,
         disc_slot: int = -1,
+        *,
+        initial_disc: Disc | None = None,
     ) -> int:
         """在强化页循环判断+升级，直到弃置/升满/跳过，最后回到网格。
 
@@ -2018,19 +2037,29 @@ class Runner:
         expect_level: int | None = None
         expect_from = 0
         rechecks = 0
-        # 本档开始时间：点「升级」那一刻起算，到下一轮确认等级到位为止。
+        # 本档从阶段添加/材料操作前起算，包含按钮定位、输入、等待和结果识别。
         stage_started: float | None = None
         while True:
-            image, *_ = self._grab(allow_esc=False, need_page=False)
-            try:
-                disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
-            except RunnerError:
-                # 满级时游戏会弹「材料返还」确认框盖住强化页：先点掉它再重读一次；
-                # 不是这个弹窗就原样抛出（识别不出就是识别不出，不掩盖）。
-                if not self._dismiss_material_refund(hwnd, image):
-                    raise
+            if initial_disc is not None:
+                paused = self.hotkeys is not None and self.hotkeys.paused
+                self._checkpoint()
+                if paused:
+                    initial_disc = None
+                    continue  # 暂停期间画面可能改变，恢复后按原路径重新读盘。
+                # 已解析当前侧栏且已确认进入强化页；尚未升级，词条数据没有变化。
+                disc, initial_disc = initial_disc, None
+                image = None
+                self.log.info("cell %s 首档复用侧栏盘面，省略强化前重复词条 OCR", cell_tag)
+            else:
                 image, *_ = self._grab(allow_esc=False, need_page=False)
-                disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
+                try:
+                    disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
+                except RunnerError:
+                    # 满级「材料返还」遮住盘面时先确认；其他识别错误原样传播。
+                    if not self._dismiss_material_refund(hwnd, image):
+                        raise
+                    image, *_ = self._grab(allow_esc=False, need_page=False)
+                    disc = self._read_disc_with_retry(image, self._parse_upgrade_page, "upgrade")
             if self._detail_disc is not None:
                 disc = replace(
                     disc,
@@ -2104,6 +2133,7 @@ class Runner:
                     self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
                     self._esc_back_to_grid(hwnd)
                     return disc.level
+                stage_started = time.monotonic()
                 if not self._upgrade_once(hwnd, self.material_slot):
                     raise RunnerError(f"{cell_tag} 强化按钮识别失败，停止任务链")
                 upgraded += 1
@@ -2112,8 +2142,7 @@ class Runner:
                 expect_from = disc.level
                 expect_level = next_stage_level(disc.level)
                 rechecks = 0
-                # 本档计时从现在开始，到下一轮确认等级到位为止（含重读）。
-                stage_started = time.monotonic()
+                # 下一轮实际盘面确认本档结果，结束先前开始的完整操作区间。
                 self.log.info(
                     "cell %s UPGRADE done, level %d -> 期望到 %d 级，强化页重判",
                     cell_tag,

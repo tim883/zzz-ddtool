@@ -1,0 +1,654 @@
+{
+  "version": 3,
+  "layouts": [
+    {
+      "layout_id": "1920x1080-v6",
+      "width": 1920,
+      "height": 1080,
+      "dpi": 96,
+      "list_area": [
+        800,
+        340,
+        1490,
+        840
+      ],
+      "confirm_area": [
+        1040,
+        838,
+        1260,
+        900
+      ],
+      "origin_mode": "reopen_top",
+      "top_wheel_events": 0,
+      "top_delta_units": 0,
+      "scroll_x": 960,
+      "scroll_y": 540,
+      "scroll_wait_ms": 600,
+      "click_wait_ms": 400,
+      "confirm_wait_ms": 500,
+      "origin_evidence": [
+        "手册/参考图/驱动盘筛选/说明.md#起始位置标定（2026-10-06，同日实测）"
+      ],
+      "disabled_evidence": "absent"
+    }
+  ],
+  "cases": [
+    {
+      "id": "pick-top-open",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-顶部.png",
+      "observation": "popup_open",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-top-at-top",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-顶部.png",
+      "observation": "at_top",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-at-top-false",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-前.png",
+      "observation": "at_top",
+      "target": null,
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-open",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "popup_open",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-stage",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "stage_match",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-selected-false",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "selected",
+      "target": "谶羽之誓",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-enabled",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "enabled",
+      "target": "谶羽之誓",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-enabled-gray-unknown",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "enabled",
+      "target": "拂晓行纪",
+      "expected": null,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-closed-false",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "popup_closed",
+      "target": null,
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-identity-plain",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "identity_match",
+      "target": "谶羽之誓",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": "pick-s1-selected-false"
+    },
+    {
+      "id": "pick-s1-identity-selected",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-后.png",
+      "observation": "identity_match",
+      "target": "谶羽之誓",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": "pick-s1-selected-false"
+    },
+    {
+      "id": "pick-s1-identity-count",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-件数变化-合成.png",
+      "observation": "identity_match",
+      "target": "谶羽之誓",
+      "expected": true,
+      "source": "synthetic",
+      "identity_source_id": "pick-s1-selected-false"
+    },
+    {
+      "id": "pick-s1-identity-renamed",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-换名-合成.png",
+      "observation": "identity_match",
+      "target": "谶羽之誓",
+      "expected": false,
+      "source": "synthetic",
+      "identity_source_id": "pick-s1-selected-false"
+    },
+    {
+      "id": "pick-s1-identity-occluded",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-遮挡-合成.png",
+      "observation": "identity_match",
+      "target": "谶羽之誓",
+      "expected": null,
+      "source": "synthetic",
+      "identity_source_id": "pick-s1-selected-false"
+    },
+    {
+      "id": "pick-s1-confirm-enabled",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "enabled",
+      "target": "确认筛选",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s1-identity-confirm",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "observation": "identity_match",
+      "target": "确认筛选",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": "pick-s1-confirm-enabled"
+    },
+    {
+      "id": "pick-confirm-renamed",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/确认按钮-换名-合成.png",
+      "observation": "identity_match",
+      "target": "确认筛选",
+      "expected": false,
+      "source": "synthetic",
+      "identity_source_id": "pick-s1-confirm-enabled"
+    },
+    {
+      "id": "pick-confirm-occluded",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/确认按钮-遮挡-合成.png",
+      "observation": "identity_match",
+      "target": "确认筛选",
+      "expected": null,
+      "source": "synthetic",
+      "identity_source_id": "pick-s1-confirm-enabled"
+    },
+    {
+      "id": "pick-s1-selected-true",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-后.png",
+      "observation": "selected",
+      "target": "谶羽之誓",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-stage",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-前.png",
+      "observation": "stage_match",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-selected-false",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-前.png",
+      "observation": "selected",
+      "target": "折枝剑歌",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-enabled",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-前.png",
+      "observation": "enabled",
+      "target": "折枝剑歌",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-selected-true",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-后.png",
+      "observation": "selected",
+      "target": "折枝剑歌",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-s2-selected-true-2",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段2-后.png",
+      "observation": "selected",
+      "target": "静听嘉音",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-closed-after",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-确认后.png",
+      "observation": "popup_closed",
+      "target": null,
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-lowcontrast-plain",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-低对比度-未选.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "真机低对比度行（浅灰底板+灰字）；新前景判据的目标源"
+    },
+    {
+      "id": "pick-lowcontrast-selected",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-低对比度-已选.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "同一行已选（勾在名称框之外），身份仍需匹配"
+    },
+    {
+      "id": "pick-lowcontrast-count",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-低对比度-件数变化-合成.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": true,
+      "source": "synthetic",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "只把同帧另一格件数字条贴到本格件数位置，名称范围不动"
+    },
+    {
+      "id": "pick-lowcontrast-renamed",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-低对比度-换名-合成.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": false,
+      "source": "synthetic",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "把同帧另一名称的文字条（裁到同尺寸、不缩放）贴到本名称范围"
+    },
+    {
+      "id": "pick-lowcontrast-occluded",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-低对比度-遮挡-合成.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": null,
+      "source": "synthetic",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "用本框底板色盖住名称范围"
+    },
+    {
+      "id": "pick-lowcontrast-brightness",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/身份-低对比度-亮度变化-合成.png",
+      "observation": "identity_match",
+      "target": "河豚电音",
+      "expected": true,
+      "source": "synthetic",
+      "identity_source_id": "pick-lowcontrast-plain",
+      "note": "名称范围像素整体乘 1.3（截断 255），结构不变"
+    },
+    {
+      "id": "pick-panel-absent-popup-unknown",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/筛选面板-关闭.png",
+      "observation": "popup_closed",
+      "target": null,
+      "expected": null,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-green-art-unselected",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "observation": "selected",
+      "target": "激素朋克",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-green-art-enabled",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "observation": "enabled",
+      "target": "激素朋克",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-green-art-selected-neighbor",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "observation": "selected",
+      "target": "河豚电音",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-green-art-selected-top-clipped",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "observation": "selected",
+      "target": "静听嘉音",
+      "expected": true,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "pick-green-art-gray-unknown",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "observation": "enabled",
+      "target": "混沌爵士",
+      "expected": null,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-0",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "混沌爵士",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-1",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "原始朋克",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-2",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "啄木鸟电音",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-3",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "拂晓生花",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-4",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "如影相随",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    },
+    {
+      "id": "zero-count-unselected-5",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png",
+      "observation": "selected",
+      "target": "法厄同之歌",
+      "expected": false,
+      "source": "captured",
+      "identity_source_id": null
+    }
+  ],
+  "substat_cases": [
+    {
+      "id": "substat-not-ready",
+      "image": "手册/参考图/驱动盘筛选/副属性-展开未就位.png",
+      "names": [
+        "攻击力%",
+        "暴击伤害",
+        "暴击率",
+        "攻击力",
+        "穿透值"
+      ],
+      "counts": [
+        3,
+        4
+      ],
+      "expected_ready": null,
+      "expected_keys": [
+        "攻击力",
+        "攻击力%"
+      ]
+    },
+    {
+      "id": "substat-ready",
+      "image": "手册/参考图/驱动盘筛选/副属性-展开已就位.png",
+      "names": [
+        "攻击力%",
+        "暴击伤害",
+        "暴击率",
+        "攻击力",
+        "穿透值"
+      ],
+      "counts": [
+        3,
+        4
+      ],
+      "expected_ready": true,
+      "expected_keys": [
+        "攻击力%",
+        "暴击伤害",
+        "暴击率",
+        "攻击力",
+        "穿透值",
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  ],
+  "name_span_cases": [
+    {
+      "id": "name-span-plain",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "source": "captured",
+      "name": "谶羽之誓",
+      "row_text": "谶羽之誓",
+      "row_rect": [
+        1025,
+        486,
+        1104,
+        516
+      ],
+      "expected_rect": [
+        1031,
+        489,
+        1100,
+        513
+      ]
+    },
+    {
+      "id": "name-span-count3",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/名称件数-3-合成.png",
+      "source": "synthetic",
+      "name": "谶羽之誓",
+      "row_text": "谶羽之誓 3",
+      "row_rect": [
+        1015,
+        478,
+        1150,
+        524
+      ],
+      "expected_rect": [
+        1031,
+        489,
+        1097,
+        512
+      ]
+    },
+    {
+      "id": "name-span-count9",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/裁剪/名称件数-9-合成.png",
+      "source": "synthetic",
+      "name": "谶羽之誓",
+      "row_text": "谶羽之誓 9",
+      "row_rect": [
+        1015,
+        478,
+        1150,
+        524
+      ],
+      "expected_rect": [
+        1031,
+        489,
+        1097,
+        512
+      ]
+    },
+    {
+      "id": "name-span-fail",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png",
+      "source": "captured",
+      "name": "谶羽之誓",
+      "row_text": "荆棘玫瑰",
+      "row_rect": [
+        862,
+        489,
+        940,
+        515
+      ],
+      "expected_rect": null
+    },
+    {
+      "id": "name-span-green-art-hormone",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png",
+      "source": "captured",
+      "name": "激素朋克",
+      "row_text": "激素朋克",
+      "row_rect": [
+        1186,
+        736,
+        1267,
+        763
+      ],
+      "expected_rect": [
+        1192,
+        738,
+        1261,
+        761
+      ]
+    },
+    {
+      "id": "name-span-thunder-truncated-row",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-震星迪斯科候选漏字.png",
+      "source": "captured",
+      "name": "震星迪斯科",
+      "row_text": "星迪斯科",
+      "row_rect": [
+        883,
+        737,
+        948,
+        761
+      ],
+      "expected_rect": null
+    },
+    {
+      "id": "name-span-thunder-recovered-row",
+      "layout_id": "1920x1080-v6",
+      "image": "手册/参考图/驱动盘筛选/套装弹窗-震星迪斯科候选漏字.png",
+      "source": "captured",
+      "name": "震星迪斯科",
+      "row_text": "星迪斯科",
+      "row_rect": [
+        851,
+        733,
+        974,
+        765
+      ],
+      "expected_rect": [
+        858,
+        738,
+        945,
+        760
+      ]
+    }
+  ]
+}

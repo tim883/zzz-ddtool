@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from ctypes import wintypes
+from itertools import count
 from random import randint, uniform
+from threading import Lock
+from typing import Callable, Iterator, NamedTuple
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -11,6 +16,7 @@ advapi32 = ctypes.windll.advapi32
 
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.control import checkpoint_input
+from zzz_ddtool.hotkeys import RunnerStopped
 
 _input_log = get_logger("zzz_ddtool.wininput")
 
@@ -85,6 +91,166 @@ class INPUT(ctypes.Structure):
 
 class InputError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# 输入观察（spec §8.4）
+#
+# 未启用 capture_inputs 时五个入口零开销直通：不存记录、不抓图、不建文件，也
+# 不改变既有输入函数的参数、发送顺序、等待和检查点。启用后每个逻辑调用发一对
+# begin/end：在初始检查点通过之后、首次实际发送之前发 begin；正常返回发
+# status=completed 的 end；已发 begin 的调用异常退出发 failed/stopped 的 end
+# （RunnerStopped → stopped）；在初始检查点就被停止的调用不发 begin/end、也
+# 不分配 call_id。原异常原样传播，回调既不吞异常也不重发输入。
+#
+# 状态全部放在 ContextVar 里，按执行上下文隔离，嵌套退出恢复前值，不保留任何
+# 进程级共享回调。call_id 由本模块分配：进程内从 1 起、跨 run 连续递增，
+# begin/end 共用同一 ID，多线程下用锁保证唯一。
+# ---------------------------------------------------------------------------
+
+
+class _InputContext(NamedTuple):
+    role: str
+    target: str | int | None
+    stage_index: int | None
+    selected: bool | None
+
+
+_input_sink: ContextVar[Callable[[dict[str, object]], None] | None] = ContextVar(
+    "ddtool_input_sink", default=None
+)
+_input_context: ContextVar[_InputContext | None] = ContextVar("ddtool_input_context", default=None)
+
+_call_ids = count(1)
+_call_id_lock = Lock()
+
+
+def _next_call_id() -> int:
+    with _call_id_lock:
+        return next(_call_ids)
+
+
+def _new_record(
+    api: str,
+    *,
+    role: str | None,
+    target: str | int | None,
+    stage_index: int | None,
+    selected: bool | None,
+    hwnd: int | None,
+    x: int | None,
+    y: int | None,
+    alt: bool | None,
+    vk: int | None,
+    delta_units: int | None,
+) -> dict[str, object]:
+    """构造 begin 行；字段固定为 spec §8.4 的 16 个，顺序固定。"""
+    return {
+        "t_ns": time.monotonic_ns(),
+        "event": "begin",
+        "call_id": _next_call_id(),
+        "api": api,
+        "role": role,
+        "target": target,
+        "stage_index": stage_index,
+        "selected": selected,
+        "hwnd": hwnd,
+        "x": x,
+        "y": y,
+        "alt": alt,
+        "vk": vk,
+        "delta_units": delta_units,
+        "status": "started",
+        "error": None,
+    }
+
+
+def _end_record(begin: dict[str, object], status: str, error: str | None) -> dict[str, object]:
+    """end 行保留同一调用的全部参数（与 begin 一致），只换时间/事件/状态/错误。"""
+    return {
+        **begin,
+        "t_ns": time.monotonic_ns(),
+        "event": "end",
+        "status": status,
+        "error": error,
+    }
+
+
+@contextmanager
+def _observe_input(
+    api: str,
+    *,
+    hwnd: int | None = None,
+    x: int | None = None,
+    y: int | None = None,
+    alt: bool | None = None,
+    vk: int | None = None,
+    delta_units: int | None = None,
+) -> Iterator[None]:
+    """包住一次逻辑输入调用。未启用 capture_inputs 时不取 call_id、不发事件。"""
+    sink = _input_sink.get()
+    if sink is None:
+        yield
+        return
+    ctx = _input_context.get()
+    begin = _new_record(
+        api,
+        role=ctx.role if ctx is not None else None,
+        target=ctx.target if ctx is not None else None,
+        stage_index=ctx.stage_index if ctx is not None else None,
+        selected=ctx.selected if ctx is not None else None,
+        hwnd=hwnd,
+        x=x,
+        y=y,
+        alt=alt,
+        vk=vk,
+        delta_units=delta_units,
+    )
+    sink(begin)
+    try:
+        yield
+    except BaseException as exc:
+        status = "stopped" if isinstance(exc, RunnerStopped) else "failed"
+        try:
+            sink(_end_record(begin, status, type(exc).__name__))
+        except Exception:
+            # 观察回调自己出错也不能改变输入语义：原异常必须原样传播。
+            _input_log.exception("输入观察回调上报失败时抛异常，已忽略以保留原异常")
+        raise
+    else:
+        sink(_end_record(begin, "completed", None))
+
+
+@contextmanager
+def capture_inputs(sink: Callable[[dict[str, object]], None]) -> Iterator[None]:
+    """在该执行上下文里把输入调用交给 sink 观察；可嵌套，退出时恢复前一个 sink。
+
+    sink 收到原始字典（字段见 spec §8.4），只做记录，不得吞异常或重发输入。
+    """
+    token = _input_sink.set(sink)
+    try:
+        yield
+    finally:
+        _input_sink.reset(token)
+
+
+@contextmanager
+def input_context(
+    role: str,
+    *,
+    target: str | int | None = None,
+    stage_index: int | None = None,
+    selected: bool | None = None,
+) -> Iterator[None]:
+    """给当前执行上下文里的输入附加角色元数据；可嵌套，退出时恢复前值。
+
+    元数据只用于观察记录，不改变坐标、动作或既有匹配行为。
+    """
+    token = _input_context.set(_InputContext(role, target, stage_index, selected))
+    try:
+        yield
+    finally:
+        _input_context.reset(token)
 
 
 def _send(inputs: list[INPUT]) -> None:
@@ -233,21 +399,22 @@ def _key_event(vk: int, *, up: bool = False, scancode: bool = False) -> INPUT:
 def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
     """Foreground click, same idea as OneDragon: move cursor then mouse down/up."""
     checkpoint_input()
-    _input_log.info("click (%d,%d) alt=%s", x, y, alt)
-    sx, sy = client_to_screen(hwnd, x + randint(-2, 2), y + randint(-2, 2))
-    focus_window(hwnd)
-    if alt:
-        _send([_key_event(VK_MENU)])
-        pause(0.15, 0.22)
-    user32.SetCursorPos(sx, sy)
-    pause(0.04, 0.08)
-    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    time.sleep(0.08)
-    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-    if alt:
+    with _observe_input("click_client", hwnd=hwnd, x=x, y=y, alt=alt):
+        _input_log.info("click (%d,%d) alt=%s", x, y, alt)
+        sx, sy = client_to_screen(hwnd, x + randint(-2, 2), y + randint(-2, 2))
+        focus_window(hwnd)
+        if alt:
+            _send([_key_event(VK_MENU)])
+            pause(0.15, 0.22)
+        user32.SetCursorPos(sx, sy)
         pause(0.04, 0.08)
-        _send([_key_event(VK_MENU, up=True)])
-    pause()
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.08)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        if alt:
+            pause(0.04, 0.08)
+            _send([_key_event(VK_MENU, up=True)])
+        pause()
 
 
 def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
@@ -256,14 +423,15 @@ def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
     保持既有调用兼容（一次缩放 delta、自带聚焦/移光标/随机等待）。批量按行
     发送请用 send_wheel_event，不要用这个。"""
     checkpoint_input()
-    _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
-    sx, sy = client_to_screen(hwnd, x, y)
-    focus_window(hwnd)
-    user32.SetCursorPos(sx, sy)
-    pause(0.04, 0.08)
-    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
-    time.sleep(0.15)
-    pause()
+    with _observe_input("wheel_client", hwnd=hwnd, x=x, y=y, delta_units=delta):
+        _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
+        sx, sy = client_to_screen(hwnd, x, y)
+        focus_window(hwnd)
+        user32.SetCursorPos(sx, sy)
+        pause(0.04, 0.08)
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
+        time.sleep(0.15)
+        pause()
 
 
 def send_wheel_event(delta_units: int) -> None:
@@ -278,34 +446,37 @@ def send_wheel_event(delta_units: int) -> None:
     if delta_units == 0:
         raise InputError("滚轮事件格数不能为 0。")
     checkpoint_input()
-    _input_log.info("wheel_event delta_units=%d", delta_units)
-    user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_units * 120, 0)
+    with _observe_input("send_wheel_event", delta_units=delta_units):
+        _input_log.info("wheel_event delta_units=%d", delta_units)
+        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_units * 120, 0)
 
 
 def press_key_once(hwnd: int, vk: int) -> None:
     """只按一次键（down+up 一对）。R 弃置这类开关型键必须用这个：
     press_key 会发多对 down/up，R 按奇数次才有效，偶数次等于没按。"""
     checkpoint_input()
-    _input_log.info("key_once vk=0x%02X", vk)
-    focus_window(hwnd)
-    _send([_key_event(vk), _key_event(vk, scancode=True)])
-    time.sleep(0.05)
-    _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
-    time.sleep(0.03)
-    pause(0.35, 0.55)
+    with _observe_input("press_key_once", hwnd=hwnd, vk=vk):
+        _input_log.info("key_once vk=0x%02X", vk)
+        focus_window(hwnd)
+        _send([_key_event(vk), _key_event(vk, scancode=True)])
+        time.sleep(0.05)
+        _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
+        time.sleep(0.03)
+        pause(0.35, 0.55)
 
 
 def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
     checkpoint_input()
-    _input_log.info("key vk=0x%02X", vk)
-    scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or SCAN_ESCAPE
-    focus_window(hwnd)
-    user32.keybd_event(vk, scan, 0, 0)
-    time.sleep(0.04)
-    user32.keybd_event(vk, scan, KEYEVENTF_KEYUP, 0)
-    _send([_key_event(vk), _key_event(vk, scancode=True)])
-    time.sleep(0.03)
-    _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
-    user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 1)
-    user32.PostMessageW(hwnd, WM_KEYUP, vk, 1 | (1 << 30) | (1 << 31))
-    pause(0.45, 0.65)
+    with _observe_input("press_key", hwnd=hwnd, vk=vk):
+        _input_log.info("key vk=0x%02X", vk)
+        scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or SCAN_ESCAPE
+        focus_window(hwnd)
+        user32.keybd_event(vk, scan, 0, 0)
+        time.sleep(0.04)
+        user32.keybd_event(vk, scan, KEYEVENTF_KEYUP, 0)
+        _send([_key_event(vk), _key_event(vk, scancode=True)])
+        time.sleep(0.03)
+        _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
+        user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 1)
+        user32.PostMessageW(hwnd, WM_KEYUP, vk, 1 | (1 << 30) | (1 << 31))
+        pause(0.45, 0.65)

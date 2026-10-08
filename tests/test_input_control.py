@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from zzz_ddtool import hotkeys, wininput
-from zzz_ddtool.control import checkpoint_input, controlled_inputs
+from zzz_ddtool.control import checkpoint_input, controlled_inputs, validated_inputs
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 
 
@@ -23,12 +23,29 @@ def test_stop_blocks_input_before_any_windows_call(monkeypatch, action):
     monkeypatch.setattr(wininput, "user32", windows)
     monkeypatch.setattr(wininput, "kernel32", Mock())
     stop = Mock(side_effect=RunnerStopped("test stop"))
-    with controlled_inputs(stop), pytest.raises(RunnerStopped):
+    validate = Mock()
+    with controlled_inputs(stop), validated_inputs(validate), pytest.raises(RunnerStopped):
         action()
     assert not windows.mock_calls
     # 异常退出后不能把已停止任务的回调泄漏给其他操作。
     checkpoint_input()
     stop.assert_called_once()
+    validate.assert_not_called()
+
+
+def test_input_validation_runs_after_control_and_is_context_local():
+    order = []
+    with controlled_inputs(lambda: order.append("control")), validated_inputs(lambda: order.append("outer")):
+        checkpoint_input()
+        with pytest.raises(ValueError), validated_inputs(lambda: (_ for _ in ()).throw(ValueError("invalid"))):
+            checkpoint_input()
+        thread = threading.Thread(target=checkpoint_input)
+        thread.start()
+        thread.join(2)
+        assert not thread.is_alive()
+        checkpoint_input()
+    checkpoint_input()
+    assert order == ["control", "outer", "control", "control", "outer"]
 
 
 def test_pause_then_stop_does_not_send_pending_wheel(monkeypatch):

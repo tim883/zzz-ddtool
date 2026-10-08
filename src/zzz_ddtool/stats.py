@@ -471,7 +471,7 @@ class RunStats:
             )
         if data["unfinished"]:
             log.info("未走完流程：%d 件（中途中断，不计入等级分布）", data["unfinished"])
-        for level in STAGE_LEVELS:
+        for level in sorted(set(STAGE_LEVELS) | {int(k) for k in data["stage_seconds"]}):
             stat = data["stage_seconds"].get(str(level))
             if not stat or not stat.get("n"):
                 continue
@@ -553,7 +553,7 @@ class RunStats:
             "| --- | --- |",
             f"| 任务数 | {totals['jobs']} |",
             f"| 筛选后合计 | {totals['slots']} 个盘 |",
-            f"| 跳过 | {totals['skipped']} 个 |",
+            f"| 扫描跳过 | {totals['skipped']} 个 |",
             f"| 处理 | {totals['processed']} 个 |",
             f"| 升满成功 | {data['max_level_kept']} 件 |",
             f"| 判定弃置 | {counts[OUTCOME_DISCARDED]} 件 |",
@@ -580,7 +580,7 @@ class RunStats:
             "| --- | --- | --- |",
             f"| 升满成功 | {data['max_level_kept']} | {KEPT_NOTE} |",
             f"| 判定弃置 | {counts[OUTCOME_DISCARDED]} | {DISCARD_NOTE} |",
-            f"| 跳过 | {counts[OUTCOME_SKIPPED]} | 不满足条件，未改动 |",
+            f"| 进入处理后跳过 | {counts[OUTCOME_SKIPPED]} | 已读取盘面，未改动 |",
             f"| 中断 | {counts[OUTCOME_FAILED]} | 素材不足等中途停止 |",
             f"| 未完成 | {data['unfinished']} | 未走完流程，不计入等级分布 |",
             "",
@@ -604,7 +604,7 @@ class RunStats:
             "| --- | --- | --- | --- | --- | --- |",
         ]
         stage = data["stage_seconds"]
-        for level in STAGE_LEVELS:
+        for level in sorted(set(STAGE_LEVELS) | {int(k) for k in stage}):
             stat = stage.get(str(level))
             if stat and stat.get("n"):
                 lines.append(
