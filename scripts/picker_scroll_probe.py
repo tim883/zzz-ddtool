@@ -176,9 +176,17 @@ class Probe:
         elif command == "scroll":
             self.scroll(delta)
         elif command == "esc":
-            self.popup_input(lambda: wininput.press_key_once(self.hwnd, wininput.VK_ESCAPE))
-            time.sleep(0.5)
-            self.require(lambda image: gf._picker_popup_closed(image))
+            if gf._picker_stage_matches(before, self.layout) is True:
+                self.popup_input(lambda: wininput.press_key_once(self.hwnd, wininput.VK_ESCAPE))
+                time.sleep(0.5)
+                self.require(lambda image: gf._picker_popup_closed(image))
+            else:
+                predicate = lambda image: self.panel_state(image, True)
+                self.require(predicate)
+                with validated_inputs(lambda: self.require(predicate)):
+                    wininput.press_key_once(self.hwnd, wininput.VK_ESCAPE)
+                time.sleep(0.5)
+                self.require(lambda image: self.panel_state(image, False))
         elif command == "top":
             for _ in range(8):
                 image, _ = self.frame()

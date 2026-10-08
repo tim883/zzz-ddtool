@@ -58,6 +58,32 @@ def test_one_scroll_preserves_two_native_boundaries(setup):
     assert sent == [-6]
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_panel_close_revalidates_before_escape(setup, monkeypatch, changed):
+    p, probe, image, sent = setup
+    opened = [True]
+    monkeypatch.setattr(probe, "save", lambda tag: image)
+    monkeypatch.setattr(p.gf, "_picker_stage_matches", lambda *args: False)
+    monkeypatch.setattr(probe, "panel_state", lambda image, visible: opened[0] is visible)
+
+    def escape(*args):
+        if changed:
+            opened[0] = False
+        checkpoint_input()
+        checkpoint_input()
+        sent.append("esc")
+        opened[0] = False
+
+    monkeypatch.setattr(p.wininput, "press_key_once", escape)
+    with controlled_inputs(lambda: 0):
+        if changed:
+            with pytest.raises(RuntimeError):
+                probe.execute("esc", None)
+        else:
+            probe.execute("esc", None)
+    assert sent == ([] if changed else ["esc"])
+
+
 @pytest.mark.parametrize("boundary", [1, 2])
 def test_page_change_at_entry_or_focus_refuses_scroll(setup, monkeypatch, boundary):
     p, probe, _, sent = setup
