@@ -1,0 +1,379 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "profile_id": "warehouse-1920x1080",
+      "layout": "detail",
+      "client_size": [
+        1920,
+        1080
+      ],
+      "rec_min_score": 0.9,
+      "fields": [
+        {
+          "field_id": "level",
+          "kind": "level",
+          "rect": [
+            1460,
+            398,
+            1610,
+            445
+          ],
+          "slot": null
+        },
+        {
+          "field_id": "substat-1-name",
+          "kind": "substat_name",
+          "rect": [
+            1418,
+            564,
+            1560,
+            615
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-1-value",
+          "kind": "substat_value",
+          "rect": [
+            1735,
+            564,
+            1835,
+            615
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-2-name",
+          "kind": "substat_name",
+          "rect": [
+            1418,
+            615,
+            1560,
+            666
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-2-value",
+          "kind": "substat_value",
+          "rect": [
+            1735,
+            615,
+            1835,
+            666
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-3-name",
+          "kind": "substat_name",
+          "rect": [
+            1418,
+            666,
+            1560,
+            717
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-3-value",
+          "kind": "substat_value",
+          "rect": [
+            1735,
+            666,
+            1835,
+            717
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-4-name",
+          "kind": "substat_name",
+          "rect": [
+            1418,
+            717,
+            1560,
+            765
+          ],
+          "slot": 4
+        },
+        {
+          "field_id": "substat-4-value",
+          "kind": "substat_value",
+          "rect": [
+            1735,
+            717,
+            1835,
+            765
+          ],
+          "slot": 4
+        },
+        {
+          "field_id": "locked",
+          "kind": "locked",
+          "rect": [
+            1600,
+            1026,
+            1880,
+            1057
+          ],
+          "slot": null
+        },
+        {
+          "field_id": "discarded",
+          "kind": "discarded",
+          "rect": [
+            1600,
+            1026,
+            1880,
+            1057
+          ],
+          "slot": null
+        }
+      ]
+    },
+    {
+      "profile_id": "modal-1920x1080",
+      "layout": "detail",
+      "client_size": [
+        1920,
+        1080
+      ],
+      "rec_min_score": 0.9,
+      "fields": [
+        {
+          "field_id": "level",
+          "kind": "level",
+          "rect": [
+            1180,
+            190,
+            1310,
+            250
+          ],
+          "slot": null
+        },
+        {
+          "field_id": "substat-1-name",
+          "kind": "substat_name",
+          "rect": [
+            1166,
+            393,
+            1300,
+            444
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-1-value",
+          "kind": "substat_value",
+          "rect": [
+            1350,
+            393,
+            1475,
+            444
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-2-name",
+          "kind": "substat_name",
+          "rect": [
+            1488,
+            393,
+            1620,
+            444
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-2-value",
+          "kind": "substat_value",
+          "rect": [
+            1690,
+            393,
+            1790,
+            444
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-3-name",
+          "kind": "substat_name",
+          "rect": [
+            1166,
+            444,
+            1300,
+            495
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-3-value",
+          "kind": "substat_value",
+          "rect": [
+            1350,
+            444,
+            1475,
+            495
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-4-name",
+          "kind": "substat_name",
+          "rect": [
+            1488,
+            444,
+            1620,
+            495
+          ],
+          "slot": 4
+        },
+        {
+          "field_id": "substat-4-value",
+          "kind": "substat_value",
+          "rect": [
+            1690,
+            444,
+            1790,
+            495
+          ],
+          "slot": 4
+        },
+        {
+          "field_id": "locked",
+          "kind": "locked",
+          "rect": [
+            1600,
+            1026,
+            1880,
+            1057
+          ],
+          "slot": null
+        },
+        {
+          "field_id": "discarded",
+          "kind": "discarded",
+          "rect": [
+            1600,
+            1026,
+            1880,
+            1057
+          ],
+          "slot": null
+        }
+      ]
+    },
+    {
+      "profile_id": "upgrade-1920x1080",
+      "layout": "upgrade",
+      "client_size": [
+        1920,
+        1080
+      ],
+      "rec_min_score": 0.9,
+      "fields": [
+        {
+          "field_id": "level",
+          "kind": "level",
+          "rect": [
+            955,
+            528,
+            1050,
+            592
+          ],
+          "slot": null
+        },
+        {
+          "field_id": "substat-1-name",
+          "kind": "substat_name",
+          "rect": [
+            883,
+            419,
+            1012,
+            460
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-1-value",
+          "kind": "substat_value",
+          "rect": [
+            1180,
+            419,
+            1290,
+            460
+          ],
+          "slot": 1
+        },
+        {
+          "field_id": "substat-2-name",
+          "kind": "substat_name",
+          "rect": [
+            1295,
+            419,
+            1425,
+            460
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-2-value",
+          "kind": "substat_value",
+          "rect": [
+            1605,
+            419,
+            1692,
+            460
+          ],
+          "slot": 2
+        },
+        {
+          "field_id": "substat-3-name",
+          "kind": "substat_name",
+          "rect": [
+            883,
+            460,
+            1012,
+            501
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-3-value",
+          "kind": "substat_value",
+          "rect": [
+            1180,
+            460,
+            1290,
+            501
+          ],
+          "slot": 3
+        },
+        {
+          "field_id": "substat-4-name",
+          "kind": "substat_name",
+          "rect": [
+            1295,
+            460,
+            1425,
+            501
+          ],
+          "slot": 4
+        },
+        {
+          "field_id": "substat-4-value",
+          "kind": "substat_value",
+          "rect": [
+            1605,
+            460,
+            1692,
+            501
+          ],
+          "slot": 4
+        }
+      ]
+    }
+  ]
+}

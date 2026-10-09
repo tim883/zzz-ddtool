@@ -29,6 +29,8 @@ a = Analysis(
         (os.path.join(os.path.dirname(rapidocr.__file__), "default_models.yaml"), "rapidocr"),
         # 认页模板，运行时 assets_dir() 从包内读
         ("src/zzz_ddtool/assets/templates", "zzz_ddtool/assets/templates"),
+        # 扫描提速的固定行布局清单与模板，运行时 assets_dir()/discocr 从包内读
+        ("src/zzz_ddtool/assets/discocr", "zzz_ddtool/assets/discocr"),
     ],
     hiddenimports=[],
     hookspath=[],

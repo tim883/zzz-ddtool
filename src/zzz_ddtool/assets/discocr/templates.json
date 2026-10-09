@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "template_version": 1,
+  "entries": [
+    {
+      "template_id": "wh-name-baojilv",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "substat_name",
+      "text": "暴击率",
+      "image": "templates/wh-name-baojilv.png",
+      "sha256": "5a52cc67a3d3f98e98985e067cab87cbda21758f1d71666c3aa2f905c8ebacfb",
+      "source_image_sha256": "93b2c4c390de02d54b3d995dc01673d12dd34c17cfa18cd40f265fb2a98123d0",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-name-baojishanghai",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "substat_name",
+      "text": "暴击伤害",
+      "image": "templates/wh-name-baojishanghai.png",
+      "sha256": "e3f1dd288e70b25aafbdea3dec5a96903512d6cd85e78f451c486487065e3346",
+      "source_image_sha256": "a4944a777e4d0bccf3b81a6495b07f43d96ec029acda9a2c07f3380c147b9e52",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-name-shengmingzhi",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "substat_name",
+      "text": "生命值",
+      "image": "templates/wh-name-shengmingzhi.png",
+      "sha256": "f61a0ef4c044f09b03dc55f4b83a8724445915bc83d742e6df5cf946ce74c4f9",
+      "source_image_sha256": "a4944a777e4d0bccf3b81a6495b07f43d96ec029acda9a2c07f3380c147b9e52",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-name-chuantouzhi",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "substat_name",
+      "text": "穿透值",
+      "image": "templates/wh-name-chuantouzhi.png",
+      "sha256": "01251bfe29624651bde5f4e0beaac69472fca8eb5b73f8fd47dce4753f6f0f56",
+      "source_image_sha256": "a4944a777e4d0bccf3b81a6495b07f43d96ec029acda9a2c07f3380c147b9e52",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-name-gongjili",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "substat_name",
+      "text": "攻击力",
+      "image": "templates/wh-name-gongjili.png",
+      "sha256": "6c39852d81a47c34fc4356b8fe84355c11cb6596a7b044e21b7c4db3c8d40515",
+      "source_image_sha256": "93b2c4c390de02d54b3d995dc01673d12dd34c17cfa18cd40f265fb2a98123d0",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-level-00-15",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "level",
+      "text": "等级00/15",
+      "image": "templates/wh-level-00-15.png",
+      "sha256": "dde8625749a5ecbbf5dc5ba0b0e389f70488591976f75537d1edb049e2fccd0c",
+      "source_image_sha256": "a4944a777e4d0bccf3b81a6495b07f43d96ec029acda9a2c07f3380c147b9e52",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-level-03-15",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "level",
+      "text": "等级03/15",
+      "image": "templates/wh-level-03-15.png",
+      "sha256": "2e057f2fc90efcd1fdb227c42f6f72c102155cf94f598a2ae487751c5b45aca9",
+      "source_image_sha256": "4a1a70402ad29e9ae759aa182fb6d8c258c5798385c80d7e48cace46469280bb",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "wh-level-15-15",
+      "profile_id": "warehouse-1920x1080",
+      "kind": "level",
+      "text": "等级15/15",
+      "image": "templates/wh-level-15-15.png",
+      "sha256": "a71538fea00bf38593b99ad3e970a064b9719f84fdccf418faa30eb8d351b303",
+      "source_image_sha256": "747ff13f12fdea63d006024d432b3cc16f293c811d7e9b27f35ae14fab0d5fba",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-name-baojishanghai",
+      "profile_id": "modal-1920x1080",
+      "kind": "substat_name",
+      "text": "暴击伤害",
+      "image": "templates/mo-name-baojishanghai.png",
+      "sha256": "0bd53dfe1845d546b2680e91650714b5008b6b08fc3d935bc92560f61762326a",
+      "source_image_sha256": "262cc49ef5fad9af93d6f9e01f0b2ec13bc7fcbecf255c6b90a8f16de8780122",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-name-baojilv",
+      "profile_id": "modal-1920x1080",
+      "kind": "substat_name",
+      "text": "暴击率",
+      "image": "templates/mo-name-baojilv.png",
+      "sha256": "3e705209a30574db207cfc1494e407936014a07b786e52df916e8abc15826039",
+      "source_image_sha256": "262cc49ef5fad9af93d6f9e01f0b2ec13bc7fcbecf255c6b90a8f16de8780122",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-name-yichangjingtong",
+      "profile_id": "modal-1920x1080",
+      "kind": "substat_name",
+      "text": "异常精通",
+      "image": "templates/mo-name-yichangjingtong.png",
+      "sha256": "0a122545440b2540c5324b29896c9020a6bff46351495bfd82b2dbe4e18687be",
+      "source_image_sha256": "262cc49ef5fad9af93d6f9e01f0b2ec13bc7fcbecf255c6b90a8f16de8780122",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-name-gongjili",
+      "profile_id": "modal-1920x1080",
+      "kind": "substat_name",
+      "text": "攻击力",
+      "image": "templates/mo-name-gongjili.png",
+      "sha256": "834a591db098d767c3f56dbe9d828c69c02976d40211a581e48768316aa47a17",
+      "source_image_sha256": "6a803e2efd1a455125b975cf51109544317519e1cd7912e386a7cb54090397a2",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-name-fangyuli",
+      "profile_id": "modal-1920x1080",
+      "kind": "substat_name",
+      "text": "防御力",
+      "image": "templates/mo-name-fangyuli.png",
+      "sha256": "f29aa9a70509d2d551c0935a81758a1fc2e9d1b245c34a00e01d3405631da2e1",
+      "source_image_sha256": "6a803e2efd1a455125b975cf51109544317519e1cd7912e386a7cb54090397a2",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-level-00",
+      "profile_id": "modal-1920x1080",
+      "kind": "level",
+      "text": "等级00",
+      "image": "templates/mo-level-00.png",
+      "sha256": "96790108eb54e5ff3d8287fdb40467a39f7a8f41193a64b8079f0d61d6903856",
+      "source_image_sha256": "6a803e2efd1a455125b975cf51109544317519e1cd7912e386a7cb54090397a2",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-level-03",
+      "profile_id": "modal-1920x1080",
+      "kind": "level",
+      "text": "等级03",
+      "image": "templates/mo-level-03.png",
+      "sha256": "39f4d3562357224ae7956f6336c579cdf4a2e2e00f7fd77ae40393afba675106",
+      "source_image_sha256": "262cc49ef5fad9af93d6f9e01f0b2ec13bc7fcbecf255c6b90a8f16de8780122",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "mo-level-15",
+      "profile_id": "modal-1920x1080",
+      "kind": "level",
+      "text": "等级15",
+      "image": "templates/mo-level-15.png",
+      "sha256": "7e232dc1ef10a5756e9ff92b217961a3390c2843a098c37d92385c87d97553c1",
+      "source_image_sha256": "5dc05a3fdf857a5e8462484548d9f6ea4b1010808da8d8e3ff141a285c5f3c99",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "up-name-gongjili",
+      "profile_id": "upgrade-1920x1080",
+      "kind": "substat_name",
+      "text": "攻击力",
+      "image": "templates/up-name-gongjili.png",
+      "sha256": "32b00d11e506fc647790e4c8b21f171def46d30b9511ea79c67de3b7aac2a5b8",
+      "source_image_sha256": "3a23d47ac32b1a991ace0855c097ee528b836ef04b55f4471b6aeb097b36c666",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    },
+    {
+      "template_id": "up-name-baojishanghai",
+      "profile_id": "upgrade-1920x1080",
+      "kind": "substat_name",
+      "text": "暴击伤害",
+      "image": "templates/up-name-baojishanghai.png",
+      "sha256": "43ef08e62fb117a86dbc742b613436da76fe2975e9e3012fc90961b749c07a59",
+      "source_image_sha256": "3a23d47ac32b1a991ace0855c097ee528b836ef04b55f4471b6aeb097b36c666",
+      "match_min_score": 0.99,
+      "match_min_gap": 0.03
+    }
+  ]
+}

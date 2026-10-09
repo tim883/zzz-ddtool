@@ -29,7 +29,12 @@ zzz-ddtool = "zzz_ddtool.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-zzz_ddtool = ["assets/templates/**/*.png"]
+zzz_ddtool = [
+  "assets/templates/**/*.png",
+  "assets/discocr/profiles.json",
+  "assets/discocr/templates.json",
+  "assets/discocr/templates/*.png",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
