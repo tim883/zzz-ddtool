@@ -35,6 +35,9 @@ def setup(monkeypatch):
     state = [kept_disc()]
     parser = Mock(side_effect=lambda _image: state[0])
     monkeypatch.setattr(rm, "parse_disc", parser)
+    monkeypatch.setattr(rm, "is_page", lambda *_: True)
+    monkeypatch.setattr(rm, "read_action_state_fast",
+                        lambda _: {"locked": state[0].locked, "discarded": state[0].discarded})
     keys = []
 
     def press(hwnd, vk):
@@ -53,14 +56,19 @@ def test_unlocked_kept_disc_locks_once_before_any_restore(setup):
     assert keys == [wininput.VK_T]
     assert state[0].locked is True
     back.assert_called_once_with(1)
-    assert parser.call_count == 4  # 初始、两个输入边界、动作后
+    assert parser.call_count == 3  # 初始、两个输入边界；动作后只读标签
 
 
-def test_already_locked_disc_is_not_toggled(setup):
+def test_already_locked_disc_is_not_toggled(setup, monkeypatch):
     runner, state, parser, keys, _ = setup
     state[0] = kept_disc(locked=True)
+    sleep = Mock()
+    monkeypatch.setattr(rm.time, "sleep", sleep)
+    before_stats = runner.stats.summary()
     runner._finish_kept_upgrade(1, kept_disc())
     assert keys == [] and parser.call_count == 1
+    sleep.assert_not_called()
+    assert runner.stats.summary() == before_stats
 
 
 def test_save_disabled_adds_no_ocr_or_key(setup):
@@ -183,7 +191,7 @@ def test_unknown_after_t_fails_without_second_t(setup, monkeypatch):
     monkeypatch.setattr(rm, "press_key_once", press)
     with pytest.raises(RunnerError, match="无法确认"):
         runner._finish_kept_upgrade(1, kept_disc())
-    assert keys == [wininput.VK_T] and parser.call_count == 4
+    assert keys == [wininput.VK_T] and parser.call_count == 2  # 按后不读整盘
 
 
 def test_level_fifteen_final_discard_uses_original_discard_path(setup, monkeypatch):
@@ -204,6 +212,23 @@ def test_level_fifteen_final_discard_uses_original_discard_path(setup, monkeypat
     discard.assert_called_once_with(1)
     assert keys == [] and runner.stats.discs[index].outcome == "discarded"
     assert runner.stats.summary()["max_level_kept"] == 0
+
+
+def test_upgrade_discard_failure_is_not_counted_as_success(setup, monkeypatch):
+    runner, _, _, _, _ = setup
+    monkeypatch.setattr(runner, "_discard_from_upgrade", Mock(side_effect=RunnerError("discard failed")))
+    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
+    monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
+    decisions = iter([Decision(Action.UPGRADE, "test_upgrade", 1, 1, 4, 12),
+                      Decision(Action.MARK_DISCARD, "test_discard", 0, 0, 4, 15)])
+    monkeypatch.setattr(rm, "decide", lambda *args, **kwargs: next(decisions))
+    job = runner._default_job()
+    index = runner.stats.disc_begin(job.job_id, 0, 12)
+    with pytest.raises(RunnerError, match="discard failed"):
+        runner._upgrade_loop(1, job, 0, "R1C1", runner.preset, None, {}, index,
+                             initial_disc=kept_disc(12))
+    assert runner.stats.discs[index].outcome == "failed"
+    assert runner.stats.summary()["discard_labels"] == 0
 
 
 @pytest.mark.parametrize("error", [CaptureError, OcrError, wininput.InputError])

@@ -203,6 +203,26 @@ def offline_runner(monkeypatch):
     }
     for name, mock in inputs.items():
         monkeypatch.setattr(runner_module, name, mock)
+    # 这里隔离的是截图/OCR 边界，保留真实标签转换和复核循环。
+    label_states = {}
+    active_label = [None]
+
+    def label_frame(self, hwnd, context):
+        if id(context) not in label_states:
+            disc = context.before
+            label_states[id(context)] = (context, {"locked": disc.locked if disc else False,
+                                                  "discarded": disc.discarded if disc else False})
+        active_label[0] = label_states[id(context)][1]
+        return dict(active_label[0]), image
+
+    def toggle_label(hwnd, vk):
+        if active_label[0] is not None:
+            key = {runner_module.VK_R: "discarded", runner_module.VK_T: "locked"}.get(vk)
+            if key is not None:
+                active_label[0][key] = not active_label[0][key]
+
+    monkeypatch.setattr(Runner, "_read_label_state", label_frame)
+    inputs["press_key_once"].side_effect = toggle_label
     monkeypatch.setattr("zzz_ddtool.overlay.overlay_hide", Mock())
     monkeypatch.setattr("zzz_ddtool.overlay.overlay_show", Mock())
     # 缩放预览层判据默认关掉（真实现要跑 OCR）；需要模拟它的用例自行覆盖。

@@ -1,0 +1,187 @@
+"""标签转换真实编排；仅窗口、截图、识别及原生输入由替身隔离。"""
+from dataclasses import replace
+from unittest.mock import Mock
+
+import pytest
+from PySide6.QtGui import QImage
+
+from zzz_ddtool import runner as rm
+from zzz_ddtool.config import LabelPolicy, Preset
+from zzz_ddtool.control import checkpoint_input, controlled_inputs
+from zzz_ddtool.hotkeys import RunnerStopped
+from zzz_ddtool.models import Action, Disc, Substat
+
+
+@pytest.fixture
+def labels(monkeypatch):
+    runner = rm.Runner(Preset(skip_locked=False, ocr_retry=2), hotkeys=False)
+    runner.trace = Mock()
+    state = [Disc(3, (Substat("暴击率"), Substat("攻击力"), Substat("生命值")), locked=True)]
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(0)
+    generation, stopped, keys = [0], [False], []
+
+    def checkpoint():
+        if stopped[0]:
+            raise RunnerStopped("stop")
+        return generation[0]
+
+    monkeypatch.setattr(runner, "_checkpoint", checkpoint)
+    monkeypatch.setattr(runner, "_grab", Mock(return_value=(image, "unknown", "test", 1)))
+    monkeypatch.setattr(runner, "_esc_back_to_grid", Mock())
+    monkeypatch.setattr(rm, "is_page", lambda *_: True)
+    monkeypatch.setattr(rm.time, "sleep", lambda _: None)
+    reader = Mock(side_effect=lambda _: {"locked": state[0].locked, "discarded": state[0].discarded})
+    parser = Mock(side_effect=lambda _: state[0])
+    monkeypatch.setattr(rm, "read_action_state_fast", reader)
+    monkeypatch.setattr(rm, "parse_disc", parser)
+
+    def press(hwnd, vk):
+        checkpoint_input()
+        checkpoint_input()  # 聚焦前仍检查，暂停改变会触发复验。
+        keys.append(vk)
+        key = "locked" if vk == rm.VK_T else "discarded"
+        state[0] = replace(state[0], **{key: not getattr(state[0], key)})
+
+    monkeypatch.setattr(rm, "press_key_once", press)
+    return runner, state, generation, stopped, keys, reader, parser, press
+
+
+@pytest.mark.parametrize("upgraded", [False, True])
+@pytest.mark.parametrize("save", [False, True])
+def test_locked_discard_both_entries_unlock_then_discard(labels, upgraded, save):
+    runner, state, _, _, keys, reader, parser, _ = labels
+    runner.preset = replace(runner.preset, labels=LabelPolicy(save=save))
+    runner._detail_disc = state[0]
+    with controlled_inputs(runner._checkpoint):
+        if upgraded:
+            runner._discard_from_upgrade(1)
+        else:
+            runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == [rm.VK_T, rm.VK_R]
+    assert (state[0].locked, state[0].discarded) == (False, True)
+    parser.assert_not_called()  # 正常按后从不重读副词条。
+    assert reader.call_count >= 4
+    assert runner.stats.summary()["discard_labels"] == 1
+
+
+def test_discard_disabled_suppresses_unlock_too(labels):
+    runner, state, _, _, keys, reader, parser, _ = labels
+    runner.preset = replace(runner.preset, labels=LabelPolicy(discard=False))
+    runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == []
+    reader.assert_not_called()
+    parser.assert_not_called()
+
+
+@pytest.mark.parametrize("discarded,value,expected", [(False, True, [rm.VK_R]),
+                                                     (True, False, [rm.VK_R]),
+                                                     (True, True, [])])
+def test_set_or_remove_discard_uses_current_state(labels, monkeypatch, discarded, value, expected):
+    runner, state, _, _, keys, _, _, _ = labels
+    state[0] = replace(state[0], locked=False, discarded=discarded)
+    sleep = Mock()
+    monkeypatch.setattr(rm.time, "sleep", sleep)
+    with controlled_inputs(runner._checkpoint):
+        changed = runner._set_discard_label(1, discarded=not discarded, value=value, before=state[0])
+    assert keys == expected  # 传入的旧状态不能导致反向切换。
+    assert state[0].discarded is value
+    assert changed is bool(expected)
+    assert runner.stats.summary()["discard_labels"] == int(bool(expected) and value)
+    if not expected:
+        sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("effect", ["none", "unknown"])
+def test_failed_unlock_never_sends_r(labels, monkeypatch, effect):
+    runner, state, _, _, keys, _, _, _ = labels
+    def press(hwnd, vk):
+        checkpoint_input()
+        keys.append(vk)
+        if effect == "unknown":
+            state[0] = replace(state[0], locked=None)
+    monkeypatch.setattr(rm, "press_key_once", press)
+    with controlled_inputs(runner._checkpoint), pytest.raises(rm.RunnerError, match="不重复按键"):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == [rm.VK_T]
+    assert runner.stats.summary()["discard_labels"] == 0
+
+
+def test_failed_r_is_not_counted_or_retried(labels, monkeypatch):
+    runner, state, _, _, keys, _, _, _ = labels
+    state[0] = replace(state[0], locked=False)
+    monkeypatch.setattr(rm, "press_key_once", lambda hwnd, vk: (checkpoint_input(), keys.append(vk)))
+    with controlled_inputs(runner._checkpoint), pytest.raises(rm.RunnerError, match="不重复按键"):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == [rm.VK_R] and runner.stats.summary()["discard_labels"] == 0
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_pause_after_unlock_resumes_without_repeating_t(labels, monkeypatch, changed):
+    runner, state, generation, _, keys, _, parser, press = labels
+    original = state[0]
+    def pause_after_t(hwnd, vk):
+        press(hwnd, vk)
+        if vk == rm.VK_T:
+            generation[0] += 2
+            if changed:
+                state[0] = replace(state[0], level=6)
+    monkeypatch.setattr(rm, "press_key_once", pause_after_t)
+    with controlled_inputs(runner._checkpoint):
+        if changed:
+            with pytest.raises(rm.RunnerError, match="不一致"):
+                runner._act(1, Action.MARK_DISCARD, original)
+        else:
+            runner._act(1, Action.MARK_DISCARD, original)
+    assert keys == ([rm.VK_T] if changed else [rm.VK_T, rm.VK_R])
+    assert parser.call_count == 1  # 仅恢复时复验一次对象。
+
+
+def test_stop_between_unlock_and_discard_never_sends_r(labels, monkeypatch):
+    runner, state, _, stopped, keys, _, _, press = labels
+    def stop_after_t(hwnd, vk):
+        press(hwnd, vk)
+        stopped[0] = True
+    monkeypatch.setattr(rm, "press_key_once", stop_after_t)
+    with controlled_inputs(runner._checkpoint), pytest.raises(RunnerStopped):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == [rm.VK_T]
+
+
+@pytest.mark.parametrize("key", ["locked", "discarded"])
+def test_unknown_before_input_never_sends_any_key(labels, key):
+    runner, state, _, _, keys, _, _, _ = labels
+    state[0] = replace(state[0], **{key: None})
+    with pytest.raises(rm.RunnerError, match="无法确认"):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == []
+
+
+@pytest.mark.parametrize("fault", ["window", "page", "size"])
+def test_changed_capture_binding_stops_without_input(labels, monkeypatch, fault):
+    runner, state, _, _, keys, _, _, _ = labels
+    if fault == "window":
+        image = runner._grab()[0]
+        runner._grab.return_value = (image, "unknown", "test", 2)
+    elif fault == "page":
+        monkeypatch.setattr(rm, "is_page", lambda *_: False)
+    else:
+        small = QImage(1280, 720, QImage.Format.Format_RGB32)
+        runner._grab.side_effect = [runner._grab.return_value, (small, "unknown", "test", 1)]
+    with controlled_inputs(runner._checkpoint), pytest.raises(rm.RunnerError):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == []
+
+
+@pytest.mark.parametrize("key", ["locked", "discarded"])
+def test_both_keys_complete_on_first_known_target_without_full_read(labels, monkeypatch, key):
+    runner, state, _, _, keys, reader, parser, _ = labels
+    other = "discarded" if key == "locked" else "locked"
+    reader.side_effect = [{key: None, other: False}, {key: True, other: False}]
+    sleep = Mock()
+    monkeypatch.setattr(rm.time, "sleep", sleep)
+    context = rm._LabelContext(state[0], 0)
+    runner._verify_label(1, key=key, value=True, other_value=False, context=context)
+    assert reader.call_count == 2 and keys == []
+    assert [call.args[0] for call in sleep.call_args_list] == [0.05, 0.05]
+    parser.assert_not_called()

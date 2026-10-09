@@ -51,7 +51,7 @@ from zzz_ddtool.navigation import (
     settle_and_read_anchor,
     anchor_screen_rows,
 )
-from zzz_ddtool.ocr import OcrError, parse_disc
+from zzz_ddtool.ocr import OcrError, parse_disc, read_action_state_fast
 from zzz_ddtool.paths import stats_dir
 from zzz_ddtool.screen import DRIVE_DISC, is_page
 from zzz_ddtool.stats import (
@@ -100,6 +100,13 @@ _SETTLE_FALLBACK_MS = 500
 # 恢复方法：本常量改回 True 即可；tile_has_portrait、YAML 的 skip_equipped 字段、界面控件
 # 与扫描分支全部原样保留，无需其他改动。
 SKIP_EQUIPPED_ENABLED = False
+
+
+@dataclass
+class _LabelContext:
+    before: Disc | None
+    generation: int | None
+    size: tuple[int, int] | None = None
 
 
 class RunnerError(RuntimeError):
@@ -1829,16 +1836,86 @@ class Runner:
     STAGE_ADD_AREA = (1150, 800, 1420, 940)
     UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
 
-    def _set_discard_label(self, hwnd: int, *, discarded: bool, value: bool) -> bool:
+    def _read_label_state(self, hwnd: int, context: _LabelContext) -> tuple[dict, QImage]:
+        """只检查绑定窗口、仓库和提示行；仅暂停代次改变时复验核心盘面。"""
+        generation = self._checkpoint()
+        image, _page, _method, actual_hwnd = self._grab(allow_esc=False, need_page=False)
+        if actual_hwnd != hwnd or (self._hwnd is not None and self._hwnd != hwnd):
+            raise RunnerError("标签操作的游戏窗口改变，停止任务链")
+        if self._pid is not None and window_pid(hwnd) != self._pid:
+            raise RunnerError("标签操作的游戏进程改变，停止任务链")
+        size = (image.width(), image.height())
+        if context.size is None:
+            context.size = size
+        if size != context.size or not is_page(image, DRIVE_DISC):
+            raise RunnerError("标签操作时尺寸改变或已离开驱动盘仓库，停止任务链")
+        if generation != context.generation:
+            current = parse_disc(image) if context.before is not None else None
+            if current is None or self._label_core(current) != self._label_core(context.before):
+                raise RunnerError("暂停后标签操作对象无法确认或盘面不一致，停止任务链")
+            context.generation = generation
+        state = read_action_state_fast(image)
+        # 识别中发生暂停时，丢弃旧帧；下一次读取再复验，不能凭旧结果发下一键。
+        if self._checkpoint() != generation:
+            return {"locked": None, "discarded": None}, image
+        return state, image
+
+    @staticmethod
+    def _label_core(disc: Disc) -> tuple:
+        return disc.level, disc.rarity, sorted((s.name, s.rolls) for s in disc.substats)
+
+    def _verify_label(self, hwnd: int, *, key: str, value: bool, other_value: bool,
+                      context: _LabelContext) -> QImage:
+        """R/T 共用快速复核；轮询只读，不补发任何标签输入。"""
+        other = "discarded" if key == "locked" else "locked"
+        for _attempt in range(max(1, self.preset.ocr_retry) * 4):
+            self._checkpoint()
+            time.sleep(0.05)
+            state, image = self._read_label_state(hwnd, context)
+            if state[other] is not None and state[other] != other_value:
+                raise RunnerError("按键后另一标签状态意外变化，不重复按键，停止任务链")
+            if state[key] is value and state[other] is other_value:
+                return image
+        raise RunnerError("按键后标签状态无法确认，不重复按键，停止任务链")
+
+    def _set_discard_label(self, hwnd: int, *, discarded: bool, value: bool,
+                           before: Disc | None = None) -> bool:
         """所有弃置标签增删的统一入口；高级设置关闭时不发送标签按键。"""
         if not self.preset.labels.allows("discard"):
             self.log.info("弃置标签设置关闭：保留判断结果，不修改标签")
             self.trace.note("标签设置关闭，不修改弃置标签")
             return False
-        if discarded == value:
-            return False
-        press_key_once(hwnd, VK_R)
-        time.sleep(0.5)
+        # discarded 是调用者先前的读数；输入前必须使用当前帧，不能信旧标签。
+        context = _LabelContext(before or self._detail_disc, self._checkpoint())
+        state = None
+        for _attempt in range(max(1, self.preset.ocr_retry)):
+            state, _image = self._read_label_state(hwnd, context)
+            if state["discarded"] is value:
+                return False
+            if state["locked"] is not None and state["discarded"] is not None:
+                break
+            time.sleep(0.05)
+        if state is None or state["locked"] is None or state["discarded"] is None:
+            raise RunnerError("标签输入前状态无法确认，停止任务链")
+
+        def send(vk: int, expected: dict) -> None:
+            def validate() -> None:
+                actual, _image = self._read_label_state(hwnd, context)
+                if actual != expected:
+                    raise RunnerError("标签输入前状态改变或未知，停止任务链")
+            with validated_inputs(validate, reuse_unchanged=True):
+                press_key_once(hwnd, vk)
+
+        if value and state["locked"]:
+            # G07：先解锁再弃置，避免直接 R 产生确认弹窗。
+            send(VK_T, state)
+            self._verify_label(hwnd, key="locked", value=False,
+                               other_value=state["discarded"], context=context)
+            state = {"locked": False, "discarded": state["discarded"]}
+            self.log.info("弃置前已确认解锁 (T)")
+        send(VK_R, state)
+        self._verify_label(hwnd, key="discarded", value=value,
+                           other_value=state["locked"], context=context)
         self.log.info("discard label=%s (R)", value)
         if value:
             # 「判定为弃置」和「真打上标记」不是一个数，这里只数后者。
@@ -1886,12 +1963,11 @@ class Runner:
             if checked.locked is not False or checked.discarded is not False:
                 raise RunnerError("锁定输入前标签状态改变或未知，停止任务链")
 
+        context = _LabelContext(disc, self._checkpoint(), (image.width(), image.height()))
         with validated_inputs(validate_unlocked):
             press_key_once(hwnd, VK_T)
-        time.sleep(0.3)
-        current, image = read_current()
-        if current.locked is not True:
-            raise RunnerError("按 T 后未确认锁定成功，不重复按键，停止任务链")
+        image = self._verify_label(hwnd, key="locked", value=True,
+                                   other_value=False, context=context)
         self.log.info("升满保留：已确认锁定标签 (T)")
         self.trace.ok("detail", "lock", "升满保留，已确认 T 锁定", image=image)
 
@@ -1900,7 +1976,7 @@ class Runner:
         # 注意：这些动作都不按 Esc——详情保持常开，下一个格子点击直接切换。
         # R 是开关：按之前必须看 disc.discarded，否则打标签会变成摘标签（反之亦然）。
         if action == Action.MARK_DISCARD:
-            self._set_discard_label(hwnd, discarded=disc.discarded, value=True)
+            self._set_discard_label(hwnd, discarded=disc.discarded, value=True, before=disc)
         elif action == Action.SKIP:
             self.log.info("action=SKIP")
         elif action == Action.STOP:
@@ -2085,7 +2161,7 @@ class Runner:
         """确认回到仓库侧边详情后按 R；侧边详情本来就是网格，不再 Esc。"""
         self._esc_back_to_grid(hwnd)
         self._checkpoint()
-        discarded = bool(self._detail_disc and self._detail_disc.discarded and not self.preset.labels.discard)
+        discarded = bool(self._detail_disc and self._detail_disc.discarded)
         if self._set_discard_label(hwnd, discarded=discarded, value=True):
             self.trace.ok("detail", "discard", "已按 R 打上弃置标记")
 
@@ -2259,7 +2335,10 @@ class Runner:
                         raise
                     raise RunnerError(f"保留锁定收尾失败：{exc}，停止任务链") from exc
                 self._record(job, disc, decision)
-                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
+                img = ""
+                if disc.level >= MAX_LEVEL:
+                    img = self._kept_image_path(disc_slot)
+                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score, image=img)
                 return disc.level
             # 其他 SKIP 不动，直接 Esc 回网格；STOP 已在前面停止整条任务链。
             self.log.info("cell %s 强化页判 %s，回网格", cell_tag, decision.action.value)

@@ -21,6 +21,7 @@ from PySide6.QtGui import QImage
 
 from zzz_ddtool.layout import (
     ACTION_ROW,
+    ACTION_TEXT_LINE,
     DISC_LEVEL,
     SUB_STAT_SPLIT_X,
     SUB_STATS,
@@ -637,6 +638,37 @@ def read_action_state(image: QImage) -> dict[str, bool | None]:
                     break
         state[key] = True if active else (False if group else None)
     return state
+
+
+def read_action_state_fast(image: QImage) -> dict[str, bool | None]:
+    """固定提示行直接识别；正常标签复核不做检测、不读取盘面。"""
+    from rapidocr.ch_ppocr_rec import TextRecInput
+
+    unknown = {"locked": None, "discarded": None}
+    if image.isNull() or image.width() * 9 != image.height() * 16:
+        return unknown
+    left, top, right, bottom = scale_rect(*ACTION_TEXT_LINE, image.width(), image.height())
+    crop = qimage_to_bgr(image.copy(left, top, right - left, bottom - top))
+    with _WORD_BOX_LOCK:
+        result = _get_engine().text_rec(TextRecInput(img=[crop]))
+    if result.txts is None or result.scores is None or len(result.txts) != 1 or len(result.scores) != 1:
+        raise OcrError("标签行识别返回数量不正确")
+    score = float(result.scores[0])
+    if not math.isfinite(score) or score < 0.90:
+        return unknown
+    text = re.sub(r"\s+", "", result.txts[0])
+    # 完整提示语法；残缺「解除」或杂字不能退化成未标记。
+    match = re.fullmatch(r"R?(解除弃置|取消弃置|弃置)T?(解除锁定|锁定)", text)
+    if match is not None:
+        return {"discarded": match[1] != "弃置", "locked": match[2] != "锁定"}
+    # 某些页面只显示一个提示，另一个保持未知，调用方不能盲按。
+    match = re.fullmatch(r"R?(解除弃置|取消弃置|弃置)", text)
+    if match is not None:
+        return {"discarded": match[1] != "弃置", "locked": None}
+    match = re.fullmatch(r"T?(解除锁定|锁定)", text)
+    if match is not None:
+        return {"discarded": None, "locked": match[1] != "锁定"}
+    return unknown
 
 
 def parse_disc(image: QImage) -> Disc | None:
