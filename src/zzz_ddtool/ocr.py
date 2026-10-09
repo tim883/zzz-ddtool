@@ -718,25 +718,37 @@ def _parse_disc_upgrade_page_legacy(image: QImage) -> Disc | None:
 # ---------------------------------------------------------------------------
 # 公开解析入口（§2.2 / §3.2）
 #
-# 步骤 1 只完成 legacy 提取，尚未启用盘面快路径：公开入口直接调用旧整帧解析器，
-# 行为与提取前一致。步骤 3 起改为「先 try_read_disc 成功则返回其 disc；拒绝则同帧
-# 调用对应 _legacy」。
+# 步骤 1 只完成 legacy 提取；步骤 3 起改为「先 try_read_disc 成功则返回其 disc；
+# 拒绝则同帧调用对应 _legacy」。快路径只省识别开销，不改旧解析结果：提取后的
+# legacy 逐字段不变，识别网络自身抛出的异常按 §6.1.1 原样传播，不折算成拒绝原因。
 # ---------------------------------------------------------------------------
 
 
 def parse_disc(image: QImage) -> Disc | None:
     """从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
 
-    公开入口。当前（步骤 1）未启用快路径，等价于旧整帧解析器。
+    公开入口：先在**同一帧**上走快路径（`discocr.try_read_disc`），成功就直接返回
+    它的 Disc；拒绝或异常以外的任何拒绝原因都回退到旧整帧解析器 `_parse_disc_legacy`。
     失败返回 None，调用方应中断流程。
     """
+    from zzz_ddtool import discocr
+
+    fast = discocr.try_read_disc(image, layout="detail")
+    if fast.disc is not None:
+        return fast.disc
     return _parse_disc_legacy(image)
 
 
 def parse_disc_upgrade_page(image: QImage) -> Disc | None:
     """从强化页截图解析 Disc（强化页副属性/等级坐标）。
 
-    公开入口。当前（步骤 1）未启用快路径，等价于旧整帧解析器。
-    失败返回 None。
+    公开入口：先在同帧上走 `layout="upgrade"` 的快路径，拒绝则回退强化页 legacy。
+    本入口**不调用** detail 入口（§3.2）；满级后回退详情解析由 Runner 的
+    `_parse_upgrade_page` 负责。失败返回 None。
     """
+    from zzz_ddtool import discocr
+
+    fast = discocr.try_read_disc(image, layout="upgrade")
+    if fast.disc is not None:
+        return fast.disc
     return _parse_disc_upgrade_page_legacy(image)
