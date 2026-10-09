@@ -20,3 +20,16 @@ import os
 
 if os.environ.get("ZZZ_DDTOOL_TEST_WINDOW") != "1":
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+
+def pytest_collection_modifyitems(items):
+    """把真实 pytest node ID 写进 JUnit testcase property ``pytest_nodeid``（Spec §9）。
+
+    阶段门禁按 node ID 精确匹配映射节点，不靠截断的 classname/name 猜。本 hook 只读写
+    ``item.user_properties``，不 import Qt、不建窗口，保持 conftest 的零依赖约定。
+    """
+    for item in items:
+        props = getattr(item, "user_properties", None)
+        if props is None:
+            item.user_properties = props = []
+        props.append(("pytest_nodeid", item.nodeid))

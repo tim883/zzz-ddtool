@@ -671,9 +671,10 @@ def read_action_state_fast(image: QImage) -> dict[str, bool | None]:
     return unknown
 
 
-def parse_disc(image: QImage) -> Disc | None:
-    """从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
+def _parse_disc_legacy(image: QImage) -> Disc | None:
+    """旧整帧解析器：从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
 
+    §2.2 的 legacy：完整保存「启用盘面快路径前」的算法，不改动。
     失败返回 None，调用方应中断流程。
     """
     # 只有在等级标签成功匹配时才选择布局，避免把套装说明里的数字当等级。
@@ -697,9 +698,10 @@ def parse_disc(image: QImage) -> Disc | None:
     )
 
 
-def parse_disc_upgrade_page(image: QImage) -> Disc | None:
-    """从强化页截图解析 Disc（强化页副属性/等级坐标）。
+def _parse_disc_upgrade_page_legacy(image: QImage) -> Disc | None:
+    """旧整帧解析器：从强化页截图解析 Disc（强化页副属性/等级坐标）。
 
+    §2.2 的 legacy：完整保存「启用盘面快路径前」的算法，不改动。
     强化页没有 R/T 按钮，弃置在详情页做；这里只读等级+副属性供 decide 判断
     升级还是弃置。稀有度同理由等级上限推出，读不出就是 None（未知，不据此跳过）。
     失败返回 None。
@@ -711,3 +713,30 @@ def parse_disc_upgrade_page(image: QImage) -> Disc | None:
     if not substats:
         return None
     return Disc(level=level, substats=substats, rarity=rarity, locked=False, discarded=False)
+
+
+# ---------------------------------------------------------------------------
+# 公开解析入口（§2.2 / §3.2）
+#
+# 步骤 1 只完成 legacy 提取，尚未启用盘面快路径：公开入口直接调用旧整帧解析器，
+# 行为与提取前一致。步骤 3 起改为「先 try_read_disc 成功则返回其 disc；拒绝则同帧
+# 调用对应 _legacy」。
+# ---------------------------------------------------------------------------
+
+
+def parse_disc(image: QImage) -> Disc | None:
+    """从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
+
+    公开入口。当前（步骤 1）未启用快路径，等价于旧整帧解析器。
+    失败返回 None，调用方应中断流程。
+    """
+    return _parse_disc_legacy(image)
+
+
+def parse_disc_upgrade_page(image: QImage) -> Disc | None:
+    """从强化页截图解析 Disc（强化页副属性/等级坐标）。
+
+    公开入口。当前（步骤 1）未启用快路径，等价于旧整帧解析器。
+    失败返回 None。
+    """
+    return _parse_disc_upgrade_page_legacy(image)
