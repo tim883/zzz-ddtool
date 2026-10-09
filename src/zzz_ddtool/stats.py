@@ -141,6 +141,9 @@ class DiscStat:
     slot: int = 0
     sets: tuple[str, ...] = ()
     line_count: int = 0  # 副词条条数（词条数）
+    # 升满成功盘的截图相对路径（相对 log/stats/<tag>/，如 "success/disc12.png"）。
+    # 由 runner 在判定成功时存好；截不到就留空，报告里不贴图。
+    image: str = ""
     level_end: int = 0
     outcome: str = ""
     score: float = 0.0
@@ -250,8 +253,12 @@ class RunStats:
                 StageSpan(from_level=int(from_level), to_level=int(to_level), seconds=float(seconds))
             )
 
-    def disc_end(self, slot: int, outcome: str, level: int, score: float = 0.0) -> None:
-        """收尾一件盘。重复调用以第一次为准（一件盘有多个出口，别重复记账）。"""
+    def disc_end(self, slot: int, outcome: str, level: int, score: float = 0.0, *,
+                  image: str = "") -> None:
+        """收尾一件盘。重复调用以第一次为准（一件盘有多个出口，别重复记账）。
+
+        image：成功盘截图相对路径（相对 log/stats/<tag>/），由 runner 在判定成功时传入。
+        """
         if not (0 <= slot < len(self.discs)):
             return
         disc = self.discs[slot]
@@ -260,6 +267,7 @@ class RunStats:
         disc.outcome = outcome
         disc.level_end = int(level)
         disc.score = float(score)
+        disc.image = image
         t0 = self._open.pop(f"disc{disc.index}", None)
         if t0 is not None:
             disc.seconds = time.monotonic() - t0
@@ -397,6 +405,7 @@ class RunStats:
                     "line_count": d.line_count,
                     "level_end": d.level_end,
                     "score": round(d.score, 3),
+                    "image": d.image,
                 }
                 for d in self.discs
                 if d.outcome == OUTCOME_UPGRADED and d.level_end >= 15
@@ -487,6 +496,7 @@ class RunStats:
                 f"{d['slot']}号位"
                 f"{'/'.join(d['sets']) if d['sets'] else '未知'}"
                 f"{d['line_count']}词条"
+                + (f" 图={d['image']}" if d.get("image") else "")
                 for d in data["kept_discs"]
             )
             log.info("    升满成功明细：%s", kept_desc)
@@ -636,9 +646,15 @@ class RunStats:
                     f"{d['level_end']} 级 | {d['score']:.2f} |"
                 )
             lines.append("")
+            for d in kept:
+                if d.get("image"):
+                    set_name = "、".join(d["sets"]) if d["sets"] else "未知"
+                    lines.append(f"![{d['slot']} 号位 {set_name}]({d['image']})")
+            lines.append("")
             lines.append(
                 "- 套装名取所属任务的过滤套装（任务未限定套装时显示「未知」）；部位号 = 任务号位；"
                 "词条数 = 副词条条数。这几项帮你看清「升满成功的到底是哪几件盘」。"
+                "每张图是对应盘升满成功时的界面截图（存于 log/stats/<tag>/success/）。"
             )
         else:
             lines.append("（无：本轮没有升满 15 级且判定保留的盘）")

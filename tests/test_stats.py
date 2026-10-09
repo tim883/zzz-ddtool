@@ -374,3 +374,23 @@ def test_kept_disc_detail_unknown_set_when_job_has_no_set() -> None:
     assert "2 号位" in text
     assert "未知" in text
     assert "2 条" in text
+
+
+def test_kept_disc_report_embeds_image_when_present() -> None:
+    """成功盘带截图路径时，报告在明细里贴出图片；没截图就不贴。"""
+    st = S.RunStats(tag="t")
+    st.job_begin(2, 2, (), ())
+    slot = st.disc_begin("j2", 0, 0, slot=2, sets=(), line_count=2)
+    st.disc_end(slot, S.OUTCOME_UPGRADED, 15, 8.0, image="success/disc0.png")
+    text = st.report_text()
+    # 贴图语法：![]() 且路径指向 success/
+    assert "![2 号位 未知](success/disc0.png)" in text
+
+    # 不带 image 的成功盘：表格出现，但不贴图
+    st2 = S.RunStats(tag="t2")
+    st2.job_begin(4, 4, ("震星迪斯科",), ())
+    slot2 = st2.disc_begin("j2", 1, 0, slot=4, sets=("震星迪斯科",), line_count=3)
+    st2.disc_end(slot2, S.OUTCOME_UPGRADED, 15, 9.0)
+    text2 = st2.report_text()
+    assert "![4 号位 震星迪斯科](" not in text2
+

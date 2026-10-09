@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool.capture import CaptureError, find_game_hwnd, grab_game_image, window_pid
+from zzz_ddtool.capture import CaptureError, find_game_hwnd, grab_game_image, save_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.control import controlled_inputs, validated_inputs
@@ -446,6 +446,24 @@ class Runner:
             overlay_handler.close()
         self.log.info("run %s processed=%d", self.outcome, self._processed)
         return list(self.results)
+
+    def _kept_image_path(self, disc_slot: int) -> str:
+        """成功盘（升满保留）截图存到 log/stats/<tag>/success/，返回相对 .md 的路径。
+
+        截不到（窗口最小化、游戏不在前台、统计对象被 mock 等）就返回空串，不影响主流程。
+        截什么界面由调用时机决定（目前截判定成功那一刻的游戏画面，后续可调成切到详情页再截）。
+        """
+        try:
+            if not (0 <= disc_slot < len(self.stats.discs)):
+                return ""
+            disc = self.stats.discs[disc_slot]
+            image, _method, _hwnd = grab_game_image(self._hwnd)
+            dest = stats_dir() / str(self.stats.tag) / "success"
+            path = save_image(image, self._hwnd, "printwindow", name=f"disc{disc.index}", dest_dir=dest)
+            return f"success/{path.name}"
+        except Exception:
+            self.log.warning("成功盘截图失败，不附图：disc_slot=%s", disc_slot)
+            return ""
 
     def _finish_stats(self, run_started: float) -> str:
         """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 执行结果总结。
@@ -1228,7 +1246,10 @@ class Runner:
                 )
                 self._record(job, disc, decision)
                 time.sleep(0.3)
-                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
+                img = ""
+                if disc.level >= MAX_LEVEL:
+                    img = self._kept_image_path(disc_slot)
+                self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score, image=img)
                 return "done"  # 没进强化页，画面未变，坐标仍然有效
             if disc.discarded:
                 self._set_discard_label(hwnd, discarded=True, value=False)
@@ -2189,7 +2210,10 @@ class Runner:
                         f"升到 {disc.level} 级"
                         + ("（已满级）" if disc.level >= MAX_LEVEL else "（到升阶上限）"),
                     )
-                    self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score)
+                    img = ""
+                    if disc.level >= MAX_LEVEL:
+                        img = self._kept_image_path(disc_slot)
+                    self.stats.disc_end(disc_slot, OUTCOME_UPGRADED, disc.level, decision.score, image=img)
                     self._esc_back_to_grid(hwnd)
                     return disc.level
                 stage_started = time.monotonic()
@@ -2214,8 +2238,15 @@ class Runner:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)
                 self.trace.ok("upgrade", "decide", f"判为弃置：{decision.reason}")
                 self._record(job, disc, decision)
+                self._detail_disc = disc  # 暂停复验使用最后实读等级/词条，而非升级前旧盘面。
+                try:
+                    self._discard_from_upgrade(hwnd)
+                except RunnerStopped:
+                    raise
+                except (RunnerError, CaptureError, OcrError, InputError):
+                    self.stats.disc_end(disc_slot, OUTCOME_FAILED, disc.level, decision.score)
+                    raise
                 self.stats.disc_end(disc_slot, OUTCOME_DISCARDED, disc.level, decision.score)
-                self._discard_from_upgrade(hwnd)
                 return disc.level
             if decision.reason == "keep_max_level" and upgraded > 0:
                 try:
