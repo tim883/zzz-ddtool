@@ -11,13 +11,38 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+CONFTEST = Path(__file__).with_name("conftest.py")
 
 
-def test_qt_platform_is_forced_offscreen() -> None:
-    # 只有显式放行（要故意看真窗口）时才允许不是 offscreen
-    if os.environ.get("ZZZ_DDTOOL_TEST_WINDOW") == "1":
-        return
-    assert os.environ.get("QT_QPA_PLATFORM") == "offscreen", (
-        "测试进程的 Qt 平台必须是 offscreen，否则建出来的窗口会弹到桌面上抢用户屏幕；"
-        "检查 tests/conftest.py 是否还在用赋值强制设置。"
+def _load_conftest(platform: str | None, allow_window: bool = False) -> str | None:
+    env = os.environ.copy()
+    env.pop("QT_QPA_PLATFORM", None)
+    env.pop("ZZZ_DDTOOL_TEST_WINDOW", None)
+    if platform is not None:
+        env["QT_QPA_PLATFORM"] = platform
+    if allow_window:
+        env["ZZZ_DDTOOL_TEST_WINDOW"] = "1"
+    # 子进程只执行环境守卫，不导入 Qt、不创建窗口。
+    result = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import json, os, runpy, sys; runpy.run_path(sys.argv[1]); print(json.dumps(os.environ.get('QT_QPA_PLATFORM')))",
+         str(CONFTEST)],
+        env=env, capture_output=True, text=True, check=True,
     )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("platform", [None, "windows", "other"])
+def test_qt_platform_is_forced_offscreen(platform) -> None:
+    assert _load_conftest(platform) == "offscreen"
+
+
+def test_explicit_window_override_preserves_requested_platform() -> None:
+    assert _load_conftest("windows", allow_window=True) == "windows"

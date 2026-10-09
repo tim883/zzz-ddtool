@@ -2,8 +2,6 @@ import os
 
 import pytest
 
-pytest.importorskip("PySide6")
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
@@ -102,7 +100,6 @@ def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     preset = window.collect_preset()
     assert preset.weights == {"暴击率": 1.0}
     assert preset.accepted is None  # Ungenerated tasks stay invalid until a list is established.
-    assert decide_sample(preset) in {Action.UPGRADE, Action.MARK_DISCARD, Action.SKIP, Action.STOP}
     window.close()
 
 
@@ -605,16 +602,6 @@ def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatc
     assert target2.exists()
     assert last_config_path() == target2.resolve()
     window.close()
-
-
-def decide_sample(preset) -> Action:
-    from zzz_ddtool.decide import decide
-
-    disc = Disc(
-        level=0,
-        substats=(Substat("暴击率"), Substat("暴击伤害"), Substat("攻击力%")),
-    )
-    return decide(disc, preset, preset.accepted).action
 
 
 def test_log_panel_updates_rotates_and_shows_failure(qapp, tmp_path, monkeypatch):

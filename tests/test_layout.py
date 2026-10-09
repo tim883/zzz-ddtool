@@ -70,6 +70,7 @@ def test_all_named_points_are_inside_screen() -> None:
         for name in dir(layout)
         if name.isupper() and isinstance(getattr(layout, name), tuple) and len(getattr(layout, name)) == 2
     ]
+    assert point_names, "没扫到任何点击坐标，不能将空集合当作边界检查通过"
     for name in point_names:
         x, y = getattr(layout, name)
         assert 0 <= x <= DESIGN_W, f"{name} 横坐标 {x} 越界"

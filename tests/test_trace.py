@@ -6,6 +6,14 @@ from pathlib import Path
 import pytest
 
 from zzz_ddtool.trace import Trace, action_name, page_name
+from zzz_ddtool import trace as trace_module
+
+
+@pytest.fixture(autouse=True)
+def isolated_capture(tmp_path, monkeypatch):
+    """只用临时目录和内存图片，不在日志回归中抓真实桌面或写用户日志。"""
+    monkeypatch.setattr(trace_module, "captures_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(trace_module, "grab_game_image", lambda: (_FakeImage(tmp_path), "fake", 1))
 
 
 def test_page_names_are_chinese() -> None:
@@ -65,15 +73,14 @@ def test_fail_mentions_screenshot_or_explains_why_not(caplog: pytest.LogCaptureF
     assert any("截图=" in m or "截图没成功" in m for m in messages)
 
 
-def test_screenshot_filename_uses_step_number() -> None:
+def test_screenshot_filename_uses_step_number(tmp_path) -> None:
     """截图名带步骤号，才能和日志那一行对上。"""
     trace = Trace(tag="tag")
-    trace.ok("detail", "parse")
-    name = trace._persist("parse", image=None)
-    # 这台机器没有游戏窗口时会截不了图，返回 None 也算正常
-    if name is not None:
-        assert name.startswith("tag/0001-")
-        assert name.endswith(".png")
+    trace.step_start("detail", "parse")
+    name = trace._persist("parse", image=_FakeImage(tmp_path))
+    assert name == "tag/0001-识别盘面.png"
+    assert trace._shots == [trace.dir / "0001-识别盘面.png"]
+    assert trace._shots[0].read_bytes() == b"x"
 
 
 def test_decide_does_not_shoot() -> None:
@@ -113,17 +120,23 @@ def test_note_does_not_consume_a_step() -> None:
     assert trace.step == before
 
 
-def test_steps_record_elapsed_time_with_chinese_names(tmp_path: Path) -> None:
+def test_steps_record_elapsed_time_with_chinese_names(tmp_path: Path, monkeypatch) -> None:
     """每步都记耗时，名字跟日志里一致（统计直接按这个名字分组）。"""
+    from types import SimpleNamespace
+
+    now = [100.0]
+    monkeypatch.setattr(trace_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
     trace = Trace(tag="tag-spans")
     img = _FakeImage(tmp_path)
+    now[0] += 0.25
     trace.ok("drive_disc", "scan", "第 1 批", image=img)
+    now[0] += 0.75
     trace.ok("upgrade", "upgrade", "强化了一阶", image=img)
 
     assert [s.page for s in trace.spans] == ["驱动盘仓库", "强化页"]
     assert [s.action for s in trace.spans] == ["扫描列表", "强化"]
     assert [s.detail for s in trace.spans] == ["第 1 批", "强化了一阶"]
-    assert all(s.seconds >= 0.0 for s in trace.spans)
+    assert [s.seconds for s in trace.spans] == pytest.approx([0.25, 0.75])
 
 
 def test_decide_step_also_records_a_span(tmp_path: Path) -> None:

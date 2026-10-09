@@ -12,8 +12,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("PySide6")
-
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from zzz_ddtool import logprefs, logutil, paths, retain  # noqa: E402

@@ -15,6 +15,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # 头像识别当前在 Runner 中停用；相关用例仅保护保留函数的历史样本行为，
 # 不作为已装备跳过功能的验收，也不证明标定样本之外的识别可靠性。
+# 标为 legacy，默认不运行；修改保留函数时显式用 -m legacy 验证。
 
 
 @pytest.fixture(scope="module")
@@ -23,12 +24,14 @@ def qapp() -> QApplication:
     yield app
 
 
+@pytest.mark.legacy
 def test_blank_tile_is_not_equipped(qapp: QApplication) -> None:
     image = QImage(120, 120, QImage.Format.Format_RGB32)
     image.fill(QColor(40, 40, 40))
     assert tile_has_portrait(image, 0, 0, 120, 120) is False
 
 
+@pytest.mark.legacy
 def test_colorful_corner_counts_as_portrait(qapp: QApplication) -> None:
     image = QImage(120, 120, QImage.Format.Format_RGB32)
     image.fill(QColor(40, 40, 40))
@@ -40,6 +43,7 @@ def test_colorful_corner_counts_as_portrait(qapp: QApplication) -> None:
     assert tile_has_portrait(image, 0, 0, 120, 120) is True
 
 
+@pytest.mark.legacy
 def test_archived_equipped_tile(qapp: QApplication) -> None:
     sample = Path(__file__).resolve().parents[1] / "手册" / "参考图" / "驱动盘仓库" / "裁剪" / "已装备头像格.png"
     assert sample.is_file(), f"已归档参考图缺失：{sample}"
@@ -48,6 +52,7 @@ def test_archived_equipped_tile(qapp: QApplication) -> None:
     assert tile_has_portrait(image, 0, 0, image.width(), image.height()) is True
 
 
+@pytest.mark.legacy
 @pytest.mark.parametrize(
     "name,expected",
     [

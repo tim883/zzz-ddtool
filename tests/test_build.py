@@ -9,6 +9,9 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -91,3 +94,92 @@ def test_build_clears_only_target_package(tmp_path: Path, monkeypatch) -> None:
 
     assert not (pkg / "stale.dll").exists()  # 目标目录已重建
     assert (sibling / "keep.txt").exists()  # 兄弟目录保留
+
+
+def _assert_rejected_before_cleanup(monkeypatch, output: Path | str) -> None:
+    cleanup = Mock()
+    package = Mock()
+    monkeypatch.setattr(build, "shutil", types.SimpleNamespace(rmtree=cleanup))
+    monkeypatch.setattr(build, "subprocess", types.SimpleNamespace(run=package))
+    assert build.main(["--outdir", str(output)]) == 2
+    cleanup.assert_not_called()
+    package.assert_not_called()
+
+
+@pytest.mark.parametrize("output", ["..", ".git", ".venv", "src", "tests", "scripts", "data", "user", "手册", "dev-docs", "build"])
+def test_protected_output_is_rejected_before_any_cleanup(tmp_path: Path, monkeypatch, output) -> None:
+    root = tmp_path / build.PKG_NAME
+    root.mkdir()
+    _fake_repo(root)
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, output)
+    assert (root / "pyproject.toml").is_file()
+
+
+def test_output_containing_repository_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / build.PKG_NAME / "source"
+    root.mkdir(parents=True)
+    _fake_repo(root)
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize("marker", [".git", ".zzz-ddtool-root", "pyproject.toml", "user"])
+def test_existing_source_or_user_data_in_package_is_preserved(tmp_path: Path, monkeypatch, marker) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    _fake_repo(root)
+    outdir = tmp_path / "release"
+    pkg = outdir / build.PKG_NAME
+    pkg.mkdir(parents=True)
+    sentinel = pkg / marker
+    sentinel.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, outdir)
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_existing_user_data_in_work_directory_prevents_all_cleanup(tmp_path: Path, monkeypatch) -> None:
+    root = _fake_repo(tmp_path)
+    (root / "build" / "user").mkdir(parents=True)
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, root / "dist")
+
+
+@pytest.mark.parametrize("destination", ["data/zzz-ddtool", "dist/history"])
+def test_linked_package_is_rejected_before_cleanup(tmp_path: Path, monkeypatch, destination) -> None:
+    root = _fake_repo(tmp_path)
+    outdir = root / "dist"
+    target = tmp_path / destination
+    resolve = Path.resolve
+
+    def resolve_package(path, *args, **kwargs):
+        return target if path == outdir / build.PKG_NAME else resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(build, "ROOT", root)
+    monkeypatch.setattr(Path, "resolve", resolve_package)
+    _assert_rejected_before_cleanup(monkeypatch, outdir)
+
+
+def test_linked_work_directory_is_rejected_before_cleanup(tmp_path: Path, monkeypatch) -> None:
+    root = _fake_repo(tmp_path)
+    target = tmp_path / "src"
+    resolve = Path.resolve
+
+    def resolve_work(path, *args, **kwargs):
+        return target if path == root / "build" else resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(build, "ROOT", root)
+    monkeypatch.setattr(Path, "resolve", resolve_work)
+    _assert_rejected_before_cleanup(monkeypatch, root / "dist")
+
+
+def test_external_output_directory_remains_supported(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    _fake_repo(root)
+    outdir = tmp_path / "release"
+    monkeypatch.setattr(build, "ROOT", root)
+    _stub_pyinstaller(monkeypatch, outdir)
+    assert build.main(["--outdir", str(outdir)]) == 0
+    assert (outdir / build.PKG_NAME / "zzz-ddtool.exe").is_file()

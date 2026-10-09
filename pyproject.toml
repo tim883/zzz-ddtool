@@ -34,9 +34,10 @@ zzz_ddtool = ["assets/templates/**/*.png"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-# 会创建真实桌面窗口的用例打 window 标记，默认排除：跑全量时不在桌面上弹
-# TOPMOST 半透明浮层（曾误盖住用户窗口）。验浮层时显式跑 pytest -m window。
-addopts = '-m "not window"'
+# 默认排除真实窗口用例和停用功能用例；改动相关功能时显式选择
+# window / legacy。测试范围和验证限制见手册/测试约定.md。
+addopts = '-m "not window and not legacy"'
 markers = [
   "window: 会创建真实桌面窗口的用例，默认跳过以避免占用屏幕",
+  "legacy: 仅验证已停用功能的保留实现，默认不运行，修改该函数时显式选择",
 ]

@@ -1,25 +1,23 @@
 import os
+from pathlib import Path
 
 import pytest
-
-pytest.importorskip("PySide6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
-from zzz_ddtool.paths import captures_dir
 from zzz_ddtool.screen import DRIVE_DISC, MENU, OVERWORLD, STORAGE, classify_image, is_page
 from zzz_ddtool.template import assets_dir
 
-CAPTURES = captures_dir()
-PAGES = {
-    "大地图页.png": OVERWORLD,
-    "功能页.png": MENU,
-    "仓库页.png": STORAGE,
-    "驱动盘页.png": DRIVE_DISC,
-}
+REFERENCES = Path(__file__).resolve().parents[1] / "手册" / "参考图"
+PAGES = [
+    ("大地图/普通大世界.png", OVERWORLD),
+    ("功能菜单/仓库入口.png", MENU),
+    ("音擎仓库/仓库列表.png", STORAGE),
+    ("驱动盘仓库/列表与侧栏.png", DRIVE_DISC),
+]
 
 
 @pytest.fixture(scope="module")
@@ -43,19 +41,20 @@ def test_template_files_exist() -> None:
     assert missing == []
 
 
-@pytest.mark.skipif(not (CAPTURES / "驱动盘页.png").is_file(), reason="no named captures")
-def test_named_captures_hit_their_icons(qapp: QApplication) -> None:
-    for filename, page in PAGES.items():
-        image = QImage(str(CAPTURES / filename))
-        assert not image.isNull(), filename
-        assert is_page(image, page), filename
-        assert classify_image(image) == page, filename
+@pytest.mark.parametrize("filename,page", PAGES)
+def test_reference_pages_hit_their_icons(qapp: QApplication, filename, page) -> None:
+    sample = REFERENCES / filename
+    assert sample.is_file(), f"固定参考图缺失：{sample}"
+    image = QImage(str(sample))
+    assert not image.isNull(), filename
+    assert is_page(image, page), filename
+    assert classify_image(image) == page, filename
 
 
-@pytest.mark.skipif(not (CAPTURES / "驱动盘页.png").is_file(), reason="no named captures")
 def test_recycle_and_dismantle_do_not_cross(qapp: QApplication) -> None:
-    storage = QImage(str(CAPTURES / "仓库页.png"))
-    discs = QImage(str(CAPTURES / "驱动盘页.png"))
+    storage = QImage(str(REFERENCES / "音擎仓库/仓库列表.png"))
+    discs = QImage(str(REFERENCES / "驱动盘仓库/列表与侧栏.png"))
+    assert not storage.isNull() and not discs.isNull()
     assert is_page(storage, STORAGE)
     assert not is_page(storage, DRIVE_DISC)
     assert is_page(discs, DRIVE_DISC)
