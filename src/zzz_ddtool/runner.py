@@ -448,9 +448,9 @@ class Runner:
         return list(self.results)
 
     def _finish_stats(self, run_started: float) -> str:
-        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 人类可读报告。
+        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 执行结果总结。
 
-        返回人类可读报告（.md）的绝对路径，供界面显示「详细日志在哪」；
+        返回执行结果总结（.md）的绝对路径，供界面显示「详细日志在哪」；
         写不出去就返回空串。统计出问题不影响任务结果，只记一条警告。
         """
         try:
@@ -464,9 +464,9 @@ class Runner:
                 self.log.warning("结构化统计写入失败（不影响本轮结果）")
             report_path = self.stats.write_report(stats_dir() / f"{self.stats.tag}.md")
             if report_path is not None:
-                self.log.info("人类可读报告已写入 %s", report_path)
+                self.log.info("执行结果总结已写入 %s", report_path)
                 return str(report_path)
-            self.log.warning("人类可读报告写入失败（不影响本轮结果）")
+            self.log.warning("执行结果总结写入失败（不影响本轮结果）")
             return ""
         except Exception:
             self.log.warning("运行统计生成失败（不影响本轮结果）", exc_info=True)
@@ -1193,7 +1193,12 @@ class Runner:
         self._processed += 1
         self._detail_disc = disc
         # 统计：从认出盘面这一刻起算这件盘的耗时（含进强化页、逐档升级、收尾）。
-        disc_slot = self.stats.disc_begin(job.job_id, cell.global_index, disc.level)
+        # slot/sets 取所属任务的过滤值（每个任务按固定号位+套装过滤），
+        # line_count 取副词条条数——这些只用于「升满成功明细」，不影响统计口径。
+        disc_slot = self.stats.disc_begin(
+            job.job_id, cell.global_index, disc.level,
+            slot=job.slot, sets=job.sets, line_count=disc.line_count,
+        )
         self.trace.ok(
             "detail",
             "parse",

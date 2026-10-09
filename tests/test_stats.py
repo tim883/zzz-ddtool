@@ -209,7 +209,7 @@ def test_write_and_log_summary_produce_readable_output(tmp_path, caplog) -> None
     assert not (tmp_path / "stats.tmp").exists()
 
 
-# ---------------------------------------------------------------- 人类可读报告
+# ---------------------------------------------------------------- 执行结果总结
 
 
 def _sample() -> S.RunStats:
@@ -332,3 +332,45 @@ def test_write_report_writes_markdown_file(tmp_path) -> None:
     assert target is not None and target.is_file()
     assert "运行结果统计" in target.read_text(encoding="utf-8")
     assert not (tmp_path / "r.tmp").exists()
+
+
+def test_kept_disc_detail_lists_slot_set_and_line_count() -> None:
+    """「升满成功明细」要列出成功盘的部位号、套装名、词条数，让用户看清是哪几件。"""
+    st = S.RunStats(tag="t")
+    st.job_begin(1, 4, ("震星迪斯科",), ())  # 4 号位、震星迪斯科
+    # 一件升满 15 级的 4 词条盘
+    slot = st.disc_begin("j1", 0, 0, slot=4, sets=("震星迪斯科",), line_count=4)
+    st.disc_stage(slot, 0, 3, 3.0)
+    st.disc_end(slot, S.OUTCOME_UPGRADED, 15, 12.5)
+    # 一件只升到 9 级的盘，不应出现在成功明细
+    short = st.disc_begin("j1", 1, 0, slot=4, sets=("震星迪斯科",), line_count=3)
+    st.disc_end(short, S.OUTCOME_UPGRADED, 9, 5.0)
+    st.job_end(20.0, 1)
+
+    data = st.summary()
+    assert data["max_level_kept"] == 1
+    assert len(data["kept_discs"]) == 1
+    kept = data["kept_discs"][0]
+    assert kept["slot"] == 4 and kept["sets"] == ["震星迪斯科"] and kept["line_count"] == 4
+
+    text = st.report_text()
+    assert "## 升满成功明细（15 级且判定保留）" in text
+    # 成功盘的具体信息要出现在报告里
+    assert "4 号位" in text
+    assert "震星迪斯科" in text
+    assert "4 条" in text
+    # 没升满的不该进明细
+    assert "9 级" not in text.split("升满成功明细", 1)[1].split("## 最终等级分布", 1)[0]
+
+
+def test_kept_disc_detail_unknown_set_when_job_has_no_set() -> None:
+    """任务没限定套装时，成功明细的套装列显示「未知」，不能崩。"""
+    st = S.RunStats(tag="t")
+    st.job_begin(2, 2, (), ())  # 2 号位、不限套装
+    slot = st.disc_begin("j2", 0, 0, slot=2, sets=(), line_count=2)
+    st.disc_end(slot, S.OUTCOME_UPGRADED, 15, 8.0)
+    st.job_end(10.0, 1)
+    text = st.report_text()
+    assert "2 号位" in text
+    assert "未知" in text
+    assert "2 条" in text

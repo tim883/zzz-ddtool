@@ -24,7 +24,7 @@
 产物三处（收尾时一次性写出）：
     log/text/ddtool.log          一段中文摘要（给人看的，可 grep）
     log/stats/<tag>.json         结构化数据（给脚本/后续报表用）
-    log/stats/<tag>.md           人类可读报告；客户端的结果统计界面展示的就是它
+    log/stats/<tag>.md           执行结果总结；客户端的结果统计界面展示的就是它
 
 **为什么放 log/stats 而不是 captures/<tag>/**：截图目录按张数整轮回收，
 统计文件虽然不匹配 ``*.png`` 删不掉，但跟着截图走容易被误清理。
@@ -136,6 +136,11 @@ class DiscStat:
     job_name: str
     index: int
     level_start: int
+    # 套装名 / 部位号从所属任务（job）拿：每个任务按固定号位 + 套装过滤，
+    # 成功盘子归属到某个任务，所以其套装/部位就是任务过滤值。
+    slot: int = 0
+    sets: tuple[str, ...] = ()
+    line_count: int = 0  # 副词条条数（词条数）
     level_end: int = 0
     outcome: str = ""
     score: float = 0.0
@@ -223,10 +228,18 @@ class RunStats:
         if max_index is not None:
             job.slots = max(job.slots, int(max_index) + 1)
 
-    def disc_begin(self, job, index: int, level: int, name: str = "") -> int:
-        """开始处理一件盘，返回它在 ``discs`` 里的下标。"""
+    def disc_begin(self, job, index: int, level: int, name: str = "", *,
+                   slot: int = 0, sets: tuple[str, ...] = (), line_count: int = 0) -> int:
+        """开始处理一件盘，返回它在 ``discs`` 里的下标。
+
+        slot / sets / line_count 用于「升满成功明细」：套装名与部位号取所属任务的
+        过滤值，词条数取副词条条数。这几个都不影响统计口径，缺省也行。
+        """
         self.discs.append(
-            DiscStat(job=str(job), job_name=name, index=int(index), level_start=int(level))
+            DiscStat(
+                job=str(job), job_name=name, index=int(index), level_start=int(level),
+                slot=int(slot), sets=tuple(str(s) for s in (sets or ())), line_count=int(line_count),
+            )
         )
         self._open[f"disc{index}"] = time.monotonic()
         return len(self.discs) - 1
@@ -376,6 +389,18 @@ class RunStats:
             },
             "outcomes": counts,
             "max_level_kept": max_level_kept,
+            "kept_discs": [
+                {
+                    "index": d.index,
+                    "slot": d.slot,
+                    "sets": list(d.sets),
+                    "line_count": d.line_count,
+                    "level_end": d.level_end,
+                    "score": round(d.score, 3),
+                }
+                for d in self.discs
+                if d.outcome == OUTCOME_UPGRADED and d.level_end >= 15
+            ],
             "discard_labels": self.discard_labels,
             "unfinished": self.unfinished(),
             "level_distribution": self.level_distribution(),
@@ -457,6 +482,14 @@ class RunStats:
             counts[OUTCOME_SKIPPED],
             counts[OUTCOME_FAILED],
         )
+        if data["kept_discs"]:
+            kept_desc = "；".join(
+                f"{d['slot']}号位"
+                f"{'/'.join(d['sets']) if d['sets'] else '未知'}"
+                f"{d['line_count']}词条"
+                for d in data["kept_discs"]
+            )
+            log.info("    升满成功明细：%s", kept_desc)
         log.info(
             "    实际打上弃置标记 %d 次（判定弃置 %d 件，两者本来就不等：盘上已有标记、"
             "或标签设置关闭时不会真打）",
@@ -499,7 +532,7 @@ class RunStats:
         self._print_group(log, "步骤耗时（距上一步的间隔，看细节；会和上面重叠，别相加）", data["steps"])
         log.info("─" * 68)
 
-    # ------------------------------------------------------------ 人类可读报告
+    # ------------------------------------------------------------ 执行结果总结
 
     def headline(self) -> str:
         """一行摘要：共计耗时、处理了几个盘、升满成功几件、判定弃置几件。
@@ -587,6 +620,30 @@ class RunStats:
             f"- 本轮实际打上弃置标记：**{data['discard_labels']}** 次"
             f"（和上面的「判定弃置」不是一个数）",
             "",
+            "## 升满成功明细（15 级且判定保留）",
+            "",
+        ]
+        kept = data["kept_discs"]
+        if kept:
+            lines += [
+                "| 任务号位 | 套装（取任务过滤值） | 词条数 | 满级 | 评分 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+            for d in kept:
+                set_name = "、".join(d["sets"]) if d["sets"] else "未知"
+                lines.append(
+                    f"| {d['slot']} 号位 | {set_name} | {d['line_count']} 条 | "
+                    f"{d['level_end']} 级 | {d['score']:.2f} |"
+                )
+            lines.append("")
+            lines.append(
+                "- 套装名取所属任务的过滤套装（任务未限定套装时显示「未知」）；部位号 = 任务号位；"
+                "词条数 = 副词条条数。这几项帮你看清「升满成功的到底是哪几件盘」。"
+            )
+        else:
+            lines.append("（无：本轮没有升满 15 级且判定保留的盘）")
+        lines += [
+            "",
             "## 最终等级分布",
             "",
         ]
@@ -640,7 +697,7 @@ class RunStats:
         return "\n".join(lines)
 
     def write_report(self, path: Path) -> Path | None:
-        """写人类可读报告（Markdown）。"""
+        """写执行结果总结（Markdown）。"""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             temp = path.with_suffix(".tmp")
