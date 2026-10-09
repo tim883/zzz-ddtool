@@ -2501,3 +2501,50 @@ def test_run_status_swaps_to_result_stats_when_finished(qapp: QApplication, tmp_
     # 下一轮开始：结果统计区必须收起来，别把上一轮的留在屏上
     window._show_run_status(running)
     assert window.run_stats_path_label.isHidden()
+
+
+def test_propagate_require_button_present_on_every_stage(qapp: QApplication, tmp_path) -> None:
+    """递增下发按钮每档都要有，且从任意档点都只往更高档递增填充。"""
+    from PySide6.QtWidgets import QPushButton
+    from zzz_ddtool.origin import Origin
+    from zzz_ddtool.patterns import CHECKPOINTS
+
+    window = MainWindow(config_path=tmp_path / "prop.yaml")
+    for origin in Origin:
+        for checkpoint in CHECKPOINTS:
+            section = window.sections[(origin.value, checkpoint)]
+            assert isinstance(section.propagate_btn, QPushButton)
+
+    # 从 +6 往后填：+6 设 3.0，则 +9=4.0、+12=5.0、+15=6.0（每高 3 档 +1）
+    window.sections[("three", 6)].require.setValue(3.0)
+    window.sections[("three", 6)].propagate_require.emit()
+    assert window.sections[("three", 6)].require.value() == 3.0
+    assert window.sections[("three", 9)].require.value() == 4.0
+    assert window.sections[("three", 12)].require.value() == 5.0
+    assert window.sections[("three", 15)].require.value() == 6.0
+    # 本档及更低档不动
+    assert window.sections[("three", 3)].require.value() == 0.0
+    assert window.sections[("three", 0)].require.value() == 0.0
+    window.close()
+
+
+def test_copy_other_require_mirrors_other_origin(qapp: QApplication, tmp_path) -> None:
+    """「拷贝对方本档要求」把另一侧每档的右侧卡片权重照搬过来，不动卡片勾选。"""
+    from zzz_ddtool.origin import Origin
+    from zzz_ddtool.patterns import CHECKPOINTS
+
+    window = MainWindow(config_path=tmp_path / "copy.yaml")
+    for checkpoint in CHECKPOINTS:
+        window.sections[("four", checkpoint)].require.setValue(checkpoint * 0.5 + 1)
+
+    window._copy_other_require(Origin.THREE)
+    for checkpoint in CHECKPOINTS:
+        assert window.sections[("three", checkpoint)].require.value() == pytest.approx(checkpoint * 0.5 + 1)
+    assert "4词" in window.status.text() and "3词" in window.status.text()
+
+    # 反向：从 4 词一侧拷回 3 词
+    window.sections[("three", 0)].require.setValue(9.9)
+    window._copy_other_require(Origin.FOUR)
+    assert window.sections[("four", 0)].require.value() == pytest.approx(9.9)
+    window.close()
+

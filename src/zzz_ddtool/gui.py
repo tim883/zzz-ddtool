@@ -74,6 +74,9 @@ from zzz_ddtool.patterns import (
     enumerate_filtered, enumerate_patterns, first_filter, useful_ordered,
 )
 
+# 部位中文标签：右侧 tab 与「拷贝对方本档要求」按钮都用它，保持一致。
+_ORIGIN_CN = {Origin.THREE: "3词", Origin.FOUR: "4词"}
+
 # 词条下拉的顺序偏好：常用的排前面（双爆最常用）。
 #
 # 这里**只声明顺序**，不声明内容；内容取自 gamedata.SUBSTAT_NAMES（data/stats.json）：
@@ -703,13 +706,12 @@ class StageSection(QWidget):
         require_label = QLabel("本档要求")
         require_label.setObjectName("hint")
 
-        self.propagate_btn: QPushButton | None = None
-        if checkpoint == 0:
-            self.propagate_btn = QPushButton("递增下发")
-            self.propagate_btn.setToolTip(
-                "以 +0 的本档要求为 x，把 +3/+6/+9/+12/+15 的本档要求依次设为 x+1 ~ x+5。"
-            )
-            self.propagate_btn.clicked.connect(self.propagate_require.emit)
+        self.propagate_btn = QPushButton("递增下发")
+        self.propagate_btn.setToolTip(
+            f"以本档（+{checkpoint}）要求为 x，把更高档的本档要求依次设为 x+1、x+2、……"
+            f"（每高 3 档 +1）。"
+        )
+        self.propagate_btn.clicked.connect(self.propagate_require.emit)
 
         bar = QFrame()
         bar.setObjectName("stageBar")
@@ -718,8 +720,7 @@ class StageSection(QWidget):
         header.addWidget(level)
         header.addWidget(require_label)
         header.addWidget(self.require)
-        if self.propagate_btn is not None:
-            header.addWidget(self.propagate_btn)
+        header.addWidget(self.propagate_btn)
         header.addStretch()
         header.addWidget(self.count_label)
 
@@ -2394,17 +2395,33 @@ class MainWindow(QMainWindow):
         self._apply_stage_require(plan.get("stage_require") or {})
 
     def _propagate_require(self, section: StageSection) -> None:
-        """以 +0 档的本档要求 x 为基准，把同部位 +3~+15 依次设为 x+1 ~ x+5。
+        """以当前档的本档要求 x 为基准，把同部位更高档依次设为 x+1、x+2……（每高 3 档 +1）。
 
+        从任意档点都生效：点 +6 就只往下填 +9/+12/+15。
         直接 setValue（不拦信号），每档照常刷新可见卡片并计入未保存状态，
         与手动逐个改数值走完全相同的路径。
         """
         base = section.require.value()
         for checkpoint in CHECKPOINTS:
-            if checkpoint <= 0:
+            if checkpoint <= section.checkpoint:
                 continue
             target = self.sections[(section.origin.value, checkpoint)]
-            target.require.setValue(base + checkpoint // 3)
+            target.require.setValue(base + (checkpoint - section.checkpoint) // 3)
+
+    def _copy_other_require(self, origin: Origin) -> None:
+        """把另一侧（3词/4词）每档的本档要求（右侧卡片权重）照搬到本侧。
+
+        逐档 setValue（不拦信号），与手动改数值走同一条路径：每档照常刷新可见
+        卡片、计入未保存状态。只搬「本档要求」这一列，不动卡片勾选。
+        """
+        other = Origin.FOUR if origin is Origin.THREE else Origin.THREE
+        for checkpoint in CHECKPOINTS:
+            value = self.sections[(other.value, checkpoint)].require.value()
+            self.sections[(origin.value, checkpoint)].require.setValue(value)
+        self._mark_unsaved()
+        self.status.setText(
+            f"已把「初始 {_ORIGIN_CN[other]}」每档的本档要求拷贝到「初始 {_ORIGIN_CN[origin]}」。"
+        )
 
     def _on_slot_clicked(self, slot: int) -> None:
         """换部位。
@@ -2466,6 +2483,14 @@ class MainWindow(QMainWindow):
         inner = QWidget()
         box = QVBoxLayout(inner)
         box.setContentsMargins(12, 8, 12, 8)
+        other = Origin.FOUR if origin is Origin.THREE else Origin.THREE
+        copy_btn = QPushButton(f"拷贝{_ORIGIN_CN[other]}的本档要求")
+        copy_btn.setToolTip(
+            f"把右侧「初始 {_ORIGIN_CN[other]}」每档的本档要求（卡片权重）照搬到本侧"
+            f"（初始 {_ORIGIN_CN[origin]}）。"
+        )
+        copy_btn.clicked.connect(lambda: self._copy_other_require(origin))
+        box.addWidget(copy_btn)
         for checkpoint in CHECKPOINTS:
             section = StageSection(origin, checkpoint, None)
             section.require_changed.connect(self._on_require_changed)
