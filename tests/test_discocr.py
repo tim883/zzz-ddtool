@@ -192,6 +192,23 @@ def test_o3_warehouse_detail_fast_path_fields() -> None:
     assert serialized(parse_disc(image)) == serialized(_parse_disc_legacy(image))
 
 
+def test_o3_warehouse_three_substats_sidebar_fast_path() -> None:
+    """三词条侧栏盘（真机失败现场图）：第 4 槽名称 ROI 落到下一节「套装效果」标题、
+    数值列为空 → 必须判空槽并接受，而不是把标题当词条名报 invalid_data 回退 legacy。"""
+    image = load(FIXTURES / "warehouse-three-substats.png")
+    result = discocr.try_read_disc(image, layout="detail")
+    assert result.profile_id == _WAREHOUSE and result.reject_reason is None
+    assert result.disc == Disc(
+        level=0,
+        substats=(Substat("穿透值", 1), Substat("攻击力%", 1), Substat("暴击伤害", 1)),
+        rarity="S",
+        locked=False,
+        equipped=False,
+        discarded=False,
+    )
+    assert serialized(parse_disc(image)) == serialized(_parse_disc_legacy(image))
+
+
 # ---------------------------------------------------------------------------
 # O4 模板：基础名称模板不接受带 +N 的整行；完整行模板可省名称 OCR
 # ---------------------------------------------------------------------------
@@ -438,6 +455,85 @@ def test_o9_fourth_slot_with_ink_but_failed_ocr_rejects_whole_frame(monkeypatch)
     assert result.disc is None
     assert result.reject_reason == discocr.INCOMPLETE_FIELDS
     assert result.profile_id == _MODAL
+
+
+def _warehouse_three_substat_case(
+    monkeypatch, *, slot4_name: str | None, slot4_value_present: bool
+) -> discocr.FastDiscRead:
+    """把 warehouse 侧栏三词条现场逐字段构造成确定性输入，直测 ``_read_fields``。
+
+    绕过布局判别（本用例只验证槽位空/占用判定）。``slot4_name`` 给出第 4 槽名称列
+    识别到的文字（None = 名称列也空）；``slot4_value_present`` 控制第 4 槽数值列是否有墨迹。
+    """
+    rects: dict[str, tuple[int, int, int, int]] = {"level": (1460, 398, 1610, 445)}
+    for slot, top in ((1, 564), (2, 615), (3, 666), (4, 717)):
+        rects[f"s{slot}-name"] = (1418, top, 1560, top + 51)
+        rects[f"s{slot}-value"] = (1735, top, 1835, top + 51)
+    fields = [discocr._Field("level", "level", rects["level"], None)]
+    for slot in (1, 2, 3, 4):
+        fields.append(discocr._Field(f"substat-{slot}-name", "substat_name", rects[f"s{slot}-name"], slot))
+        fields.append(discocr._Field(f"substat-{slot}-value", "substat_value", rects[f"s{slot}-value"], slot))
+    profile = discocr._Profile(_WAREHOUSE, "detail", (1920, 1080), 0.90, tuple(fields))
+    assets = discocr._Assets(root=Path("."), identity="stub", profiles=(profile,), templates={})
+
+    texts = {
+        rects["level"]: discocr._Text("等级00/15", 1.0),
+        rects["s1-name"]: discocr._Text("穿透值", 1.0),
+        rects["s1-value"]: discocr._Text("9", 1.0),
+        rects["s2-name"]: discocr._Text("攻击力%", 1.0),
+        rects["s2-value"]: discocr._Text("3%", 1.0),
+        rects["s3-name"]: discocr._Text("暴击伤害", 1.0),
+        rects["s3-value"]: discocr._Text("4.8%", 1.0),
+    }
+    if slot4_name is not None:
+        texts[rects["s4-name"]] = discocr._Text(slot4_name, 1.0)
+    if slot4_value_present:
+        texts[rects["s4-value"]] = discocr._Text("2.4%", 1.0)
+
+    empty = set()
+    if slot4_name is None:
+        empty.add(rects["s4-name"])
+    if not slot4_value_present:
+        empty.add(rects["s4-value"])
+    real_band = discocr._band_gray
+
+    def band(image, rect):
+        key = tuple(rect)
+        if key in empty:
+            return np.zeros((4, 4), np.float32)
+        if key in set(rects.values()):
+            return np.full((4, 4), 255.0, np.float32)
+        return real_band(image, rect)
+
+    monkeypatch.setattr(discocr, "_band_gray", band)
+    patch_recognition(monkeypatch, texts)
+    image = QImage(1920, 1080, QImage.Format.Format_RGB888)
+    return discocr._read_fields(assets, profile, image, "detail", texts[rects["level"]])
+
+
+def test_o9_warehouse_section_header_in_fourth_slot_is_empty_slot(monkeypatch) -> None:
+    """三词条侧栏盘：第 4 槽名称列有墨迹但是下一节「套装效果」标题、数值列为空
+    → 判空槽接受；不能把节标题当词条名报 invalid_data。"""
+    result = _warehouse_three_substat_case(monkeypatch, slot4_name="套装效果", slot4_value_present=False)
+    assert result.reject_reason is None
+    assert result.profile_id == _WAREHOUSE
+    assert result.disc == Disc(
+        level=0,
+        substats=(Substat("穿透值", 1), Substat("攻击力%", 1), Substat("暴击伤害", 1)),
+        rarity="S",
+        locked=False,
+        equipped=False,
+        discarded=False,
+    )
+
+
+def test_o9_warehouse_fourth_substat_name_with_empty_value_rejects(monkeypatch) -> None:
+    """第 4 槽名称列读成已知词条名、但数值列为空 → 按「有词条但数值漏读」拒绝，
+    不得降级成三词盘。"""
+    result = _warehouse_three_substat_case(monkeypatch, slot4_name="穿透值", slot4_value_present=False)
+    assert result.disc is None
+    assert result.reject_reason == discocr.INCOMPLETE_FIELDS
+    assert result.profile_id == _WAREHOUSE
 
 
 def test_o9_missing_front_slot_rejects(monkeypatch) -> None:

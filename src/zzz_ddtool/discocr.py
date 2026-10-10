@@ -879,12 +879,16 @@ def _read_fields(
         value_field = profile.slot_field(slot, "substat_value")
         name_text = resolved.get(name_field.field_id)
         value_text = resolved.get(value_field.field_id)
-        name_empty = name_text is None and _gray_is_empty(grays[name_field.field_id])
         value_empty = value_text is None and _gray_is_empty(grays[value_field.field_id])
-        if name_empty and value_empty:
-            if slot < 4:
+        if value_empty:
+            # 数值列无墨迹 ⇒ 该槽没有真实词条：词条的数值必然被渲染。
+            # 三词条的侧栏盘里，下一节的「套装效果」标题会紧接最后一条词条落下，
+            # 正落在第 4 槽的名称 ROI 内（数值列仍为空），故空槽判定只认数值列。
+            # 若名称列仍读到已知词条名，说明是「有词条但数值漏读」，按前部缺槽拒绝。
+            name_looks_substat = name_text is not None and _name_base_is_known(name_text.text)
+            if slot < 4 or name_looks_substat:
                 return _reject(profile.profile_id, INCOMPLETE_FIELDS)
-            continue  # 第 4 槽：已标定空槽证据成立
+            continue  # 第 4 槽：数值列为空且名称列非词条 → 空槽
         if name_text is None or not name_text.text.strip():
             return _reject(profile.profile_id, INCOMPLETE_FIELDS)
         if name_text.score < profile.rec_min_score:
