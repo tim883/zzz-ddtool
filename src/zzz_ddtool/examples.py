@@ -193,3 +193,20 @@ def _atomic_write(target: Path, content: bytes) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def save_all_examples(items: list[ExampleItem]) -> tuple[int, list[str]]:
+    """逐个落盘并汇总，返回 ``(成功数, 失败说明列表)``。
+
+    单项失败不影响其余 —— 用户勾了一堆，不该因为其中一个名字冲突就一个都没落。
+    """
+    ok = 0
+    problems: list[str] = []
+    for item in items:
+        try:
+            save_example(item)
+        except (OSError, ExamplesError) as exc:
+            problems.append(f"{item.file}：{exc}")
+            continue
+        ok += 1
+    return ok, problems

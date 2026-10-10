@@ -1267,6 +1267,70 @@ class ConfirmSelectAllDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class ExampleFetchDialog(QDialog):
+    """列出远端示例（文件名 / 标题 / 时间 / 说明 / 本地状态），勾选后下载。
+
+    只负责"让用户挑"；落盘交给 `examples.save_example` —— 那个从不覆盖已有文件。
+    """
+
+    def __init__(self, items: list, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("获取公共示例")
+        self.setMinimumWidth(620)
+        self._items = list(items)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel("勾选要下载的示例。本地已有同名且内容不同的，会并列保存一份，不覆盖你现有的。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.list = QListWidget(self)
+        for index, item in enumerate(self._items):
+            entry = QListWidgetItem(self._row_text(item), self.list)
+            entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            entry.setCheckState(Qt.CheckState.Checked)
+            entry.setData(Qt.ItemDataRole.UserRole, index)
+        layout.addWidget(self.list, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("下载")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _local_state(self, item) -> str:
+        from zzz_ddtool.paths import plans_dir
+
+        target = plans_dir() / item.file
+        try:
+            if not target.exists():
+                return "不存在"
+            return "已是最新" if target.read_bytes() == item.content else "将并列保存"
+        except OSError:
+            return "未知"
+
+    def _row_text(self, item) -> str:
+        note = item.note or "-"
+        state = self._local_state(item)
+        return f"{item.file}  ·  {item.title}  ·  {item.updated_at}  ·  {note}  ·  {state}"
+
+    def row_text(self, index: int) -> list[str]:
+        """某一行的字段，供测试与无障碍阅读。"""
+        item = self._items[index]
+        return [item.file, item.title, item.updated_at, item.note, self._local_state(item)]
+
+    def selected_items(self) -> list:
+        picked = []
+        for row in range(self.list.count()):
+            entry = self.list.item(row)
+            if entry.checkState() == Qt.CheckState.Checked:
+                picked.append(self._items[entry.data(Qt.ItemDataRole.UserRole)])
+        return picked
+
+
 def qualifying_pattern_ids(
     slot: int,
     mainstats: tuple[str, ...],
@@ -1709,13 +1773,24 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.open_settings)
         check_btn = QPushButton("检查更新")
         check_btn.clicked.connect(self.check_update)
-        self._task_controls = [capture_btn, warehouse_btn, open_btn, save_btn, save_as_btn, check_btn]
+        examples_btn = QPushButton("获取公共示例")
+        examples_btn.clicked.connect(self.fetch_public_examples)
+        self._task_controls = [
+            capture_btn,
+            warehouse_btn,
+            open_btn,
+            save_btn,
+            save_as_btn,
+            check_btn,
+            examples_btn,
+        ]
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addWidget(self.stay_on_top)
         actions.addWidget(settings_btn)
         actions.addWidget(check_btn)
+        actions.addWidget(examples_btn)
         actions.addWidget(capture_btn)
         actions.addWidget(warehouse_btn)
         actions.addWidget(open_btn)
@@ -2900,6 +2975,50 @@ class MainWindow(QMainWindow):
         from zzz_ddtool.updater import check_for_update
 
         self._start_utility(check_for_update, self._handle_update_status, "正在检查更新…")
+
+    def fetch_public_examples(self) -> None:
+        from zzz_ddtool.examples import fetch_examples
+
+        def collect() -> tuple[list, str]:
+            """把网络/清单异常变成可展示的结果 —— _start_utility 的失败路径不弹窗。"""
+            try:
+                return fetch_examples(), ""
+            except Exception as exc:  # ExamplesError 以及意外的网络错误
+                return [], str(exc)
+
+        self._start_utility(collect, self._handle_public_examples, "正在获取示例列表…")
+
+    def _handle_public_examples(self, result) -> None:  # noqa: ANN001
+        items, error = result
+        if error:
+            QMessageBox.information(self, "获取公共示例", error)
+            return
+        if not items:
+            QMessageBox.information(self, "获取公共示例", "远端暂无示例。")
+            return
+
+        picked = self._open_example_fetch_dialog(items)
+        if not picked:
+            return
+
+        from zzz_ddtool.examples import save_all_examples
+
+        ok, problems = save_all_examples(picked)
+        if problems:
+            QMessageBox.information(
+                self,
+                "获取公共示例",
+                f"已保存 {ok} 项；以下未保存：\n" + "\n".join(problems),
+            )
+            return
+        QMessageBox.information(self, "获取公共示例", f"已保存 {ok} 项。")
+
+    def _open_example_fetch_dialog(self, items) -> list:  # noqa: ANN001
+        """单独成方法，测试里覆盖掉它就不用真弹窗。"""
+        dialog = ExampleFetchDialog(items, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return []
+        return dialog.selected_items()
 
     def _handle_update_status(self, st) -> None:  # noqa: ANN001
         from zzz_ddtool.updater import apply_data_update, apply_program_update

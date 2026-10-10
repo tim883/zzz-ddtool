@@ -254,3 +254,23 @@ def test_save_example_leaves_no_partial_file_when_write_fails(tmp_path: Path, mo
         examples.save_example(item)
     assert (plans / "a.yaml").read_text(encoding="utf-8") == "MINE"
     assert sorted(p.name for p in plans.iterdir()) == ["a.yaml"]
+
+
+def test_save_all_examples_counts_ok_and_reports_each_failure(tmp_path: Path, monkeypatch) -> None:
+    """一条失败不影响其余；失败项按名字报出来。"""
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    # b.yaml 与它的并列目标都已存在、内容都不同 → save_example 必然拒绝
+    (plans / "b.yaml").write_text("MINE", encoding="utf-8")
+    (plans / "b-2026-10-10.yaml").write_text("OTHER", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+
+    good = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+    bad = examples.ExampleItem("b.yaml", "t", "2026-10-10", "", "y" * 64, b"NEW")
+
+    ok, problems = examples.save_all_examples([good, bad])
+
+    assert ok == 1
+    assert len(problems) == 1
+    assert "b.yaml" in problems[0]
+    assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"

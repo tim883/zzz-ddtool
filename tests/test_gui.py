@@ -2671,3 +2671,124 @@ def test_copy_other_require_mirrors_other_origin(qapp: QApplication, tmp_path) -
     assert window.sections[("four", 0)].require.value() == pytest.approx(9.9)
     window.close()
 
+
+
+def test_example_fetch_dialog_lists_fields_and_selection(qapp, tmp_path, monkeypatch):
+    """对话框按清单字段列行、默认勾选、能取回勾选项；不调 exec()。"""
+    from PySide6.QtCore import Qt
+
+    from zzz_ddtool import examples, gui, paths
+
+    monkeypatch.setattr(paths, "plans_dir", lambda: tmp_path / "user" / "plan")
+    item = examples.ExampleItem("a.yaml", "标题", "2026-10-10", "说明", "x" * 64, b"NEW")
+
+    dialog = gui.ExampleFetchDialog([item])
+    try:
+        assert dialog.row_text(0) == ["a.yaml", "标题", "2026-10-10", "说明", "不存在"]
+        assert dialog.selected_items() == [item]
+
+        dialog.list.item(0).setCheckState(Qt.CheckState.Unchecked)
+        assert dialog.selected_items() == []
+    finally:
+        dialog.close()
+
+
+def test_example_fetch_dialog_marks_local_state(qapp, tmp_path, monkeypatch):
+    """本地已有同名文件时要说清会跳过还是并列保存。"""
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "same.yaml").write_text("NEW", encoding="utf-8")
+    (plans / "diff.yaml").write_text("MINE", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+
+    same = examples.ExampleItem("same.yaml", "t", "2026-10-10", "", "a" * 64, b"NEW")
+    diff = examples.ExampleItem("diff.yaml", "t", "2026-10-10", "", "b" * 64, b"NEW")
+
+    dialog = gui.ExampleFetchDialog([same, diff])
+    try:
+        assert dialog.row_text(0)[-1] == "已是最新"
+        assert dialog.row_text(1)[-1] == "将并列保存"
+    finally:
+        dialog.close()
+
+
+def test_fetch_public_examples_reports_error_without_writing(qapp, tmp_path, monkeypatch):
+    """A8：远端不可达时明确提示，且 user/plan/ 里不出现任何新文件。"""
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path / "nodata")
+
+    def boom(url=None):
+        raise examples.ExamplesError("取不到远端示例清单：网络错误")
+
+    monkeypatch.setattr(examples, "fetch_examples", boom)
+
+    window = gui.MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        before = sorted(p.name for p in plans.glob("*.yaml")) if plans.exists() else []
+        captured: dict = {}
+        monkeypatch.setattr(
+            window,
+            "_start_utility",
+            lambda operation, on_success, message: captured.update(
+                operation=operation, on_success=on_success, message=message
+            ),
+        )
+        shown: list[str] = []
+        monkeypatch.setattr(gui.QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
+
+        window.fetch_public_examples()
+        captured["on_success"](captured["operation"]())
+
+        assert captured["message"] == "正在获取示例列表…"
+        assert shown and "网络错误" in shown[-1]
+        after = sorted(p.name for p in plans.glob("*.yaml")) if plans.exists() else []
+        assert after == before
+    finally:
+        window.close()
+
+
+def test_fetch_public_examples_saves_picked_items(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path / "nodata")
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    window = gui.MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        monkeypatch.setattr(window, "_open_example_fetch_dialog", lambda items: [item])
+        shown: list[str] = []
+        monkeypatch.setattr(gui.QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
+
+        window._handle_public_examples(([item], ""))
+
+        assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"
+        assert shown and "已保存 1 项" in shown[-1]
+    finally:
+        window.close()
+
+
+def test_fetch_public_examples_cancelled_dialog_writes_nothing(qapp, tmp_path, monkeypatch):
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path / "nodata")
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    window = gui.MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        monkeypatch.setattr(window, "_open_example_fetch_dialog", lambda items: [])
+        monkeypatch.setattr(gui.QMessageBox, "information", lambda *a, **kw: pytest.fail("取消不该弹提示"))
+
+        window._handle_public_examples(([item], ""))
+
+        assert not (plans / "a.yaml").exists()
+    finally:
+        window.close()
