@@ -351,6 +351,7 @@ def test_chain_panel_is_wide_enough_for_label(qapp: QApplication, tmp_path) -> N
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.resize(1400, 900)
     window.show()
+    qapp.processEvents()  # 先让启动时的默认三栏宽落定，否则会盖掉下面这行
     window._config_splitter.setSizes([680, 300, 400])
     qapp.processEvents()
     window._add_job()
@@ -2282,6 +2283,14 @@ def test_run_log_title_row_has_collapse_toggle(qapp: QApplication, tmp_path) -> 
     window.close()
 
 
+@pytest.fixture
+def unbounded_screen(monkeypatch):
+    """离屏平台的屏幕只有 800×800，比这些用例的窗口还矮；拖红框会被当成「已贴底」。
+    这里放开屏幕底边，单测「下半块锁死、窗口跟着长」那条老规则。"""
+    monkeypatch.setattr(MainWindow, "_red_drag_room", lambda self: None)
+
+
+@pytest.mark.usefixtures("unbounded_screen")
 def test_red_line_splitter_grows_upper_block_only(qapp: QApplication, tmp_path) -> None:
     """红线那条拉伸：只改红框（三栏 + 操作栏）的高度。
 
@@ -2320,6 +2329,7 @@ def test_red_line_splitter_grows_upper_block_only(qapp: QApplication, tmp_path) 
     window.close()
 
 
+@pytest.mark.usefixtures("unbounded_screen")
 def test_red_line_can_still_grow_upper_at_lower_floor(qapp: QApplication, tmp_path) -> None:
     """下半块已经缩到最小高度时，红框照样能往上长——不能卡住。
 
@@ -2353,6 +2363,7 @@ def test_red_line_can_still_grow_upper_at_lower_floor(qapp: QApplication, tmp_pa
     window.close()
 
 
+@pytest.mark.usefixtures("unbounded_screen")
 def test_red_line_handle_mouse_drag_is_handled_by_window(qapp: QApplication, tmp_path) -> None:
     """分隔条上的鼠标拖动由窗口自己接管：QSplitter 会在下半块最小高度处把条夹死。"""
     from PySide6.QtCore import QPoint, Qt
@@ -2377,6 +2388,118 @@ def test_red_line_handle_mouse_drag_is_handled_by_window(qapp: QApplication, tmp
 
     assert upper.height() >= upper_before + 100, (upper.height(), upper_before)
     assert window.height() >= win_before + 100, (window.height(), win_before)
+    window.close()
+
+
+def test_red_line_at_screen_bottom_squeezes_lower_block(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """窗口已贴屏幕底边：再拖红框，窗口不长，改从下半块（日志）里挤，挤到最小高度为止。
+
+    笔记本 150% 缩放下窗口一贴底，红框按老规则就再也拉不高，卡片区只剩一行。
+    """
+    monkeypatch.setattr(MainWindow, "_red_drag_room", lambda self: 0)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper, lower = window._main_splitter.widget(0), window._main_splitter.widget(1)
+    upper_before, lower_before, win_before = upper.height(), lower.height(), window.height()
+    floor = lower.minimumSizeHint().height()
+    assert lower_before > floor + 40, (lower_before, floor)
+
+    window._red_drag_upper = upper_before
+    window._red_drag_window_h = win_before
+    window._drag_red_line(40)
+    qapp.processEvents()
+    assert window.height() == win_before
+    assert upper.height() >= upper_before + 36, (upper.height(), upper_before)
+    assert lower.height() <= lower_before - 36, (lower.height(), lower_before)
+
+    # 拖过头：下半块停在最小高度，不会被挤没
+    window._drag_red_line(2000)
+    qapp.processEvents()
+    assert window.height() == win_before
+    assert lower.height() >= floor
+    window.close()
+
+
+def test_red_line_grows_window_only_up_to_screen_room(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """离屏幕底边还有 50px：先长窗口 50px，剩下的位移从下半块里挤。"""
+    monkeypatch.setattr(MainWindow, "_red_drag_room", lambda self: 50)
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1320, 900)
+    window.show()
+    qapp.processEvents()
+
+    upper, lower = window._main_splitter.widget(0), window._main_splitter.widget(1)
+    upper_before, lower_before, win_before = upper.height(), lower.height(), window.height()
+    window._red_drag_upper = upper_before
+    window._red_drag_window_h = win_before
+    window._drag_red_line(80)
+    qapp.processEvents()
+    assert window.height() == win_before + 50
+    assert abs(upper.height() - (upper_before + 80)) <= 4, (upper.height(), upper_before)
+    assert abs(lower.height() - (lower_before - 30)) <= 4, (lower.height(), lower_before)
+    window.close()
+
+
+def test_window_fits_into_small_screen(qapp: QApplication, tmp_path) -> None:
+    """出厂 1320×820 / 记录里的大窗口，在小屏上要收进可用区，不能伸到屏幕外。"""
+    screen = qapp.primaryScreen().availableGeometry()
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert window.width() <= screen.width()
+    assert window.height() <= screen.height()
+    assert screen.contains(window.pos())
+    # 在大屏上存下的布局，换到小屏上打开同样收进来
+    window.resize(screen.width() + 600, screen.height() + 400)
+    window._layout_ready = True
+    window._persist_layout()
+    window.close()
+
+    reopened = MainWindow(config_path=tmp_path / "t.yaml")
+    assert reopened.width() <= screen.width()
+    assert reopened.height() <= screen.height()
+    reopened.close()
+
+
+def test_card_column_keeps_two_cards_on_laptop_width(qapp: QApplication, tmp_path) -> None:
+    """笔记本 150%（逻辑宽约 1280）：卡片栏至少并排放下两张卡，宽度从任务链 / 配置栏借。"""
+    from zzz_ddtool.gui import _COMFORT_CARDS, _cards_column_width
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1280, 640)
+    window.show()
+    qapp.processEvents()
+    want = _cards_column_width(_COMFORT_CARDS)
+
+    window._apply_saved_sizes((None, None))  # 没有布局记录：按窗口宽折算默认宽
+    qapp.processEvents()
+    sizes = window._config_splitter.sizes()
+    assert sizes[2] >= want, sizes
+
+    # 布局记录来自大屏（中间两栏很宽），换到笔记本上也得让出卡片栏
+    window._apply_saved_sizes(([700, 400, 300], None))
+    qapp.processEvents()
+    sizes = window._config_splitter.sizes()
+    assert sizes[2] >= want, sizes
+    assert sizes[0] >= window._config_splitter.widget(0).minimumWidth()
+    assert sizes[1] >= window._config_splitter.widget(1).minimumWidth()
+    window.close()
+
+
+def test_config_column_never_clips_weight_rows(qapp: QApplication, tmp_path) -> None:
+    """配置栏关了横向滚动条：最小宽必须放得下一整行词条单价（含「必带」）。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0})
+    window.resize(1280, 640)
+    window.show()
+    qapp.processEvents()
+    window._config_splitter.setSizes([2000, 1, 2000])  # 把配置栏往最窄压
+    qapp.processEvents()
+    row = window.weight_editor._rows[0][2]
+    viewport = window._config_splitter.widget(1).viewport()
+    right = row.mapTo(viewport, row.rect().topLeft()).x() + row.minimumSizeHint().width()
+    assert right <= viewport.width(), (right, viewport.width())
     window.close()
 
 

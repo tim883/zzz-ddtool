@@ -125,6 +125,28 @@ _MAINSTAT_COLS = 2
 # 各部位的主词条页取同一个高度：最高的是 5 号位（1 个「不限」+ 10 个选项 = 6 行）。
 _MAINSTAT_PAGE_HEIGHT = 160
 
+# 三栏宽度。笔记本 150% 缩放时逻辑宽只有 1280 左右，固定像素的默认宽会把右栏挤到
+# 一张半卡片宽；所以默认宽按窗口宽度折算，右栏优先保证能并排放两张卡。
+_CARD_WIDTH = 188
+_CARD_SPACING = 10
+_CHAIN_MIN_WIDTH = 380
+_CONFIG_MIN_WIDTH = 300
+_COMFORT_CARDS = 2
+# 窗口默认（没有布局记录时）的尺寸；屏幕放不下就收进可用区。
+_DEFAULT_WINDOW_SIZE = (1320, 820)
+
+
+def _cards_column_width(cards: int) -> int:
+    """右栏并排放下 `cards` 张卡片要多宽：卡片 + 间距 + 滚动区边距 12×2 + 滚动条 + 页签边框。"""
+    return cards * _CARD_WIDTH + (cards - 1) * _CARD_SPACING + 24 + 12 + 6
+
+
+def _default_column_sizes(total: int) -> list[int]:
+    """没有布局记录时三栏的默认宽：任务链 / 配置栏按比例取、各自封顶，余下全给卡片栏。"""
+    chain = max(_CHAIN_MIN_WIDTH, min(540, round(total * 0.33)))
+    config = max(_CONFIG_MIN_WIDTH, min(360, round(total * 0.22)))
+    return [chain, config, max(1, total - chain - config)]
+
 # 全局字体：字号必须**同时**写进样式表（见下面 STYLESHEET 末尾那条 QAbstractItemView）。
 # 列表类控件（任务链的 QListWidget、下拉框弹出的 QListView）只要被样式表命中，
 # Qt 就用**系统默认字体**（Windows 上是 9pt「微软雅黑 UI」）重算字号，
@@ -289,7 +311,7 @@ _JOB_SEP_COLOR = "#9aa5b1"
 _JOB_BODY_COLOR = "#1a1a1a"
 _JOB_COUNTS_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 _JOB_COUNTS_STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
-_JOB_COUNT_WIDTH = 108
+_JOB_COUNT_WIDTH = 84  # 10pt 下「2016/2016」约 63px，留点余量
 _JOB_COUNT_FONT_PT = 10
 
 
@@ -485,6 +507,25 @@ def default_config_path() -> Path:
     return plans_dir() / "example.yaml"
 
 
+class _ElidedLabel(QLabel):
+    """单行标签：放不下收省略号，悬停看全文。窄窗口下不折行，不把所在行撑高。"""
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setToolTip(text)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def paintEvent(self, _event) -> None:  # noqa: ANN001
+        rect = self.contentsRect()
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, rect.width())
+        painter = QPainter(self)
+        self.style().drawItemText(painter, rect, int(self.alignment()), self.palette(), self.isEnabled(),
+                                  text, self.foregroundRole())
+
+
 class FlowLayout(QLayout):
     def __init__(self, parent: QWidget | None = None, spacing: int = 12) -> None:
         super().__init__(parent)
@@ -560,7 +601,7 @@ class PatternCard(QFrame):
         super().__init__(parent)
         self.pattern = pattern
         self.setObjectName("card")
-        self.setFixedWidth(188)
+        self.setFixedWidth(_CARD_WIDTH)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setProperty("checked", "true" if checked else "false")
 
@@ -700,6 +741,10 @@ class StageSection(QWidget):
 
         self.count_label = QLabel()
         self.count_label.setObjectName("hint")
+        # 栏窄时让计数先被压，别把整条撑宽、给卡片区带出横向滚动条。
+        # 最小宽写 1 而不是 0：0 表示「沿用文字宽」，等于没放开。
+        self.count_label.setMinimumWidth(1)
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         level = QLabel(f"+{checkpoint}")
         level.setObjectName("stageLevel")
@@ -725,7 +770,7 @@ class StageSection(QWidget):
         header.addWidget(self.count_label)
 
         self.flow_host = QWidget()
-        self.flow = FlowLayout(self.flow_host, spacing=10)
+        self.flow = FlowLayout(self.flow_host, spacing=_CARD_SPACING)
         self.flow_host.setLayout(self.flow)
         self.flow_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
@@ -875,6 +920,17 @@ class WeightEditor(QWidget):
         add_row.addWidget(self.add_combo, 1)
         add_row.addWidget(add_btn)
         self._box.addLayout(add_row)
+        # 先量一行词条的最小宽再拆掉：所在栏关了横向滚动条，栏宽得按它兜底，
+        # 否则还没加载方案时算出的栏宽偏窄，之后「必带」会被截掉。
+        self._add_row(KNOWN_SUBSTATS[0], 0.0)
+        probe = self._rows[0][2]
+        probe.ensurePolished()
+        self._row_min_width = probe.minimumSizeHint().width()
+        self._remove_row(probe)
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(max(hint.width(), self._row_min_width), hint.height())
 
     def set_weights(self, weights: dict[str, float], required_substats: tuple[str, ...] = ()) -> None:
         previous_block = self.blockSignals(True)
@@ -1250,7 +1306,7 @@ class MainWindow(QMainWindow):
     def __init__(self, config_path: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle("驱动盘强化辅助")
-        self.resize(1320, 820)
+        self.resize(*_DEFAULT_WINDOW_SIZE)
         self._path = Path(config_path) if config_path else default_config_path()
         self._loading = False
         self._preview_dirty = True
@@ -1312,7 +1368,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 1)
         # 任务链给两个统计列留宽；各栏不允许拖到 0。
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([540, 360, 720])
+        splitter.setSizes(_default_column_sizes(_DEFAULT_WINDOW_SIZE[0]))
         # 拖完分隔条延迟记一次，下次启动照旧。
         splitter.splitterMoved.connect(lambda *_: self._queue_layout_save())
 
@@ -1413,21 +1469,65 @@ class MainWindow(QMainWindow):
         self._layout_ready = True
 
     @staticmethod
-    def _apply_sizes(splitter: QSplitter, saved: object) -> None:
-        """按记录恢复分隔条比例。条数对不上或值非法就忽略，保持默认布局。"""
+    def _apply_sizes(splitter: QSplitter, saved: object) -> bool:
+        """按记录恢复分隔条比例。条数对不上或值非法就忽略，保持默认布局。返回是否套用了。"""
         if not isinstance(saved, list) or len(saved) != len(splitter.sizes()):
-            return
+            return False
         try:
             splitter.setSizes([max(1, int(value)) for value in saved])
         except (TypeError, ValueError):
-            pass
+            return False
+        return True
+
+    def _fit_to_screen(self, restored: bool) -> None:
+        """窗口收进所在屏幕的可用区（任务栏以外），放不下就收窄收矮、挪回屏内。
+
+        出厂的 1320×820 在 150% 缩放的笔记本（逻辑约 1280×680）上就放不下；布局记录
+        也可能是在另一台更大的屏幕上存的。没有记录时顺手居中。
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        # resize 的尺寸不含标题栏和边框，按常见值预留。
+        frame_w, frame_h = 16, 40
+        width = max(1, min(self.width(), area.width() - frame_w))
+        height = max(1, min(self.height(), area.height() - frame_h))
+        if (width, height) != (self.width(), self.height()):
+            self.resize(width, height)
+        if restored:
+            x = min(max(self.x(), area.left()), area.right() + 1 - width - frame_w)
+            y = min(max(self.y(), area.top()), area.bottom() + 1 - height - frame_h)
+        else:
+            x = area.left() + (area.width() - width - frame_w) // 2
+            y = area.top() + (area.height() - height - frame_h) // 2
+        self.move(max(area.left(), x), max(area.top(), y))
+
+    def _balance_columns(self) -> None:
+        """卡片栏放不下两张卡时，先从任务链、再从配置栏借宽，各自不低于最小宽。"""
+        splitter = self._config_splitter
+        sizes = splitter.sizes()
+        if len(sizes) != 3 or sum(sizes) <= 0:
+            return
+        lack = _cards_column_width(_COMFORT_CARDS) - sizes[2]
+        if lack <= 0:
+            return
+        for index in (0, 1):
+            spare = sizes[index] - splitter.widget(index).minimumWidth()
+            take = max(0, min(spare, lack))
+            sizes[index] -= take
+            sizes[2] += take
+            lack -= take
+        splitter.setSizes(sizes)
 
     def _restore_layout(self) -> None:
         """恢复上次退出时的界面布局。没记录过就保持默认。"""
         data = read_layout()
         geometry = data.get("geometry")
+        restored = False
         if isinstance(geometry, str) and geometry:
-            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+            restored = bool(self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii"))))
+        self._fit_to_screen(restored)
         if data.get("on_top"):
             self.stay_on_top.setChecked(True)
         # 两条比例都延到窗口真正摆好之后再套。构造函数里窗口还没显示，分隔条宽度
@@ -1439,8 +1539,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._remember_lower_height)
 
     def _apply_saved_sizes(self, saved: tuple[object, object]) -> None:
-        """套用记录里的三栏 / 上下块比例。"""
-        self._apply_sizes(self._config_splitter, saved[0])
+        """套用记录里的三栏 / 上下块比例；没有记录就按当前窗口宽度折算默认三栏宽。"""
+        if not self._apply_sizes(self._config_splitter, saved[0]):
+            self._config_splitter.setSizes(_default_column_sizes(sum(self._config_splitter.sizes())))
+        self._balance_columns()
         self._apply_sizes(self._main_splitter, saved[1])
 
     def _persist_layout(self) -> None:
@@ -1488,24 +1590,56 @@ class MainWindow(QMainWindow):
                 return True
             if kind == QEvent.Type.MouseButtonRelease and self._red_drag_global_y is not None:
                 self._red_drag_global_y = None
+                # 贴底后的拖动会挤下半块，松手时记下新高度，下次拖以它为准。
+                QTimer.singleShot(0, self._remember_lower_height)
                 self._queue_layout_save()
                 return True
         return super().eventFilter(obj, event)
+
+    def _red_drag_room(self) -> int | None:
+        """拖红框时窗口还能往下长多少（相对拖动开始时）。None = 不设限。
+
+        最大化 / 全屏时窗口长不了；否则以所在屏幕可用区的底边为界。
+        """
+        if self.isMaximized() or self.isFullScreen():
+            return 0
+        screen = self.screen()
+        if screen is None:
+            return None
+        start_bottom = self.frameGeometry().bottom() - (self.height() - self._red_drag_window_h)
+        return max(0, screen.availableGeometry().bottom() - start_bottom)
 
     def _drag_red_line(self, dy: int) -> None:
         """把红框按位移 `dy` 抬高（正）/压低（负）。
 
         下半块高度锁死不动，所以红框长高多少，窗口就跟着长高多少——它只是被顶下去。
         窗口最底下那条边才改下半块（也就是日志窗）。
+        窗口长到屏幕底边（或已最大化）后再往下拖，就改从下半块里挤，挤到它的最小高度为止——
+        否则矮屏上窗口一贴底，红框就再也拉不高，卡片区只剩一行。
         """
         upper = self._main_splitter.widget(0)
         wanted = max(max(0, upper.minimumSizeHint().height()), self._red_drag_upper + dy)
         delta = wanted - self._red_drag_upper
+        lower = max(0, self._lower_height)
+        grow = delta
+        fixed = self.isMaximized() or self.isFullScreen()
+        room = self._red_drag_room()
+        if room is not None and delta > room:
+            floor = max(0, self._lower_pane.minimumSizeHint().height())
+            squeeze = min(delta - room, max(0, lower - floor))
+            lower -= squeeze
+            grow = room
+            wanted = self._red_drag_upper + grow + squeeze
+        elif fixed:
+            # 窗口高度动不了：红框让出来的高度还给下半块。
+            lower -= delta
+            grow = 0
         self._dragging_main_splitter = True
         try:
             # 先长窗口，再摆比例：窗口不够高时 setSizes 会被夹，红框就顶不上去。
-            self.resize(self.width(), max(1, self._red_drag_window_h + delta))
-            self._main_splitter.setSizes([wanted, max(0, self._lower_height)])
+            if not fixed:
+                self.resize(self.width(), max(1, self._red_drag_window_h + grow))
+            self._main_splitter.setSizes([wanted, lower])
         finally:
             self._dragging_main_splitter = False
 
@@ -1514,6 +1648,9 @@ class MainWindow(QMainWindow):
         # 套装摘要按当前可用宽度重算省略号（宽度变了但文本没变也要刷新）。
         if getattr(self, "set_summary", None) is not None:
             self._update_set_summary()
+        # 变窄时 QSplitter 先压有拉伸因子的卡片栏，这里再把宽度从左两栏借回来。
+        if self._layout_ready and event.size().width() < event.oldSize().width():
+            QTimer.singleShot(0, self._balance_columns)
         # 拖红框时窗口高度是我在补，不算用户改窗口大小，别在这记。
         if self._layout_ready and not self._dragging_main_splitter:
             QTimer.singleShot(0, self._remember_lower_height)
@@ -1528,9 +1665,8 @@ class MainWindow(QMainWindow):
         titles.setSpacing(2)
         title = QLabel("驱动盘强化辅助")
         title.setObjectName("bannerTitle")
-        hint = QLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就新建任务，不必凑齐 6 个。")
+        hint = _ElidedLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就新建任务，不必凑齐 6 个。")
         hint.setObjectName("hint")
-        hint.setWordWrap(True)
         self.path_label = QLabel()
         self.path_label.setObjectName("hint")
         # 保存状态常驻标签：固定在标题行右端，不占用文件名位置。
@@ -1539,14 +1675,20 @@ class MainWindow(QMainWindow):
         self.save_label.setObjectName("saveStateIdle")
         self.save_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.save_label.setFixedWidth(160)
-        state_row = QHBoxLayout()
-        state_row.setContentsMargins(0, 0, 0, 0)
-        state_row.addWidget(self.path_label)
-        state_row.addStretch(1)
-        state_row.addWidget(self.save_label)
-        titles.addWidget(title)
-        titles.addWidget(hint)
-        titles.addLayout(state_row)
+        # 页头只占两行，矮屏上多留给三栏：文件名跟标题一行，保存状态跟提示语一行。
+        # 保存状态放在能被压窄的提示语旁边，不放标题行，免得把整个窗口的最小宽撑大。
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(14)
+        title_row.addWidget(title)
+        title_row.addWidget(self.path_label, 0, Qt.AlignmentFlag.AlignBottom)
+        title_row.addStretch(1)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.addWidget(hint, 1)
+        hint_row.addWidget(self.save_label)
+        titles.addLayout(title_row)
+        titles.addLayout(hint_row)
         self._reset_saved_state()
 
         capture_btn = QPushButton("截取游戏")
@@ -1644,7 +1786,9 @@ class MainWindow(QMainWindow):
         scroll.setWidget(panel)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(300)
+        # 横向滚动条关着，栏宽小于内容最小宽就会直接截掉右边（「必带」「添加词条」）。
+        content = panel.minimumSizeHint().width() + scroll.verticalScrollBar().sizeHint().width()
+        scroll.setMinimumWidth(max(_CONFIG_MIN_WIDTH, content))
         scroll.setMaximumWidth(400)
         return scroll
 
@@ -1772,7 +1916,8 @@ class MainWindow(QMainWindow):
         # 12pt 下扣掉约 85px；实测「4号 · 双套装 · 暴击伤害」要 261px、「…· 能量自动回复」
         # 要 293px，所以要 380 才两行都不收省略号（340 连常见的双套装行都差 6px）。
         # 两个统计列固定宽，任务名可省略并悬停查看；允许拉宽看长名称。
-        panel.setMinimumWidth(500)
+        # 窄屏上让位给卡片栏，最窄收到 _CHAIN_MIN_WIDTH（再窄任务名就只剩省略号了）。
+        panel.setMinimumWidth(_CHAIN_MIN_WIDTH)
         panel.setMaximumWidth(760)
         self.chain_panel = panel
         layout = QVBoxLayout(panel)
@@ -2160,11 +2305,42 @@ class MainWindow(QMainWindow):
         self.four_host = self._origin_scroll(Origin.FOUR)
         self.trial = TrialPage()
         self.trial.run.clicked.connect(self.run_trial)
+        # 试判页的表单不矮，不包一层滚动区，它的最小高度会把整排三栏一起撑高。
+        trial_scroll = QScrollArea()
+        trial_scroll.setWidgetResizable(True)
+        trial_scroll.setWidget(self.trial)
+        trial_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.tabs.addTab(self.three_host["scroll"], "初始 3 词")
         self.tabs.addTab(self.four_host["scroll"], "初始 4 词")
-        self.tabs.addTab(self.trial, "试判")
+        self.tabs.addTab(trial_scroll, "试判")
+        # 「拷贝另一侧的本档要求」放进页签栏右侧，不在卡片区顶上单占一行。
+        self.copy_require_btn = QPushButton()
+        self.copy_require_btn.clicked.connect(self._copy_require_for_current_tab)
+        self.tabs.setCornerWidget(self.copy_require_btn, Qt.Corner.TopRightCorner)
         self.tabs.currentChanged.connect(lambda _index: self._update_status())
+        self.tabs.currentChanged.connect(lambda _index: self._sync_copy_require_btn())
+        self._sync_copy_require_btn()
         return self.tabs
+
+    def _tab_origin(self) -> Origin | None:
+        return {0: Origin.THREE, 1: Origin.FOUR}.get(self.tabs.currentIndex())
+
+    def _sync_copy_require_btn(self) -> None:
+        origin = self._tab_origin()
+        self.copy_require_btn.setVisible(origin is not None)
+        if origin is None:
+            return
+        other = Origin.FOUR if origin is Origin.THREE else Origin.THREE
+        self.copy_require_btn.setText(f"拷贝{_ORIGIN_CN[other]}的本档要求")
+        self.copy_require_btn.setToolTip(
+            f"把「初始 {_ORIGIN_CN[other]}」每档的本档要求（卡片权重）照搬到当前页"
+            f"（初始 {_ORIGIN_CN[origin]}）。"
+        )
+
+    def _copy_require_for_current_tab(self) -> None:
+        origin = self._tab_origin()
+        if origin is not None:
+            self._copy_other_require(origin)
 
     def _selected_slots(self) -> list[int]:
         return [self._active_slot]
@@ -2483,14 +2659,6 @@ class MainWindow(QMainWindow):
         inner = QWidget()
         box = QVBoxLayout(inner)
         box.setContentsMargins(12, 8, 12, 8)
-        other = Origin.FOUR if origin is Origin.THREE else Origin.THREE
-        copy_btn = QPushButton(f"拷贝{_ORIGIN_CN[other]}的本档要求")
-        copy_btn.setToolTip(
-            f"把右侧「初始 {_ORIGIN_CN[other]}」每档的本档要求（卡片权重）照搬到本侧"
-            f"（初始 {_ORIGIN_CN[origin]}）。"
-        )
-        copy_btn.clicked.connect(lambda: self._copy_other_require(origin))
-        box.addWidget(copy_btn)
         for checkpoint in CHECKPOINTS:
             section = StageSection(origin, checkpoint, None)
             section.require_changed.connect(self._on_require_changed)
