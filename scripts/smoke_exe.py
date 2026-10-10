@@ -62,9 +62,20 @@ def wait_for_window(pid: int, timeout_s: float) -> tuple[int, str] | None:
     return None
 
 
+def log_root(pkg: Path) -> Path:
+    """日志根目录：与 zzz_ddtool.paths.user_data_root() 同一条规则。
+
+    打包态 = 公共根（从 exe 同级向上找 `.zzz-ddtool-root`），没有标记时回退到 exe 同级。
+    """
+    for parent in (pkg, *pkg.parents):
+        if (parent / ".zzz-ddtool-root").is_file():
+            return parent / "log"
+    return pkg / "log"
+
+
 def step_resource_check(exe: Path, pkg: Path, fixture: Path) -> dict:
     """打包态资源加载：read-disc 读真机截图。"""
-    out = pkg / "log" / "debug" / "smoke-read-disc.json"
+    out = log_root(pkg) / "debug" / "smoke-read-disc.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()
@@ -90,13 +101,13 @@ def step_resource_check(exe: Path, pkg: Path, fixture: Path) -> dict:
         result["substats"] = [s.get("name") for s in (disc.get("substats") or [])]
         result["error"] = payload.get("error")
     result["ok"] = bool(result.get("json_written") and result.get("payload_ok"))
-    result["log_dir_created"] = (pkg / "log").is_dir()
+    result["log_dir_created"] = log_root(pkg).is_dir()
     return result
 
 
 def step_gui_check(exe: Path, pkg: Path, timeout_s: float) -> dict:
     """GUI 窗口 + 文本日志 + 正常退出。"""
-    log_file = pkg / "log" / "text" / "ddtool.log"
+    log_file = log_root(pkg) / "text" / "ddtool.log"
     result: dict = {"step": "gui", "log_file": str(log_file)}
     proc = subprocess.Popen([str(exe)], cwd=str(pkg))
     result["pid"] = proc.pid

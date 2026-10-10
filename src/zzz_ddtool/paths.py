@@ -78,12 +78,15 @@ def log_settings_file() -> Path:
 def log_dir() -> Path:
     """所有运行时产出的根目录，第一层就叫 log。
 
-    开发态=仓库根/log，打包态=exe 同级/log（运行时产出，不随包分发）。
-    文本和图片分开两个明确路径：
-        log/ddtool.log            文本日志
+    与 user/ 用同一条定位规则（``user_data_root()``）：开发态=仓库根/log；
+    打包态=公共根/log，周围没有根标记时回退到 exe 同级/log。
+    这样把包放进新的版本子目录、删掉旧版本目录，日志仍然保留。
+    运行时产出，不随包分发。文本和图片分开两个明确路径：
+
+        log/text/ddtool.log       文本日志
         log/captures/<时间戳>/    本轮截图
     """
-    return base_dir() / "log"
+    return user_data_root() / "log"
 
 
 def captures_dir() -> Path:
