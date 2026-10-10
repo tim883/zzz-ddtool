@@ -18,6 +18,9 @@ build/
 # Runtime output (text log + screenshots), not committed
 log/
 
+# Nutstore (坚果云) 闪电下载的云端占位标记（0 字节，非真实文件），不入库
+*.nssyncsc
+
 # User data (archives + presets), not committed
 user/
 
