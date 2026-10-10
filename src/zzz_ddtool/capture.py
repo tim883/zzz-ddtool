@@ -5,6 +5,7 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
+from zzz_ddtool import scanperf
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.paths import captures_dir
 from zzz_ddtool.retain import retain_captures
@@ -340,18 +341,25 @@ def grab_game_image(hwnd: int | None = None):
     target = hwnd if hwnd is not None else find_game_hwnd()
     _restore_window(target)
     overlay_hidden = _suspend_overlay()
+    method = None  # type: str | None
     try:
-        image = _print_window(target)
-        method = "printwindow"
-        if image is None or _looks_unusable(image):
-            # 提权运行的游戏会把 PrintWindow 拒成 ERROR_ACCESS_DENIED；
-            # 屏幕 BitBlt 不打开目标进程，可兜底。窗口已由 _restore_window 提到最前。
-            image = _bitblt_screen(target)
-            method = "bitblt"
-            if image is None or _looks_unusable(image):
-                raise CaptureError(
-                    "窗口截到的是黑图/空白图。确认游戏窗口化、可见、没有被别的窗口挡住。"
-                )
+        # 性能记录：只量本次截图调用（§7.1）。method/hwnd 取返回元组的实际值；
+        # 失败未取得结果时记 null，异常照原样往外抛。
+        with scanperf.timed("capture", details={"method": None, "hwnd": None}) as span:
+            try:
+                image = _print_window(target)
+                method = "printwindow"
+                if image is None or _looks_unusable(image):
+                    # 提权运行的游戏会把 PrintWindow 拒成 ERROR_ACCESS_DENIED；
+                    # 屏幕 BitBlt 不打开目标进程，可兜底。窗口已由 _restore_window 提到最前。
+                    image = _bitblt_screen(target)
+                    method = "bitblt"
+                    if image is None or _looks_unusable(image):
+                        raise CaptureError(
+                            "窗口截到的是黑图/空白图。确认游戏窗口化、可见、没有被别的窗口挡住。"
+                        )
+            finally:
+                span.set(method=method, hwnd=target if method is not None else None)
     finally:
         _resume_overlay(overlay_hidden)
     get_logger("zzz_ddtool.capture").debug(
@@ -364,7 +372,11 @@ def save_image(image, hwnd: int, method: str, name: str | None = None, dest_dir:
     folder = dest_dir or captures_dir()
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / f"{name}.png" if name else folder / f"zzz-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    if not image.save(str(dest), "PNG"):
+    # 性能记录：只包裹这一次 image.save（§7.1），不改调用顺序/返回值/错误处理。
+    with scanperf.timed("png_save", details={"source": "capture_save_image", "path": str(dest), "saved": False}) as span:
+        saved = image.save(str(dest), "PNG")
+        span.set(saved=bool(saved))
+    if not saved:
         raise CaptureError(f"写文件失败：{dest}")
     removed = retain_captures()
     get_logger("zzz_ddtool.capture").info(

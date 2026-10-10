@@ -39,6 +39,7 @@ import logging
 import time
 from pathlib import Path
 
+from zzz_ddtool import scanperf
 from zzz_ddtool.capture import grab_game_image
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.paths import captures_dir
@@ -214,7 +215,15 @@ class Trace:
         name = self._make_name(action)
         target = self.dir / name
         try:
-            if not image.save(str(target), "PNG"):
+            # 性能记录：只包裹这一次 image.save（§7.1）。image 为空时上面已另截一张，
+            # 那次 capture 由 grab_game_image 单独记，不并入这次 png_save。
+            with scanperf.timed(
+                "png_save",
+                details={"source": "trace", "path": str(target), "saved": False},
+            ) as span:
+                saved = image.save(str(target), "PNG")
+                span.set(saved=bool(saved))
+            if not saved:
                 return None
         except Exception as exc:
             get_logger("zzz_ddtool.trace").warning("存图失败：%s", exc)

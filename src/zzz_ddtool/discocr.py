@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 from PySide6.QtGui import QImage
 
+from zzz_ddtool import scanperf
 from zzz_ddtool.models import MAX_LEVEL, Disc, Substat
 from zzz_ddtool.ocr import (
     _LEVEL_RE,
@@ -548,43 +549,106 @@ def _match_template(
     return float(peak), coverage, extra
 
 
-def _template_text(
+def _template_match_entry(
     assets: _Assets, profile: _Profile, field: _Field, gray_roi: np.ndarray
-) -> _Text | None:
-    """按 Spec §4 的「一级候选 + 分差 + 完整行覆盖」决定是否采用模板文字。"""
+) -> tuple[_Text | None, str | None]:
+    """模板判定核心：返回 ``(命中文字, 命中的模板 ID)``；未命中为 ``(None, None)``。"""
     scored = []
     for entry in assets.entries(profile.profile_id, field.kind):
         matched = _match_template(gray_roi, entry.array)
         if matched is not None:
             scored.append((matched[0], entry, matched[1], matched[2]))
     if not scored:
-        return None
+        return None, None
     scored.sort(key=lambda item: -item[0])
     correlation, entry, coverage, extra = scored[0]
     if correlation < entry.match_min_score:
-        return None
+        return None, None
     if len(scored) > 1 and correlation - scored[1][0] < entry.match_min_gap:
-        return None
+        return None, None
     if coverage < TEMPLATE_COVERAGE_MIN or extra > TEMPLATE_EXTRA_MAX:
-        return None
-    return _Text(entry.text, correlation)
+        return None, None
+    return _Text(entry.text, correlation), entry.template_id
+
+
+def _template_text(
+    assets: _Assets,
+    profile: _Profile,
+    field: _Field,
+    gray_roi: np.ndarray,
+    *,
+    record: bool = True,
+) -> _Text | None:
+    """按 Spec §4 的「一级候选 + 分差 + 完整行覆盖」决定是否采用模板文字。
+
+    ``record=False``：只用于布局判别，结果不计入 ``template_match``/``template_hits``
+    （§7.1.1 的 template_hits 是「接受并用于字段解析」的行数）。
+    """
+    if not record:
+        text, _template_id = _template_match_entry(assets, profile, field, gray_roi)
+        return text
+
+    with scanperf.timed(
+        "template_match",
+        details={
+            "layout": profile.layout,
+            "profile_id": profile.profile_id,
+            "roi_ids": [field.field_id],
+            "template_hits": 0,
+            "matches": [],
+        },
+    ) as span:
+        text, template_id = _template_match_entry(assets, profile, field, gray_roi)
+        if text is None:
+            span.set(matches=[{"roi_id": field.field_id, "template_id": None, "accepted": False}])
+        else:
+            span.set(
+                template_hits=1,
+                matches=[
+                    {"roi_id": field.field_id, "template_id": template_id, "accepted": True}
+                ],
+            )
+        return text
 
 
 def _recognize_bands(
-    image: QImage, rects: Sequence[tuple[int, int, int, int]]
+    image: QImage,
+    rects: Sequence[tuple[int, int, int, int]],
+    *,
+    roi_ids: Sequence[str] | None = None,
+    profile_id: str | None = None,
+    layout: str | None = None,
 ) -> list[_Text | None]:
     """固定行 ROI 一次批量识别：直接送 rec 网络，不做检测。
 
     结果严格按输入 ROI 顺序返回（识别器内部会按宽度重排，本函数按原下标还原；
     引擎锁保证这一批不与另一帧的识别交织）。
+
+    性能：准备 ROI 与送网络分开计时——``crop`` 是裁剪/转格式区间，``recognize_batch``
+    只含 rec 调用、不含裁剪与检测成本（§7.1）。无活动会话时两者都是 no-op。
     """
     if not rects:
         return []
     from rapidocr.ch_ppocr_rec import TextRecInput
 
-    crops = [qimage_to_bgr(image.copy(l, t, r - l, b - t)) for l, t, r, b in rects]
-    with _WORD_BOX_LOCK:
-        result = _get_engine().text_rec(TextRecInput(img=crops))
+    ids = list(roi_ids) if roi_ids is not None else [list(rect) for rect in rects]
+    with scanperf.timed(
+        "crop",
+        details={
+            "layout": layout,
+            "profile_id": profile_id,
+            "roi_ids": ids,
+            "rects": [list(rect) for rect in rects],
+            "frame_size": [image.width(), image.height()],
+        },
+    ):
+        crops = [qimage_to_bgr(image.copy(l, t, r - l, b - t)) for l, t, r, b in rects]
+    with scanperf.timed(
+        "recognize_batch",
+        details={"roi_ids": ids, "batch_size": len(crops), "profile_id": profile_id},
+    ):
+        with _WORD_BOX_LOCK:
+            result = _get_engine().text_rec(TextRecInput(img=crops))
     texts, scores = result.txts, result.scores
     if texts is None or scores is None or len(texts) != len(crops) or len(scores) != len(crops):
         raise OcrError("固定行批量识别返回数量与输入 ROI 不一致")
@@ -677,17 +741,47 @@ def try_read_disc(image: QImage, *, layout: str) -> FastDiscRead:
         return _reject(None, UNMATCHED_LAYOUT)
 
     # 阶段 3：用 level 字段唯一判别布局。模板优先，未命中再对该 ROI 识别。
+    # crop 是 parse_total 的子事件（§7.1）：只测本批 ROI 的裁剪/转格式；布局判别用的
+    # 模板记录 record=False，不进 template_hits。
     level_texts: dict[str, _Text | None] = {}
+    level_grays: dict[str, np.ndarray] = {}
+    with scanperf.timed(
+        "crop",
+        details={
+            "layout": layout,
+            "profile_id": None,
+            "roi_ids": [],
+            "rects": [],
+            "frame_size": [image.width(), image.height()],
+        },
+    ) as crop_span:
+        roi_ids: list[str] = []
+        rects: list[list[int]] = []
+        for profile in candidates:
+            level_field = profile.level_field
+            level_grays[profile.profile_id] = _band_gray(image, level_field.rect)
+            roi_ids.append(level_field.field_id)
+            rects.append(list(level_field.rect))
+        crop_span.set(roi_ids=roi_ids, rects=rects)
+
     pending: list[tuple[_Profile, _Field]] = []
     for profile in candidates:
         level_field = profile.level_field
-        text = _template_text(assets, profile, level_field, _band_gray(image, level_field.rect))
+        text = _template_text(
+            assets, profile, level_field, level_grays[profile.profile_id], record=False
+        )
         if text is None:
             pending.append((profile, level_field))
         else:
             level_texts[profile.profile_id] = text
     if pending:
-        results = _recognize_bands(image, [item.rect for _p, item in pending])
+        results = _recognize_bands(
+            image,
+            [item.rect for _p, item in pending],
+            roi_ids=[item.field_id for _p, item in pending],
+            profile_id=None,
+            layout=layout,
+        )
         for (profile, _field), text in zip(pending, results):
             level_texts[profile.profile_id] = text
     matched = [p for p in candidates if _level_parses(level_texts[p.profile_id], layout)]
@@ -709,11 +803,33 @@ def _read_fields(
     resolved: dict[str, _Text] = {}
     pending: list[_Field] = []
 
+    # 批次 1：准备本布局全部字段的灰度 ROI（crop 子事件，§7.1）。
+    # 先单独裁完再判定，避免把 template_match 挂到 crop 区间下、破坏 parse_total 聚合。
+    with scanperf.timed(
+        "crop",
+        details={
+            "layout": layout,
+            "profile_id": profile.profile_id,
+            "roi_ids": [],
+            "rects": [],
+            "frame_size": [image.width(), image.height()],
+        },
+    ) as crop_span:
+        crop_ids: list[str] = []
+        crop_rects: list[list[int]] = []
+        for field in profile.fields:
+            if field.kind not in ("level", "substat_name", "substat_value"):
+                continue
+            grays[field.field_id] = _band_gray(image, field.rect)
+            crop_ids.append(field.field_id)
+            crop_rects.append(list(field.rect))
+        crop_span.set(roi_ids=crop_ids, rects=crop_rects)
+
+    # 批次 2：模板/识别判定；template_match / recognize_batch 直接挂在 parse_total 下。
     for field in profile.fields:
         if field.kind not in ("level", "substat_name", "substat_value"):
             continue
-        gray = _band_gray(image, field.rect)
-        grays[field.field_id] = gray
+        gray = grays[field.field_id]
         if field.kind == "level":
             text = _template_text(assets, profile, field, gray)
             if text is None:
@@ -732,7 +848,16 @@ def _read_fields(
         if not _gray_is_empty(gray):
             pending.append(field)
     if pending:
-        for field, text in zip(pending, _recognize_bands(image, [f.rect for f in pending])):
+        for field, text in zip(
+            pending,
+            _recognize_bands(
+                image,
+                [f.rect for f in pending],
+                roi_ids=[f.field_id for f in pending],
+                profile_id=profile.profile_id,
+                layout=layout,
+            ),
+        ):
             if text is not None:
                 resolved[field.field_id] = text
 

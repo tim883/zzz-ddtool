@@ -65,7 +65,7 @@ def serialized(disc: Disc | None) -> dict | None:
 def patch_recognition(monkeypatch, texts, *, default=None) -> None:
     """按 rect 指定识别文字（None = 没认出）。"""
 
-    def fake(_image, rects):
+    def fake(_image, rects, **_kwargs):
         return [texts.get(tuple(rect), default) for rect in rects]
 
     monkeypatch.setattr(discocr, "_recognize_bands", fake)
@@ -745,7 +745,7 @@ def test_engine_exception_propagates_instead_of_becoming_reject_reason(monkeypat
     """识别网络异常按 §6.1.1 原样传播；只有「字段批量识别」那一批会炸。"""
     modal_level = (1180, 190, 1310, 250)  # 布局判别阶段的另一个候选 ROI
 
-    def boom(_image, rects):
+    def boom(_image, rects, **_kwargs):
         if len(rects) == 1 and tuple(rects[0]) == modal_level:
             return [None]
         raise OcrError("识别网络挂了")

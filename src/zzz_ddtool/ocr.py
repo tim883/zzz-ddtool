@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 from PySide6.QtGui import QImage
 
+from zzz_ddtool import scanperf
 from zzz_ddtool.layout import (
     ACTION_ROW,
     ACTION_TEXT_LINE,
@@ -650,7 +651,14 @@ def read_action_state_fast(image: QImage) -> dict[str, bool | None]:
     left, top, right, bottom = scale_rect(*ACTION_TEXT_LINE, image.width(), image.height())
     crop = qimage_to_bgr(image.copy(left, top, right - left, bottom - top))
     with _WORD_BOX_LOCK:
-        result = _get_engine().text_rec(TextRecInput(img=[crop]))
+        # 性能记录：这一行是快路径实际送识别网络的一次识别（§7.1、§7.1.1）。
+        # 共用 R/T 整行只裁一次、只识别一次，因此 batch_size 固定为 1。
+        with scanperf.timed(
+            "recognize_batch",
+            details={"roi_ids": ["action_line"], "batch_size": 1, "profile_id": None},
+        ) as span:
+            result = _get_engine().text_rec(TextRecInput(img=[crop]))
+            span.set(batch_size=1)
     if result.txts is None or result.scores is None or len(result.txts) != 1 or len(result.scores) != 1:
         raise OcrError("标签行识别返回数量不正确")
     score = float(result.scores[0])
@@ -671,12 +679,27 @@ def read_action_state_fast(image: QImage) -> dict[str, bool | None]:
     return unknown
 
 
-def _parse_disc_legacy(image: QImage) -> Disc | None:
+def _parse_disc_legacy(image: QImage, *, reject_reason: str | None = None, profile_id: str | None = None) -> Disc | None:
     """旧整帧解析器：从驱动盘仓库页（右侧详情面板）截图解析出一个 Disc。
 
     §2.2 的 legacy：完整保存「启用盘面快路径前」的算法，不改动。
     失败返回 None，调用方应中断流程。
+
+    ``reject_reason`` / ``profile_id``：公开入口拒绝后调用时带上 §3.2 的原因与布局；
+    基准直接调用时都为 None（§7.1.1）。它们只用于性能记录的 ``legacy_parse`` 事件，
+    不参与解析。
     """
+    with scanperf.timed(
+        "legacy_parse",
+        details={"parser": "detail", "reject_reason": reject_reason, "profile_id": profile_id},
+    ) as span:
+        result = _parse_disc_legacy_impl(image)
+        if result is None:
+            span.set(outcome="returned_none")
+        return result
+
+
+def _parse_disc_legacy_impl(image: QImage) -> Disc | None:
     # 只有在等级标签成功匹配时才选择布局，避免把套装说明里的数字当等级。
     level, rarity = read_level_and_rarity(image, WAREHOUSE_DISC_LEVEL)
     area = WAREHOUSE_SUB_STATS
@@ -698,14 +721,27 @@ def _parse_disc_legacy(image: QImage) -> Disc | None:
     )
 
 
-def _parse_disc_upgrade_page_legacy(image: QImage) -> Disc | None:
+def _parse_disc_upgrade_page_legacy(
+    image: QImage, *, reject_reason: str | None = None, profile_id: str | None = None
+) -> Disc | None:
     """旧整帧解析器：从强化页截图解析 Disc（强化页副属性/等级坐标）。
 
     §2.2 的 legacy：完整保存「启用盘面快路径前」的算法，不改动。
     强化页没有 R/T 按钮，弃置在详情页做；这里只读等级+副属性供 decide 判断
     升级还是弃置。稀有度同理由等级上限推出，读不出就是 None（未知，不据此跳过）。
-    失败返回 None。
+    失败返回 None。``reject_reason`` / ``profile_id`` 同上，只用于 ``legacy_parse``。
     """
+    with scanperf.timed(
+        "legacy_parse",
+        details={"parser": "upgrade", "reject_reason": reject_reason, "profile_id": profile_id},
+    ) as span:
+        result = _parse_disc_upgrade_page_legacy_impl(image)
+        if result is None:
+            span.set(outcome="returned_none")
+        return result
+
+
+def _parse_disc_upgrade_page_legacy_impl(image: QImage) -> Disc | None:
     level, rarity = read_level_and_rarity(image, UPGRADE_LEVEL)
     if level is None:
         return None
@@ -730,13 +766,25 @@ def parse_disc(image: QImage) -> Disc | None:
     公开入口：先在**同一帧**上走快路径（`discocr.try_read_disc`），成功就直接返回
     它的 Disc；拒绝或异常以外的任何拒绝原因都回退到旧整帧解析器 `_parse_disc_legacy`。
     失败返回 None，调用方应中断流程。
+
+    性能：整段包一个 ``parse_total``（§7.1）；模板/批量识别/legacy 是它的子事件。
     """
     from zzz_ddtool import discocr
 
-    fast = discocr.try_read_disc(image, layout="detail")
-    if fast.disc is not None:
-        return fast.disc
-    return _parse_disc_legacy(image)
+    with scanperf.timed(
+        "parse_total",
+        details={"profile_id": None, "reject_reason": None, "template_hits": 0, "ocr_lines": 0},
+    ) as span:
+        fast = discocr.try_read_disc(image, layout="detail")
+        span.set(profile_id=fast.profile_id, reject_reason=fast.reject_reason)
+        if fast.disc is not None:
+            return fast.disc
+        result = _parse_disc_legacy(
+            image, reject_reason=fast.reject_reason, profile_id=fast.profile_id
+        )
+        if result is None:
+            span.set(outcome="returned_none")
+        return result
 
 
 def parse_disc_upgrade_page(image: QImage) -> Disc | None:
@@ -744,11 +792,21 @@ def parse_disc_upgrade_page(image: QImage) -> Disc | None:
 
     公开入口：先在同帧上走 `layout="upgrade"` 的快路径，拒绝则回退强化页 legacy。
     本入口**不调用** detail 入口（§3.2）；满级后回退详情解析由 Runner 的
-    `_parse_upgrade_page` 负责。失败返回 None。
+    `_parse_upgrade_page` 负责。失败返回 None。性能同 `parse_disc`。
     """
     from zzz_ddtool import discocr
 
-    fast = discocr.try_read_disc(image, layout="upgrade")
-    if fast.disc is not None:
-        return fast.disc
-    return _parse_disc_upgrade_page_legacy(image)
+    with scanperf.timed(
+        "parse_total",
+        details={"profile_id": None, "reject_reason": None, "template_hits": 0, "ocr_lines": 0},
+    ) as span:
+        fast = discocr.try_read_disc(image, layout="upgrade")
+        span.set(profile_id=fast.profile_id, reject_reason=fast.reject_reason)
+        if fast.disc is not None:
+            return fast.disc
+        result = _parse_disc_upgrade_page_legacy(
+            image, reject_reason=fast.reject_reason, profile_id=fast.profile_id
+        )
+        if result is None:
+            span.set(outcome="returned_none")
+        return result

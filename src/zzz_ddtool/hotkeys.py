@@ -38,6 +38,8 @@ class HotkeyController:
         self.stopped = False
         self._pressed: set[int] = set()
         self._lock = threading.Lock()
+        # 实际因暂停阻塞过的区间 (start, end) 单调时钟；供 scan-waits 标定扣除（Spec §6.1）。
+        self._pause_spans: list[tuple[float, float]] = []
         self._closed = threading.Event()
         self.log = get_logger("zzz_ddtool.hotkeys")
         self._thread = threading.Thread(target=self._loop, daemon=True, name="ddtool-hotkeys")
@@ -63,14 +65,51 @@ class HotkeyController:
             self._closed.wait(self.poll_interval)
 
     def checkpoint(self) -> int:
-        """安全检查点：暂停则阻塞，停止则抛 RunnerStopped。"""
-        while True:
-            with self._lock:
-                if self.stopped:
-                    raise RunnerStopped("F10 请求停止")
-                if not self.paused:
-                    return self.pause_generation
-            time.sleep(0.1)
+        """安全检查点：暂停则阻塞，停止则抛 RunnerStopped。
+
+        返回值（当前 pause_generation）、按键释放与停止传播都不变。额外记录**实际**
+        因 paused 阻塞的区间：第一次确实阻塞时记起点，恢复或抛停止时在 finally 记终点。
+        """
+        blocked_since: float | None = None
+        try:
+            while True:
+                with self._lock:
+                    if self.stopped:
+                        raise RunnerStopped("F10 请求停止")
+                    if not self.paused:
+                        return self.pause_generation
+                if blocked_since is None:
+                    blocked_since = time.monotonic()
+                time.sleep(0.1)
+        finally:
+            if blocked_since is not None:
+                ended = time.monotonic()
+                with self._lock:
+                    self._pause_spans.append((blocked_since, ended))
+
+    def pause_intervals(self, since: float, until: float) -> tuple[tuple[float, float], ...]:
+        """该单调时钟区间内实际暂停阻塞的起止元组（已裁剪、合并且按开始排序）。
+
+        只读查询在原控制锁下取快照；未启用/没有暂停返回空元组。只扣实际暂停阻塞，
+        不把整个 checkpoint 调用耗时或 pause_generation 次数当暂停（Spec §6.1）。
+        """
+        with self._lock:
+            raw = list(self._pause_spans)
+        clipped: list[tuple[float, float]] = []
+        for start, end in raw:
+            lo = max(float(start), float(since))
+            hi = min(float(end), float(until))
+            if hi > lo:
+                clipped.append((lo, hi))
+        clipped.sort(key=lambda span: span[0])
+        merged: list[tuple[float, float]] = []
+        for start, end in clipped:
+            if merged and start <= merged[-1][1]:
+                prev_start, prev_end = merged[-1]
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        return tuple(merged)
 
     def toggle_pause(self) -> bool:
         with self._lock:
