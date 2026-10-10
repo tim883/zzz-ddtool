@@ -118,3 +118,75 @@ def sim_clock(monkeypatch):
 def fake_controller(sim_clock):
     return FakeController(sim_clock)
 
+
+@pytest.fixture
+def sim_time(monkeypatch):
+    """把全局 ``time.monotonic``/``time.sleep`` 与 readiness 时钟统一替换成 SimClock。
+
+    §8 要求 sleep 必须真正推进模拟时钟；Runner 的 ``started_at`` 与 readiness 的
+    ``_now()`` 必须来自同一时钟，否则真实等待引擎对不上时间轴。只在显式请求时生效。
+    """
+    import time as _time
+
+    from zzz_ddtool import readiness
+
+    clock = SimClock()
+    monkeypatch.setattr(_time, "monotonic", clock.now)
+    monkeypatch.setattr(_time, "sleep", clock.sleep)
+    monkeypatch.setattr(readiness, "_now", clock.now)
+    monkeypatch.setattr(readiness, "_sleep", clock.sleep)
+    return clock
+
+
+@pytest.fixture
+def fast_wait(monkeypatch):
+    """把 Runner 的就绪等待替换成「单次采样」语义替身，保持离线遍历测试既有语义。
+
+    替身只取一帧、按错页/解析结果决定成功或抛 ReadinessTimeout，等价于启用快路径前的
+    「固定 sleep + 单次解析」路径；真实等待引擎的双帧/下限/暂停/返还由
+    ``test_readiness.py`` 与 ``test_runner_waits.py`` 用显式模拟时钟直接断言
+    （§8：不得把 ``_wait_ready`` 全部固定成成功）。这里只表语义，不当运行依赖。
+    """
+    from zzz_ddtool import readiness
+    from zzz_ddtool.runner import Runner
+
+    wrong = {"menu", "storage", "overworld"}
+
+    def _timeout(message="替身等待超时"):
+        return readiness.ReadinessTimeout(
+            message, last_sample=None, active_ms=0.0, samples=1, pause_generation=None
+        )
+
+    def fast_wait_ready(self, kind, *, started_at, before=None, before_frame=None,
+                        cell=None, expected_level=None, **kwargs):
+        if kind == "select_disc":
+            frame, page, *_ = self._grab(allow_esc=False)
+            if page in wrong:
+                raise _timeout(f"select_disc 替身超时：{page}")
+            disc = self._parse_disc(frame)
+            if disc is None:
+                raise _timeout("select_disc 替身超时：未读出盘面")
+            return readiness.WaitResult(
+                frame=frame, disc=disc, active_ms=0.0, samples=1, pause_generation=None
+            )
+        if kind == "upgrade_result":
+            frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
+            disc = self._parse_upgrade_page(frame)
+            if disc is None or (expected_level is not None and disc.level < expected_level):
+                raise _timeout("upgrade_result 替身超时")
+            return readiness.WaitResult(
+                frame=frame, disc=disc, active_ms=0.0, samples=1, pause_generation=None
+            )
+        frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
+        return readiness.WaitResult(
+            frame=frame, disc=None, active_ms=0.0, samples=1, pause_generation=None
+        )
+
+    monkeypatch.setattr(Runner, "_wait_ready", fast_wait_ready)
+    monkeypatch.setattr(
+        Runner, "_wait_policy", lambda self, kind: readiness.WaitPolicy(0, 1000, 50, 2)
+    )
+    # 返回层级替身默认「已在仓库」，使离线 _esc_back_to_grid 不按 Esc 直接返回。
+    monkeypatch.setattr(Runner, "_return_layer", lambda self, image: "warehouse")
+    return fast_wait_ready
+

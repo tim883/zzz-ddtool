@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QImage
 
+from zzz_ddtool import readiness, scanperf
 from zzz_ddtool.capture import CaptureError, find_game_hwnd, grab_game_image, save_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
@@ -30,8 +31,10 @@ from zzz_ddtool.layout import (
     GRID_COLS,
     GRID_ROWS,
     LABEL_SCAN_AREA,
+    UPGRADE_LEVEL_BAR,
     UPGRADE_MATERIAL_SLOTS,
     scale_point,
+    scale_rect,
 )
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc, next_stage_level
@@ -53,7 +56,15 @@ from zzz_ddtool.navigation import (
 )
 from zzz_ddtool.ocr import OcrError, parse_disc, read_action_state_fast
 from zzz_ddtool.paths import stats_dir
-from zzz_ddtool.screen import DRIVE_DISC, is_page
+from zzz_ddtool.readiness import (
+    DEFAULT_FLOOR_MS,
+    MATERIAL_REFUND,
+    ReadinessInterrupted,
+    ReadinessTimeout,
+    WaitResult,
+    load_wait_policies,
+)
+from zzz_ddtool.screen import DRIVE_DISC, classify_image, is_disc_modal, is_disc_preview, is_page
 from zzz_ddtool.stats import (
     OUTCOME_DISCARDED,
     OUTCOME_FAILED,
@@ -96,6 +107,22 @@ _FORWARD_ROWS = 2
 # 恢复批量滚动后的兜底稳定等待；标定给出 settle_wait_ms 时优先用它
 _SETTLE_FALLBACK_MS = 500
 
+# ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
+# 经验/预计等级条 ROI 的平均绝对灰度差：变化阈值必须大于稳定阈值。
+# 真实帧对的候选值核对留步骤 7（被动复用真实添加前后帧），未触发则记未覆盖。
+_MATERIAL_BAR_CHANGE_THRESHOLD = 6.0
+_MATERIAL_BAR_STABLE_THRESHOLD = 2.0
+_MATERIAL_BAR_QUANT = 4
+
+
+def _jsonable_key(key):
+    """§7.1.1：state_key 的嵌套 tuple 按数组保存原值，不只存不可复算的 hash。"""
+    if isinstance(key, (tuple, list)):
+        return [_jsonable_key(item) for item in key]
+    if isinstance(key, dict):
+        return {str(name): _jsonable_key(value) for name, value in key.items()}
+    return key
+
 # 装备判据暂不启用：判据缺独立答案卷、识别不准（2026-10-05 用户确认，后续要恢复）。
 # 恢复方法：本常量改回 True 即可；tile_has_portrait、YAML 的 skip_equipped 字段、界面控件
 # 与扫描分支全部原样保留，无需其他改动。
@@ -111,6 +138,24 @@ class _LabelContext:
 
 class RunnerError(RuntimeError):
     pass
+
+
+class MaterialShortfall(RunnerError):
+    """升级素材不足：本档实际升级后未达到下一档期望等级（Spec §6.2 upgrade_result）。
+
+    ``from_level`` 为本档实际升级前 ``before.level``；``expected_level`` 为发升级前冻结的
+    ``next_stage_level(before.level)``；``actual_level`` 为有限确认末次可读的真实低等级。
+    不能取素材添加后的预计等级，也不能从中文报错文本反推属性。
+    """
+
+    def __init__(self, from_level: int, expected_level: int, actual_level: int) -> None:
+        self.from_level = from_level
+        self.expected_level = expected_level
+        self.actual_level = actual_level
+        super().__init__(
+            f"升级素材不足：从 {from_level} 级升级后期望到 {expected_level} 级，"
+            f"实际只有 {actual_level} 级，停止任务链"
+        )
 
 
 @dataclass(frozen=True)
@@ -184,7 +229,30 @@ class Runner:
         self.on_status = on_status
         self.outcome = "idle"
         self.end_reason = ""
+        #: Spec §7.1 run_total：completed/user_stopped/error（未进入 Runner 时不产生根事件）。
+        self.termination_kind = ""
         self._detail_disc = None
+        # ---- 就绪等待基础（§6.1、§6.2）----
+        #: 本任务绑定的环境身份（供等待档案匹配），由 _ensure_profile 填入。
+        self._env = None
+        #: 已加载的等待策略缓存（每次 run 重建）。
+        self._wait_policies: dict | None = None
+        #: 生产等待共用的控制回调：暂停区间查询（未启用控制器返回空元组）。
+        self._pause_intervals_fn = None
+        #: 各动作的真实输入时刻（§6.1：紧接 click_client/press_key_once 正常返回后记录）。
+        self._material_started_at: float | None = None
+        self._upgrade_started_at: float | None = None
+        self._refund_started_at: float | None = None
+        #: 本档「材料返还确认」输入的事件 ID（第二次 upgrade_result 的 trigger_input_id）。
+        self._refund_input_id: str | None = None
+        #: 本盘 disc_total 的事件 ID（_process_cell 建立，等待事件挂它下面）。
+        self._disc_event_id: str | None = None
+        #: 本档「发升级」输入的事件 ID（upgrade_result 等待的 upgrade_input_id）。
+        self._upgrade_input_id: str | None = None
+        #: 最近一次 _wait_ready 产生的 wait_total 事件 ID（供 §6.2.1 第二次等待引用）。
+        self._last_wait_id: str | None = None
+        #: 当前正在计时的 disc_total 区间句柄（供内部方法补 input_sent/result）。
+        self._disc_span = None
         # 本任务绑定实例与实测布局
         self._hwnd: int | None = None
         self._pid: int | None = None
@@ -304,6 +372,553 @@ class Runner:
             page = classify_image(image)
         return image, page, method, hwnd
 
+    # ---------------------------------------------------------------- 就绪等待基础（§6）
+
+    #: §6.2 return_warehouse 每次 Esc 允许的更浅层进展（三条边）。
+    RETURN_EDGES: frozenset = frozenset(
+        {("modal", "preview"), ("modal", "warehouse"), ("preview", "warehouse")}
+    )
+
+    def _pause_intervals(self, since: float, until: float) -> tuple[tuple[float, float], ...]:
+        """§6.1 pauses 回调：未启用控制器时返回空元组。"""
+        if self.hotkeys is None:
+            return ()
+        return self.hotkeys.pause_intervals(since, until)
+
+    def _environment_mapping(self) -> dict | None:
+        """§6.4 环境身份以普通映射传给 readiness（守 §2.2 依赖方向）。"""
+        env = self._env
+        if env is None:
+            return None
+        return {
+            "machine_id": env.machine_id,
+            "client_width": env.client_width,
+            "client_height": env.client_height,
+            "window_dpi": env.window_dpi,
+            "game_exe_path": env.game_exe_path,
+            "game_build": env.game_build,
+        }
+
+    def _wait_policy(self, kind: str):
+        """读取当前环境适用的等待策略；档案不适用时用默认（§6.2、§6.4）。"""
+        if self._wait_policies is None:
+            self._wait_policies = load_wait_policies(self._environment_mapping())
+        return self._wait_policies.get(kind) or readiness.default_policy(kind)
+
+    # ---------------------------------------------------------------- 层级与返还（§6.2）
+
+    def _return_layer(self, image) -> str:
+        """§6.2 return_warehouse 的纯读取层级适配，复用现有 screen 判据。
+
+        只接受 modal / preview / warehouse / unknown：错页（menu/storage/overworld）
+        沿用原失败路径抛 RunnerError；有 ``is_disc_modal`` 的关闭 X → modal；
+        无 X 且严格命中 ``DRIVE_DISC`` → warehouse；前两者均不满足且 ``is_disc_preview``
+        命中 → preview；其他 → unknown。不用任意像素变化认层。
+        """
+        page = classify_image(image)
+        if page in {"menu", "storage", "overworld"}:
+            raise RunnerError(f"返回层级时停在{trace_page(page)}，停止任务链")
+        if is_disc_modal(image):
+            return "modal"
+        if is_page(image, DRIVE_DISC):
+            return "warehouse"
+        if is_disc_preview(image):
+            return "preview"
+        return "unknown"
+
+    def _find_material_refund(self, image):
+        """§6.2.1：只读传入帧找「材料返还」确认行；不截图、不输入。
+
+        去空格后至少一行含 ``MATERIAL_REFUND_TITLE``，且按 OCR 原顺序找到第一行含
+        「确认」的文字才返回该行；任一条件缺失返回 None。``OcrError`` 原样传播。
+        """
+        from zzz_ddtool import ocr as _ocr
+
+        lines = _ocr.read_rect(image, (0, 0, image.width(), image.height()))
+        title = self.MATERIAL_REFUND_TITLE
+        if not any(title in line.text.replace(" ", "") for line in lines):
+            return None
+        for line in lines:
+            if "确认" in line.text.replace(" ", ""):
+                return line
+        return None
+
+    # ---------------------------------------------------------------- 证据与判据工具
+
+    @staticmethod
+    def _core_of(disc: Disc | None):
+        """§7.1.1 evidence.core：词条按名称排序，未读取为 null。"""
+        if disc is None:
+            return None
+        return {
+            "level": disc.level,
+            "rarity": disc.rarity,
+            "substats": [
+                {"name": substat.name, "rolls": substat.rolls}
+                for substat in sorted(disc.substats, key=lambda s: s.name)
+            ],
+        }
+
+    @staticmethod
+    def _core_key(disc: Disc | None):
+        """对象核心盘面 key：等级、稀有度及按名称排序的 (name, rolls)。"""
+        if disc is None:
+            return None
+        return (
+            disc.level,
+            disc.rarity,
+            tuple(sorted((s.name, s.rolls) for s in disc.substats)),
+        )
+
+    @staticmethod
+    def _evidence(*, core=None, return_layer=None, label_state=None,
+                  target_selected=None, refund=None, **extra):
+        evidence = {
+            "core": core,
+            "return_layer": return_layer,
+            "label_state": label_state,
+            "target_selected": target_selected,
+            "refund": refund,
+        }
+        evidence.update(extra)
+        return evidence
+
+    def _tile_selected_for_cell(self, image, cell: GridCell):
+        """§6.2：目标格位的选中证据；客户区像素换成 1920×1080 设计坐标再判。"""
+        from zzz_ddtool.equipped import tile_is_selected
+
+        width, height = image.width(), image.height()
+        if width <= 0 or height <= 0:
+            return None
+        design_x = round(cell.center_x * 1920 / width)
+        design_y = round(cell.center_y * 1080 / height)
+        return tile_is_selected(image, design_x, design_y)
+
+    def _has_stage_add(self, image) -> bool:
+        from zzz_ddtool.ocr import read_rect
+
+        return any("阶段添加" in ln.text.replace(" ", "") for ln in read_rect(image, self.STAGE_ADD_AREA))
+
+    def _has_upgrade_button(self, image) -> bool:
+        from zzz_ddtool.ocr import read_rect
+
+        return any("升级" in ln.text.replace(" ", "") for ln in read_rect(image, self.UPGRADE_CONFIRM_AREA))
+
+    def _zoom_level_of(self, image):
+        """缩放/满级展示页的「等级xx」行；读不到返回 None。"""
+        from zzz_ddtool.ocr import read_rect
+
+        for line in read_rect(image, self.ZOOM_LEVEL_AREA):
+            if "等级" in line.text.replace(" ", ""):
+                return line
+        return None
+
+    @staticmethod
+    def _level_of_line(line) -> int | None:
+        if line is None:
+            return None
+        match = re.search(r"等级(\d+)", line.text.replace(" ", ""))
+        return int(match.group(1)) if match else None
+
+    def _material_bar_crop(self, image):
+        """§6.2 material_ready：经验/预计等级条的灰度数组（各帧同一 ROI/归一化）。"""
+        import numpy as np
+
+        from zzz_ddtool.ocr import qimage_to_bgr
+
+        if image is None or image.isNull():
+            return None
+        left, top, right, bottom = scale_rect(
+            *UPGRADE_LEVEL_BAR, image.width(), image.height()
+        )
+        if right <= left or bottom <= top:
+            return None
+        crop = image.copy(left, top, right - left, bottom - top)
+        bgr = qimage_to_bgr(crop)
+        if bgr.ndim == 3:
+            bgr = bgr.mean(axis=2)
+        return np.asarray(bgr, dtype="float32")
+
+    @staticmethod
+    def _mean_abs_diff(a, b) -> float | None:
+        import numpy as np
+
+        if a is None or b is None or a.shape != b.shape:
+            return None
+        return float(np.abs(a - b).mean())
+
+    @staticmethod
+    def _material_bar_key(crop):
+        """候选像素状态的粗量化 key（可 JSON 化，非物品 ID）。"""
+        import numpy as np
+
+        if crop is None:
+            return None
+        cells: list[float] = []
+        for band in np.array_split(crop, 4, axis=0):
+            for block in np.array_split(band, 4, axis=1):
+                cells.append(float(block.mean()))
+        return tuple(int(round(value / _MATERIAL_BAR_QUANT)) for value in cells)
+
+    # ---------------------------------------------------------------- probe 工厂（§6.1、§6.2）
+
+    def _make_ready_probe(
+        self, kind: str, *, before: Disc | None = None, before_frame=None,
+        cell: GridCell | None = None, expected_level: int | None = None,
+    ):
+        """§6.1/§6.2：生产与标定唯一共用的纯读取 probe 构造入口。
+
+        非法 kind / 缺必填项在构造时即抛 ValueError（第一次 probe 之前）；返回值是
+        一个闭包，只取绑定窗口新帧并判定，不发送任何输入。每个动作建立新的局部采样
+        状态，不跨动作复用。异常原样向上传播（§6.1.1）。
+        """
+        readiness.validate_probe_params(
+            kind,
+            {
+                "cell": cell,
+                "before": before,
+                "before_frame": before_frame,
+                "expected_level": expected_level,
+            },
+        )
+        if kind == "select_disc":
+            return self._probe_select_disc(cell)
+        if kind == "open_preview":
+            return self._probe_open_preview(before)
+        if kind == "open_upgrade":
+            return self._probe_open_upgrade(before)
+        if kind == "material_ready":
+            return self._probe_material_ready(before, before_frame)
+        if kind == "upgrade_result":
+            return self._probe_upgrade_result(before, expected_level)
+        return self._probe_return_warehouse(before_frame)
+
+    def _probe_select_disc(self, cell: GridCell):
+        def probe() -> readiness.WaitSample:
+            frame, page, _method, _hwnd = self._grab(allow_esc=False)
+            captured = time.monotonic()
+            if page in {"menu", "storage", "overworld"}:
+                return readiness.WaitSample(
+                    frame=frame,
+                    captured_at=captured,
+                    ready=False,
+                    state_key=("select_disc", page, "wrong_page"),
+                    evidence=self._evidence(return_layer=page),
+                )
+            selected = self._tile_selected_for_cell(frame, cell)
+            disc = None
+            if page == DRIVE_DISC or is_disc_modal(frame):
+                disc = parse_disc(frame)
+            ready = bool(selected is True and disc is not None)
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=ready,
+                state_key=("select_disc", page, cell.global_index, selected, self._core_key(disc)),
+                evidence=self._evidence(
+                    core=self._core_of(disc), return_layer=page, target_selected=selected
+                ),
+                disc=disc if ready else None,
+            )
+
+        return probe
+
+    def _probe_open_preview(self, before: Disc):
+        def probe() -> readiness.WaitSample:
+            frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
+            captured = time.monotonic()
+            layer = self._return_layer(frame)
+            level_line = self._zoom_level_of(frame)
+            level = self._level_of_line(level_line)
+            ready = bool(layer == "preview" and level is not None and level == before.level)
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=ready,
+                state_key=("open_preview", layer, before.level, level),
+                evidence=self._evidence(
+                    return_layer=layer,
+                    level_text=(level_line.text if level_line is not None else None),
+                    before_core=self._core_of(before),
+                ),
+            )
+
+        return probe
+
+    def _probe_open_upgrade(self, before: Disc):
+        def probe() -> readiness.WaitSample:
+            frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
+            captured = time.monotonic()
+            has_add = self._has_stage_add(frame)
+            disc = self._parse_upgrade_page(frame) if has_add else None
+            ready = bool(
+                has_add
+                and disc is not None
+                and disc.level == before.level
+                and self._core_key(disc) == self._core_key(before)
+            )
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=ready,
+                state_key=("open_upgrade", has_add, self._core_key(disc)),
+                evidence=self._evidence(
+                    core=self._core_of(disc),
+                    return_layer="upgrade" if has_add else "unknown",
+                    stage_add=has_add,
+                    before_core=self._core_of(before),
+                ),
+                disc=disc if ready else None,
+            )
+
+        return probe
+
+    def _probe_material_ready(self, before: Disc, before_frame):
+        baseline = self._material_bar_crop(before_frame)
+        state: dict = {"candidate": None}
+
+        def probe() -> readiness.WaitSample:
+            frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
+            captured = time.monotonic()
+            has_add = self._has_stage_add(frame)
+            has_upgrade = self._has_upgrade_button(frame)
+            crop = self._material_bar_crop(frame)
+            delta = self._mean_abs_diff(baseline, crop)
+            changed = delta is not None and delta >= _MATERIAL_BAR_CHANGE_THRESHOLD
+            if not changed:
+                state["candidate"] = None
+            else:
+                candidate = state["candidate"]
+                if candidate is None:
+                    state["candidate"] = crop
+                elif (diff := self._mean_abs_diff(candidate, crop)) is not None and (
+                    diff > _MATERIAL_BAR_STABLE_THRESHOLD
+                ):
+                    state["candidate"] = crop
+            key = None if state["candidate"] is None else self._material_bar_key(state["candidate"])
+            ready = bool(has_add and has_upgrade and key is not None)
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=ready,
+                state_key=("material_ready", has_add, has_upgrade, key),
+                evidence=self._evidence(
+                    return_layer="upgrade" if has_add else "unknown",
+                    delta=delta,
+                    changed=changed,
+                    before_core=self._core_of(before),
+                ),
+            )
+
+        return probe
+
+    def _probe_upgrade_result(self, before: Disc, expected_level: int):
+        def probe() -> readiness.WaitSample:
+            frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
+            captured = time.monotonic()
+            disc = self._parse_upgrade_page(frame)
+            if disc is not None:
+                ready = disc.level >= expected_level
+                return readiness.WaitSample(
+                    frame=frame,
+                    captured_at=captured,
+                    ready=ready,
+                    state_key=("upgrade_result", self._core_key(disc)),
+                    evidence=self._evidence(
+                        core=self._core_of(disc),
+                        return_layer="upgrade",
+                        expected_level=expected_level,
+                    ),
+                    disc=disc if ready else None,
+                )
+            # 只有本帧读不到盘面才做全窗口返还 OCR（§6.2.1）。
+            refund = self._find_material_refund(frame)
+            if refund is not None:
+                text = refund.text.replace(" ", "")
+                rect = [int(refund.left), int(refund.top), int(refund.right), int(refund.bottom)]
+                return readiness.WaitSample(
+                    frame=frame,
+                    captured_at=captured,
+                    ready=False,
+                    state_key=("upgrade_result", "refund", self.MATERIAL_REFUND_TITLE, text, tuple(rect)),
+                    evidence=self._evidence(refund={"text": text, "rect": rect}),
+                    interrupt_reason=MATERIAL_REFUND,
+                )
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=False,
+                state_key=("upgrade_result", "unreadable"),
+                evidence=self._evidence(),
+            )
+
+        return probe
+
+    def _probe_return_warehouse(self, before_frame):
+        state: dict = {"before_layer": None}
+
+        def probe() -> readiness.WaitSample:
+            if state["before_layer"] is None:
+                state["before_layer"] = self._return_layer(before_frame)
+            frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
+            captured = time.monotonic()
+            layer = self._return_layer(frame)
+            allowed = (state["before_layer"], layer) in self.RETURN_EDGES
+            ready = bool(allowed and layer in ("preview", "warehouse"))
+            return readiness.WaitSample(
+                frame=frame,
+                captured_at=captured,
+                ready=ready,
+                state_key=("return_warehouse", state["before_layer"], layer),
+                evidence=self._evidence(
+                    return_layer=layer,
+                    before_layer=state["before_layer"],
+                    allowed_edge=allowed,
+                ),
+            )
+
+        return probe
+
+    # ---------------------------------------------------------------- 等待包装（§6.1、§7.1.1）
+
+    def _wait_ready(
+        self, kind: str, *, started_at: float, before: Disc | None = None,
+        before_frame=None, cell: GridCell | None = None, expected_level: int | None = None,
+        trigger_input_id: str | None = None, resume_from_wait_id: str | None = None,
+    ) -> WaitResult:
+        """§6.1：构造 probe → 读当前环境策略 → 交给 wait_ready；包装 wait_total/probe 事件。
+
+        超时/中断原样抛出（ReadinessTimeout / ReadinessInterrupted），其他异常原样传播；
+        无活动性能会话时只做等待、不写事件、不改变返回值。``trigger_input_id``/
+        ``resume_from_wait_id`` 供 §6.2.1 的第二次结果等待关联首个等待与确认输入。
+        """
+        probe = self._make_ready_probe(
+            kind, before=before, before_frame=before_frame, cell=cell,
+            expected_level=expected_level,
+        )
+        policy = self._wait_policy(kind)
+        session = scanperf.current_session()
+        if session is None:
+            self._last_wait_id = None
+            return readiness.wait_ready(
+                kind=kind, policy=policy, started_at=started_at, probe=probe,
+                checkpoint=self._checkpoint, pauses=self._pause_intervals,
+            )
+
+        wait_id = session.new_event_id()
+        self._last_wait_id = wait_id
+        samples: list[dict] = []
+        counter: dict = {"n": 0, "gen": None}
+
+        def checkpoint() -> int | None:
+            gen = self._checkpoint()
+            counter["gen"] = gen
+            return gen
+
+        def wrapped_probe() -> "readiness.WaitSample":
+            index = counter["n"]
+            counter["n"] += 1
+            details = {
+                "purpose": f"wait:{kind}",
+                "wait_id": wait_id,
+                "sample_id": None,
+                "sample_index": index,
+                "kind": kind,
+                "captured_at": None,
+                "probe_ended_at": None,
+                "ready": None,
+                "state_key": None,
+                "pause_generation": counter["gen"],
+                "interrupt_reason": None,
+                "evidence": None,
+            }
+            with scanperf.timed("probe", parent_id=wait_id, details=details) as span:
+                sample = probe()
+                ended = time.monotonic()
+                span.set(
+                    captured_at=sample.captured_at,
+                    probe_ended_at=ended,
+                    ready=bool(sample.ready),
+                    state_key=_jsonable_key(sample.state_key),
+                    pause_generation=counter["gen"],
+                    interrupt_reason=sample.interrupt_reason,
+                    evidence=sample.evidence,
+                )
+                samples.append(
+                    {
+                        "probe_event_id": span.event_id,
+                        "sample_index": index,
+                        "captured_at": sample.captured_at,
+                        "probe_ended_at": ended,
+                        "ready": bool(sample.ready),
+                        "state_key": _jsonable_key(sample.state_key),
+                        "pause_generation": counter["gen"],
+                        "interrupt_reason": sample.interrupt_reason,
+                        "evidence": sample.evidence,
+                    }
+                )
+            return sample
+
+        error: BaseException | None = None
+        try:
+            return readiness.wait_ready(
+                kind=kind, policy=policy, started_at=started_at, probe=wrapped_probe,
+                checkpoint=checkpoint, pauses=self._pause_intervals,
+            )
+        except BaseException as exc:  # noqa: BLE001 - 原样传播，仅用于记事件
+            error = exc
+            raise
+        finally:
+            ended = time.monotonic()
+            intervals = self._pause_intervals(started_at, ended)
+            paused = sum(float(b) - float(a) for a, b in intervals)
+            active_ms = max(0.0, (ended - started_at) - paused) * 1000.0
+            outcome = "succeeded"
+            interrupt_reason = None
+            if isinstance(error, ReadinessInterrupted):
+                outcome, interrupt_reason = "interrupted", error.reason
+            elif isinstance(error, ReadinessTimeout):
+                outcome = "timed_out"
+            elif isinstance(error, RunnerStopped):
+                outcome = "stopped"
+            elif error is not None:
+                outcome = "failed"
+            details = {
+                "kind": kind,
+                "started_at": started_at,
+                "ended_at": ended,
+                "active_ms": active_ms,
+                "pause_intervals": [
+                    {"start": float(a), "end": float(b)} for a, b in intervals
+                ],
+                "samples": samples,
+                "t_bad": None,
+                "t_ready": None,
+                "t_stable": None,
+                "outcome": outcome,
+                "trigger_input_id": trigger_input_id,
+                "upgrade_input_id": self._upgrade_input_id if kind == "upgrade_result" else None,
+                "resume_from_wait_id": resume_from_wait_id,
+                "interrupt_reason": interrupt_reason,
+            }
+            if error is not None:
+                details["exception"] = {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                }
+            try:
+                session.record(
+                    scanperf.PerfEvent(
+                        component="wait_total",
+                        duration_ms=(ended - started_at) * 1000.0,
+                        details=details,
+                        event_id=wait_id,
+                        parent_id=self._disc_event_id,
+                    )
+                )
+            except Exception:
+                self.log.warning("wait_total 事件写入失败", exc_info=True)
+
     # ---------------------------------------------------------------- 任务与预设
 
     def _default_job(self) -> TaskJob:
@@ -358,15 +973,55 @@ class Runner:
         )
 
     def run(self) -> list[RunResult]:
-        """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。"""
-        # 导航、标定、筛选与强化共享此任务的控制器。只在一次完整输入前检查，
-        # 不在 mouse/key down 与 up 之间抛出停止，避免留下按住的键。
-        with controlled_inputs(self._checkpoint):
-            return self._run()
+        """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。
+
+        §7.1：run_total 在入口建会话后即开始，早于 ``_run`` 的 max_pages 校验及主
+        try/finally，覆盖任务准备与所有真实退出；零盘退出仍产生且只产生一个根事件。
+        """
+        import uuid
+
+        # §9.2：入口清空终止类型，避免上一轮的 completed/user_stopped 残留到本轮，
+        # 尤其是 _run 在主 try/finally 之前直接返回 [] 的分支。
+        self.termination_kind = ""
+        tag = getattr(self.trace, "tag", None)
+        if not isinstance(tag, str) or not tag:
+            tag = "run"
+        run_id = f"{tag}-{uuid.uuid4().hex}"
+        capture_dir = getattr(self.trace, "dir", None)
+        stats_target = stats_dir() / f"{tag}.json"
+        scanperf.begin_session(
+            tag,
+            run_id=run_id,
+            capture_dir=(str(capture_dir) if capture_dir is not None else None),
+            stats_path=str(stats_target),
+        )
+        run_started = time.monotonic()
+        try:
+            # 导航、标定、筛选与强化共享此任务的控制器。只在一次完整输入前检查，
+            # 不在 mouse/key down 与 up 之间抛出停止，避免留下按住的键。
+            with controlled_inputs(self._checkpoint):
+                return self._run()
+        finally:
+            ended = time.monotonic()
+            scanperf.record_event(
+                scanperf.PerfEvent(
+                    component="run_total",
+                    duration_ms=max(0.0, (ended - run_started) * 1000.0),
+                    details={
+                        "runner_outcome": self.outcome,
+                        "termination_kind": self.termination_kind or "error",
+                        "end_reason": self.end_reason,
+                        "capture_dir": (str(capture_dir) if capture_dir is not None else None),
+                        "stats_path": str(stats_target),
+                    },
+                )
+            )
+            scanperf.end_session()
 
     def _run(self) -> list[RunResult]:
         if not self._valid_max_pages():
             self.outcome = "failed"
+            self.termination_kind = "error"
             self.end_reason = f"max_pages 非法：{self.preset.max_pages!r}，未发送任何游戏输入"
             self.log.error(self.end_reason)
             return []
@@ -382,6 +1037,10 @@ class Runner:
         self._last_empties = set()
         self._last_unclear = {}
         self._last_count = None
+        # 每轮重新读取本机等待档案（环境未变时结果一致；换机/换档案则自然失效）。
+        self._wait_policies = None
+        self._disc_event_id = None
+        self._upgrade_input_id = None
         self.outcome = "running"
         self.end_reason = ""
         # spec §3.6：每次 _run 新建会话，本次 _run 的多个 _run_job 共享该实例。
@@ -429,15 +1088,25 @@ class Runner:
                         self._processed - self._job_started_at,
                     )
             self.outcome = "completed"
+            self.termination_kind = "completed"
             self.end_reason = f"已处理 {self._processed} 个盘"
             if skipped_jobs:
                 self.end_reason += f"；跳过 {skipped_jobs} 个未生成任务"
         except RunnerStopped:
             self.outcome = "stopped"
+            self.termination_kind = "user_stopped"
             self.end_reason = f"用户停止，已处理 {self._processed} 个盘"
             self.trace.ok("unknown", "run", self.end_reason)
+        except MaterialShortfall as exc:
+            # §9.2：素材不足有独立终止类型，靠类型而非中文消息判定。
+            self.outcome = "failed"
+            self.termination_kind = "material_shortfall"
+            self.end_reason = str(exc)
+            self.log.warning("run material_shortfall: %s", exc)
+            self.trace.fail("unknown", "run", self.end_reason)
         except Exception as exc:
             self.outcome = "failed"
+            self.termination_kind = "error"
             self.end_reason = str(exc)
             self.log.exception("run failed")
             self.trace.fail("unknown", "run", self.end_reason)
@@ -759,6 +1428,7 @@ class Runner:
         reset_game_filter(hwnd, image.width(), image.height())
         self.trace.ok("drive_disc", "filter", "标定前重置筛选")
         env = probe_environment(hwnd)
+        self._env = env
         # 不在这里置顶：calibrate 内部每个候选都会自己 reset_to_top，而 measure_layout
         # 只看网格几何、与列表滚到哪无关。
         image, _method, _hwnd = grab_game_image(hwnd)
@@ -1186,32 +1856,61 @@ class Runner:
         accepted_ids,
         up_counts: dict,
     ) -> str:
+        """§7.1 disc_total：包住单盘的入口到全部动作/复核/统计/恢复收尾，异常也走 finally。
+
+        从函数入口、任何 Trace/检查点/点击前开始，不从 click_client 内部起算，也不
+        沿用现有 ``discs[].seconds``。无活动会话时只跑内层，不改变返回值/异常。
+        """
+        session = scanperf.current_session()
+        if session is None:
+            return self._process_cell_inner(
+                hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
+            )
+        details = {"input_sent": False, "result": None}
+        previous = self._disc_event_id
+        with scanperf.timed("disc_total", details=details, disc_index=cell.global_index) as span:
+            self._disc_span = span
+            self._disc_event_id = span.event_id
+            try:
+                result = self._process_cell_inner(
+                    hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
+                )
+                span.set(result=result)
+                return result
+            finally:
+                self._disc_span = None
+                self._disc_event_id = previous
+
+    def _process_cell_inner(
+        self,
+        hwnd: int,
+        job: TaskJob,
+        state: TraversalState,
+        cell: GridCell,
+        sub_preset: Preset,
+        accepted_ids,
+        up_counts: dict,
+    ) -> str:
         """处理一个格位。返回 done / rescan / upgrade。"""
         row, col = cell.display()
         cell_tag = self._cell_tag(cell)
         where = f"全局第{row}行第{col}列（序号 {cell.global_index}）"
         self.trace.new_disc()
         click_client(hwnd, cell.center_x, cell.center_y)
-        time.sleep(0.5)
-        detail_image, page, *_ = self._grab(allow_esc=False)
-        if page in {"menu", "storage", "overworld"}:
-            self.log.warning("cell %s 点开了 %s，先按 Esc 退回", cell_tag, page)
-            self.trace.warn(
-                page, "click_cell", f"{where} 点开了 {trace_page(page)}，先按 Esc 退回", image=detail_image
-            )
-            press_key(hwnd, VK_ESCAPE)
-            time.sleep(0.6)
-            back_image, page2, *_ = self._grab(allow_esc=False)
-            if page2 == "drive_disc":
-                self.log.info("recovered to drive_disc, rescan batch")
-                self.trace.note("已退回驱动盘仓库，重扫本批")
+        # §6.1：紧接 click_client 正常返回记录 select_disc 的 started_at，早于随后日志/截图。
+        select_started = time.monotonic()
+        if self._disc_span is not None:
+            self._disc_span.set(input_sent=True)
+        try:
+            selection = self._wait_ready("select_disc", started_at=select_started, cell=cell)
+        except ReadinessTimeout as timeout_exc:
+            # §6.3：超时后补拍一张新帧，只有仍是已知错页才走原一次 Esc 恢复。
+            if self._select_timeout_recheck(hwnd, timeout_exc, where, cell_tag, cell) == "rescan":
                 return "rescan"
-            self.log.error("recover failed (page=%s), stop job", page2)
-            self.trace.fail(page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工", image=back_image)
-            raise RunnerError(f"退回失败：{page2}，停止任务链")
-
+            raise RunnerError(f"{cell_tag} 选择超时：{timeout_exc}，停止任务链")
+        detail_image = selection.frame
         self.trace.ok("detail", "click_cell", where, image=detail_image)
-        disc = self._parse_disc(detail_image)
+        disc = selection.disc
         if disc is None:
             self.trace.fail("detail", "parse", f"{where} 没读出盘面，停止任务链", image=detail_image)
             raise RunnerError(f"{cell_tag} 盘面识别失败")
@@ -1252,7 +1951,6 @@ class Runner:
                     f"{where} 已升 {up_counts.get(cell.global_index, 0)} 次，到上限不再升",
                 )
                 self._record(job, disc, decision)
-                time.sleep(0.3)
                 img = ""
                 if disc.level >= MAX_LEVEL:
                     img = self._kept_image_path(disc_slot)
@@ -1263,7 +1961,7 @@ class Runner:
             # 进强化页前保存恢复点（spec §6.3.1）；连续升阶途中沿用同一恢复点，
             # 强化后的焦点不覆盖它。
             state.begin_upgrade(cell.global_index)
-            if self._enter_upgrade_page(hwnd):
+            if self._enter_upgrade_page(hwnd, before=disc):
                 self._verified_upgrade_level = self._upgrade_loop(
                     hwnd,
                     job,
@@ -1303,8 +2001,55 @@ class Runner:
         self.stats.disc_end(
             disc_slot, outcome_for_action(decision.action.value), disc.level, decision.score
         )
-        time.sleep(0.3)
         return "done"
+
+    def _select_timeout_recheck(self, hwnd: int, timeout_exc, where: str, cell_tag: str, cell) -> str | None:
+        """§6.3：select_disc 超时后补拍一张新帧，只有仍是已知错页才走原一次 Esc 恢复。
+
+        补拍前后都 checkpoint 并取当前绑定窗口新帧；新帧已是正确页面/未知/对象证据不足
+        一律以选择超时停止（返回 None），不追加 Esc、不推进正常动作。仅当新帧仍明确为
+        menu/storage/overworld 时才按一次 Esc 并等 0.6 秒，再严格认 drive_disc 决定重扫或失败。
+        补拍/判页作为 disc_total 下的 probe 记录（purpose=select_timeout_recheck）。
+        """
+        self._checkpoint()
+        session = scanperf.current_session()
+        if session is None:
+            image, page, *_ = self._grab(allow_esc=False)
+        else:
+            details = {
+                "purpose": "select_timeout_recheck",
+                "wait_id": getattr(timeout_exc, "wait_id", None),
+                "sample_id": None,
+                "sample_index": 0,
+                "kind": "select_disc",
+                "captured_at": None,
+                "probe_ended_at": None,
+                "ready": False,
+                "state_key": None,
+                "pause_generation": None,
+                "interrupt_reason": None,
+                "evidence": None,
+            }
+            with scanperf.timed("probe", parent_id=self._disc_event_id, details=details) as span:
+                image, page, *_ = self._grab(allow_esc=False)
+                span.set(captured_at=time.monotonic(), probe_ended_at=time.monotonic(), evidence=self._evidence(return_layer=page))
+        self._checkpoint()
+        if page not in {"menu", "storage", "overworld"}:
+            self.log.warning("cell %s 选择超时且新帧不是可恢复错页（page=%s），停止", cell_tag, page)
+            self.trace.fail(page, "select", f"{where} 选择超时，未确认可恢复的错页", image=image)
+            return None
+        self.log.warning("cell %s 点开了 %s 且已超时，按 Esc 退回", cell_tag, page)
+        self.trace.warn(page, "select_timeout", f"{where} 选择超时且停在{trace_page(page)}，按 Esc 退回", image=image)
+        press_key(hwnd, VK_ESCAPE)
+        time.sleep(0.6)
+        back_image, page2, *_ = self._grab(allow_esc=False)
+        if page2 == "drive_disc":
+            self.log.info("recovered to drive_disc, rescan batch")
+            self.trace.note("已退回驱动盘仓库，重扫本批")
+            return "rescan"
+        self.log.error("recover failed (page=%s), stop job", page2)
+        self.trace.fail(page2, "esc", f"退回失败，停在 {trace_page(page2)}，收工", image=back_image)
+        raise RunnerError(f"退回失败：{page2}，停止任务链")
 
     # ---------------------------------------------------------------- 正常前进
 
@@ -1782,16 +2527,18 @@ class Runner:
         return _ocr.parse_disc(image)
 
     def _read_disc_with_retry(self, image, parser, page):
+        """§6.1.1：只对解析**正常返回 None** 按 §3.2 的次数/间隔重拍。
+
+        解析实际抛出的 ``OcrError`` 立即原样向上传递，不改 None、不重试、不当超时；
+        其他程序错误同样不在此吞掉。至少调用一次 parser（``max(1, ocr_retry)`` 次）。
+        """
         reason = "未识别出盘面"
-        for attempt in range(max(1, self.preset.ocr_retry)):
-            try:
-                disc = parser(image)
-                if disc is not None:
-                    return disc
-            except OcrError as exc:
-                reason = str(exc)
-                self.log.warning("ocr retry %d: %s", attempt + 1, exc)
-            if attempt + 1 < max(1, self.preset.ocr_retry):
+        attempts = max(1, self.preset.ocr_retry)
+        for attempt in range(attempts):
+            disc = parser(image)
+            if disc is not None:
+                return disc
+            if attempt + 1 < attempts:
                 time.sleep(0.1)
                 image = self._grab(allow_esc=False, need_page=False)[0]
         self.trace.fail(page, "parse", f"重试耗尽：{reason}", image=image)
@@ -1817,6 +2564,8 @@ class Runner:
         for line in lines:
             if "确认" in line.text.replace(" ", ""):
                 click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+                # §6.1：紧接确认 click_client 正常返回取时刻，早于此后日志/Trace 与 0.5 秒等待。
+                self._refund_started_at = time.monotonic()
                 self.log.info("材料返还弹窗：已点「确认」")
                 self.trace.ok("upgrade", "refund", "材料返还弹窗已确认")
                 time.sleep(0.5)
@@ -1935,12 +2684,9 @@ class Runner:
                 image, page, *_ = self._grab(allow_esc=False)
                 if page != "drive_disc":
                     raise RunnerError("保留锁定时已离开驱动盘仓库，停止任务链")
-                try:
-                    current = parse_disc(image)
-                except OcrError as exc:
-                    self.log.warning("保留锁定盘面 OCR 失败（%d/%d）：%s", attempt + 1,
-                                     max(1, self.preset.ocr_retry), exc)
-                    current = None
+                # §6.1.1：解析实际抛出的 OcrError 立即原样传播，不改 None、不再重读；
+                # 只有正常返回 None 才按 ocr_retry 次数重拍。
+                current = parse_disc(image)
                 if current is not None:
                     expected_stats = sorted((s.name, s.rolls) for s in disc.substats)
                     actual_stats = sorted((s.name, s.rolls) for s in current.substats)
@@ -1983,42 +2729,57 @@ class Runner:
             self.log.info("action=STOP")
 
     def _esc_back_to_grid(self, hwnd: int, max_esc: int = 4) -> bool:
-        """先认页再逐次退弹窗；已经在仓库时不按键，失败抛错终止任务链。
+        """先认层再逐次退弹窗；已经在仓库时不按键、不制造等待，失败抛错终止任务链。
 
-        盘面弹层有三层：缩放预览层（无关闭 X，靠等级文字认）、强化层（有 X）、
-        详情侧栏（本身判为驱动盘仓库）。只有确认这几种层存在才按 Esc。
+        §6.2/§6.3 return_warehouse：每次 Esc 后的静候由 ``return_warehouse`` 等待替代
+        （modal→preview/warehouse、preview→warehouse 的允许边）。中间 preview 只结束本次
+        Esc 等待，严格确认 warehouse 才返回 True；同层/unknown 不完成本次等待、不加计数。
+        初始层由当前绑定窗口帧确认；最初 unknown 时按原 ocr_retry 次数/重拍间隔取证据，
+        未发 Esc 就没有等待。层级枚举由 ``_return_layer`` 提供（错页直接抛 RunnerError）。
         """
-        from zzz_ddtool.screen import is_disc_modal, is_disc_preview
-
         esc_count = unknown_count = 0
+        image, _page, *_ = self._grab(allow_esc=False)
         while True:
             self._checkpoint()
-            image, page, *_ = self._grab(allow_esc=False)
-            if page == "drive_disc":
+            try:
+                layer = self._return_layer(image)
+            except RunnerError as exc:
+                reason = f"返回驱动盘仓库失败：{exc}，停止任务链"
+                self.trace.fail("esc", "esc", reason, image=image)
+                raise RunnerError(reason)
+            if layer == "warehouse":
                 self.log.info("warehouse confirmed after %d esc, keep sidebar open", esc_count)
                 return True
-            if page in {"menu", "storage", "overworld"}:
-                reason = f"返回驱动盘仓库失败：停在{trace_page(page)}，停止任务链"
-                self.trace.fail(page, "esc", reason, image=image)
-                raise RunnerError(reason)
-            if not (is_disc_modal(image) or is_disc_preview(image)):
+            if layer == "unknown":
                 # 动画中可能暂时认不出，有限重拍；未知画面绝不盲按 Esc。
                 unknown_count += 1
                 if unknown_count >= max(1, self.preset.ocr_retry):
                     reason = "返回驱动盘仓库失败：无法确认盘面弹窗或仓库，停止任务链"
-                    self.trace.fail(page, "esc", reason, image=image)
+                    self.trace.fail("unknown", "esc", reason, image=image)
                     raise RunnerError(reason)
                 time.sleep(0.2)
+                image, _page, *_ = self._grab(allow_esc=False)
                 continue
             unknown_count = 0
             if esc_count >= max_esc:
                 reason = f"返回驱动盘仓库失败：{max_esc} 次回退后弹窗仍未关闭，停止任务链"
-                self.trace.fail(page, "esc", reason, image=image)
+                self.trace.fail(layer, "esc", reason, image=image)
                 raise RunnerError(reason)
             # 通用 press_key 会通过多个输入通道发键，回退必须只发一次。
+            before_frame = image
             press_key_once(hwnd, VK_ESCAPE)
             esc_count += 1
-            time.sleep(0.6)
+            # §6.1：紧接 Esc 输入正常返回记录 return_warehouse 的 started_at。
+            esc_started = time.monotonic()
+            try:
+                result = self._wait_ready(
+                    "return_warehouse", started_at=esc_started, before_frame=before_frame
+                )
+            except ReadinessTimeout as exc:
+                reason = f"返回驱动盘仓库失败：Esc 后未稳定进入更浅层（{exc}），停止任务链"
+                self.trace.fail(layer, "esc", reason, image=image)
+                raise RunnerError(reason)
+            image = result.frame
 
     def _click_text(self, hwnd: int, lines, needle: str, region_desc: str, tag: str, image=None) -> bool:
         """在 OCR 结果里找含 needle 的行并点中心，找不到存图返回 False。"""
@@ -2049,10 +2810,12 @@ class Runner:
                 time.sleep(0.2)
         return None, image
 
-    def _enter_upgrade_page(self, hwnd: int) -> bool:
+    def _enter_upgrade_page(self, hwnd: int, *, before: Disc) -> bool:
         """详情页点「查看/强化」→ 缩放页点「》」→ 强化页（弹层）。
 
-        返回 True=已进强化页（「阶段添加」出现）；False=中断（调用方 Esc 回仓库页）。
+        §6.3：详情按钮返回后的 0.9 秒由 ``open_preview`` 替代；箭头返回后的轮询与
+        成功等待由一次 ``open_upgrade`` 替代。返回 True=已进强化页；False=中断
+        （调用方 Esc 回仓库页）。``before`` 为本次 select 得到的盘面，用于接续证据。
         """
         from zzz_ddtool.ocr import read_rect
 
@@ -2073,45 +2836,58 @@ class Runner:
             self._esc_back_to_grid(hwnd)
             return False
         click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
-        time.sleep(0.9)
-
-        # 2) 缩放页「等级」右缘 +110px 的「>>」箭头
-        level_line, image = self._read_zoom_level_line(hwnd)
-        if level_line is None:
-            self.log.warning("UPGRADE: 缩放页没找到「等级」")
-            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字", image=image)
+        preview_started = time.monotonic()
+        try:
+            preview = self._wait_ready("open_preview", started_at=preview_started, before=before)
+        except ReadinessTimeout as exc:
+            # §6.3：open_preview 超时不重发详情按钮、不点箭头，清理后返回 False。
+            self.log.warning("UPGRADE: open_preview 超时（%s）", exc)
+            self.trace.fail("zoom", "enter_upgrade", f"未进入预览层：{exc}")
             self._esc_back_to_grid(hwnd)
             return False
-        ax = level_line.right + 110
-        ay = (level_line.top + level_line.bottom) // 2
+        image = preview.frame
 
-        # 3) 点箭头进强化页，轮询等「阶段添加」出现
-        stage_clicked = False
+        # 2) 缩放页「等级」右缘 +110px 的「>>」箭头（用预览完成帧定位）
+        arrow = self._zoom_arrow_of(image, before)
+        if arrow is None:
+            self.log.warning("UPGRADE: 缩放页没找到可定位的「等级」/箭头")
+            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字或对象不一致", image=image)
+            self._esc_back_to_grid(hwnd)
+            return False
+        ax, ay = arrow
+
+        # 3) 点箭头进强化页；首次超时最多保留一次第二箭头输入（须重新确认同对象预览）。
         for attempt in (1, 2):
             click_client(hwnd, ax, ay)
-            for _wait in range(4):  # 弹层渲染可能慢，最多等 ~2.8s
-                time.sleep(0.7)
-                image, *_ = self._grab(allow_esc=False, need_page=False)
-                lines = read_rect(image, self.STAGE_ADD_AREA)
-                if any("阶段添加" in ln.text.replace(" ", "") for ln in lines):
-                    stage_clicked = True
+            upgrade_started = time.monotonic()
+            try:
+                self._wait_ready("open_upgrade", started_at=upgrade_started, before=before)
+                self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
+                return True
+            except ReadinessTimeout as exc:
+                self.trace.warn("zoom", "enter_upgrade", f"第 {attempt} 次点箭头没进强化页（{exc}）", image=image)
+                if attempt == 2:
                     break
-            if stage_clicked:
-                break
-            self.trace.warn("zoom", "enter_upgrade", f"第 {attempt} 次点箭头没进强化页", image=image)
-            level_line, _image = self._read_zoom_level_line(hwnd)
-            if level_line is None:
-                break  # 不是缩放页也没有阶段添加，别乱点，回退
-            ax = level_line.right + 110
-            ay = (level_line.top + level_line.bottom) // 2
-        if not stage_clicked:
-            self.log.warning("UPGRADE: 两次都没进强化页")
-            self.trace.fail("zoom", "enter_upgrade", "点了两次箭头都没进强化页")
-            self._esc_back_to_grid(hwnd)
-            return False
-        time.sleep(0.8)
-        self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
-        return True
+                # §6.3：第二次箭头前必须在新帧上重新确认仍是同对象预览层且箭头可定位。
+                fresh, _page, *_ = self._grab(allow_esc=False, need_page=False)
+                arrow = self._zoom_arrow_of(fresh, before)
+                if arrow is None:
+                    break
+                ax, ay = arrow
+        self.log.warning("UPGRADE: 未进入强化页（超时且未恢复同对象预览）")
+        self.trace.fail("zoom", "enter_upgrade", "点箭头后未进入强化页")
+        self._esc_back_to_grid(hwnd)
+        return False
+
+    def _zoom_arrow_of(self, image, before: Disc):
+        """§6.2 open_preview 接续：从预览帧读「等级」行并校验与 before 一致，定位箭头。"""
+        level_line = self._zoom_level_of(image)
+        if level_line is None:
+            return None
+        level = self._level_of_line(level_line)
+        if level is None or level != before.level:
+            return None
+        return level_line.right + 110, (level_line.top + level_line.bottom) // 2
 
     def _pick_material(self, hwnd: int, material_slot: int) -> bool:
         """[测试入口] 点第 N 个材料槽，只加一份素材（替代「阶段添加」）。
@@ -2124,37 +2900,56 @@ class Runner:
         index = min(max(1, material_slot), len(UPGRADE_MATERIAL_SLOTS))
         mx, my = scale_point(*UPGRADE_MATERIAL_SLOTS[index - 1], image.width(), image.height())
         click_client(hwnd, mx, my)
+        # §6.2：素材槽时刻由实际发出点写入，紧接 click_client 正常返回，早于日志/Trace。
+        self._material_started_at = time.monotonic()
         self.log.info("action=UPGRADE 测试入口：点第 %d 个材料槽 (%d,%d)", index, mx, my)
         self.trace.ok("upgrade", "step-material", f"测试入口：点第 {index} 个材料槽", image=image)
         return True
 
-    def _upgrade_once(self, hwnd: int, material_slot: int = 0) -> bool:
+    def _upgrade_once(self, hwnd: int, material_slot: int = 0, *, before: Disc) -> bool:
         """强化页选好素材 →「升级」，升一阶。返回两步是否都走完。
 
-        material_slot=0 走生产的「阶段添加」（一键补满本档素材）；>0 是测试入口，
-        改成点第 N 个材料槽（见 _pick_material）。
+        §6.2：调用开始清空素材/升级时刻；素材输入前取得 before_frame，素材输入后按 §6.1
+        记录 ``_material_started_at`` 并执行 material_ready；随后定位并点击一次「升级」，
+        紧接其返回记录 ``_upgrade_started_at`` 供 ``_upgrade_loop`` 的 upgrade_result 使用。
+        不保留原 1.5 秒等待。material_slot>0 是测试入口，走 _pick_material。
         """
         from zzz_ddtool.ocr import read_rect
 
+        self._material_started_at = None
+        self._upgrade_started_at = None
+        before_frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
         if material_slot:
             if not self._pick_material(hwnd, material_slot):
                 return False
-            time.sleep(0.6)
         else:
-            image, *_ = self._grab(allow_esc=False, need_page=False)
             if not self._click_text(
-                hwnd, read_rect(image, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」", "step-stage-add", image=image
+                hwnd, read_rect(before_frame, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」",
+                "step-stage-add", image=before_frame,
             ):
                 return False
-            time.sleep(0.6)
+            self._material_started_at = time.monotonic()
+        if self._material_started_at is None:
+            raise RunnerError("素材输入未成功发出，无法确认素材准备就绪，停止任务链")
+        try:
+            self._wait_ready(
+                "material_ready", started_at=self._material_started_at,
+                before=before, before_frame=before_frame,
+            )
+        except ReadinessTimeout as exc:
+            raise RunnerError(f"素材准备就绪超时：{exc}，停止任务链")
+        # material_ready 完成后才定位并点击一次「升级」。
         image, *_ = self._grab(allow_esc=False, need_page=False)
         if not self._click_text(
-            hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」", "step-upgrade-confirm", image=image
+            hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」",
+            "step-upgrade-confirm", image=image,
         ):
             return False
-        time.sleep(1.5)
-        self.log.info("action=UPGRADE 完成（%s→升级）", "材料槽" if material_slot else "阶段添加")
-        self.trace.ok("upgrade", "upgrade", "强化了一阶")
+        self._upgrade_started_at = time.monotonic()
+        session = scanperf.current_session()
+        self._upgrade_input_id = session.new_event_id() if session is not None else None
+        self.log.info("action=UPGRADE 已发出升级输入（%s）", "材料槽" if material_slot else "阶段添加")
+        self.trace.ok("upgrade", "upgrade", "已发出升级输入")
         return True
 
     def _discard_from_upgrade(self, hwnd: int) -> None:
@@ -2189,12 +2984,10 @@ class Runner:
         disc_slot：这件盘在 RunStats 里的下标，用来记各档升级耗时（-1 = 不统计）。
         """
         upgraded = 0
-        # 上一轮点了「升级」后应到达的等级（None = 没在等复核）与累计重读次数。
-        expect_level: int | None = None
-        expect_from = 0
-        rechecks = 0
         # 本档从阶段添加/材料操作前起算，包含按钮定位、输入、等待和结果识别。
         stage_started: float | None = None
+        # 上一轮 upgrade_result 的完成帧/盘面，交下一轮判断，不再重复解析该帧。
+        pending: tuple[Disc, QImage | None] | None = None
         while True:
             if initial_disc is not None:
                 paused = self.hotkeys is not None and self.hotkeys.paused
@@ -2206,6 +2999,10 @@ class Runner:
                 disc, initial_disc = initial_disc, None
                 image = None
                 self.log.info("cell %s 首档复用侧栏盘面，省略强化前重复词条 OCR", cell_tag)
+            elif pending is not None:
+                # §6.3：升级结果等待已消费返回帧/盘面，不再附加固定等待或重复解析。
+                disc, image = pending
+                pending = None
             else:
                 image, *_ = self._grab(allow_esc=False, need_page=False)
                 try:
@@ -2224,50 +3021,6 @@ class Runner:
                     equipped=self._detail_disc.equipped,
                     discarded=self._detail_disc.discarded and not self.preset.labels.discard,
                 )
-            # 先复核上一轮升级有没有到位。素材不够吃满一档时游戏只加到部分经验、
-            # 等级停在期望值之前（3/6/9/12/15 之前），必须当场停链；否则等级没变、
-            # decide 会一直判 UPGRADE，白转 _MAX_STAGE_UPGRADES 次后当「到升阶上限」
-            # 成功收尾，把素材耗尽静默吞掉。读一次可能撞上强化动画，按 ocr_retry 重读。
-            if expect_level is not None:
-                if disc.level >= expect_level:
-                    if stage_started is not None:
-                        self.stats.disc_stage(
-                            disc_slot, expect_from, disc.level, time.monotonic() - stage_started
-                        )
-                        stage_started = None
-                    expect_level = None
-                elif rechecks < max(1, self.preset.ocr_retry) - 1:
-                    rechecks += 1
-                    self.log.warning(
-                        "cell %s 升级后等级还是 %d（期望到 %d），重读第 %d 次",
-                        cell_tag,
-                        disc.level,
-                        expect_level,
-                        rechecks,
-                    )
-                    time.sleep(0.4)
-                    continue
-                else:
-                    reason = (
-                        f"升级素材不足：从 {expect_from} 级升级后期望到 {expect_level} 级，"
-                        f"实际只有 {disc.level} 级，停止任务链"
-                    )
-                    self.log.error("cell %s %s", cell_tag, reason)
-                    self.trace.fail("upgrade", "upgrade", reason, image=image)
-                    if stage_started is not None:
-                        # 素材不足也把这一档的实际升级耗时留下（到不了下一档也要看得见）。
-                        self.stats.disc_stage(
-                            disc_slot, expect_from, disc.level, time.monotonic() - stage_started
-                        )
-                        stage_started = None
-                    self.stats.disc_end(disc_slot, OUTCOME_FAILED, disc.level)
-                    # 素材耗尽是正常业务收尾，不是异常画面：先把游戏退回仓库侧栏，
-                    # 别把玩家卡在强化弹层里。回退本身失败也不该盖掉真正的原因。
-                    try:
-                        self._esc_back_to_grid(hwnd)
-                    except RunnerError as esc_exc:
-                        self.log.warning("素材不足收尾时回退仓库失败：%s", esc_exc)
-                    raise RunnerError(f"{cell_tag} {reason}")
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
             if decision.action == Action.STOP:
                 self._record(job, disc, decision)
@@ -2293,22 +3046,25 @@ class Runner:
                     self._esc_back_to_grid(hwnd)
                     return disc.level
                 stage_started = time.monotonic()
-                if not self._upgrade_once(hwnd, self.material_slot):
+                before_disc = disc
+                expected_level = next_stage_level(before_disc.level)
+                if not self._upgrade_once(hwnd, self.material_slot, before=before_disc):
                     raise RunnerError(f"{cell_tag} 强化按钮识别失败，停止任务链")
                 upgraded += 1
                 up_counts[global_index] = up_counts.get(global_index, 0) + 1
                 self._record(job, disc, decision)
-                expect_from = disc.level
-                expect_level = next_stage_level(disc.level)
-                rechecks = 0
-                # 下一轮实际盘面确认本档结果，结束先前开始的完整操作区间。
-                self.log.info(
-                    "cell %s UPGRADE done, level %d -> 期望到 %d 级，强化页重判",
-                    cell_tag,
-                    disc.level,
-                    expect_level,
+                # §6.3：用刚发出的升级输入时刻执行一次 upgrade_result，消费返回帧/盘面。
+                disc, image = self._await_upgrade_result(
+                    hwnd, cell_tag, before=before_disc, expected_level=expected_level,
+                    disc_slot=disc_slot, stage_started=stage_started,
                 )
-                self._set_status("upgraded", f"level {disc.level} -> {expect_level}", cell_tag)
+                stage_started = None
+                pending = (disc, image)
+                self.log.info(
+                    "cell %s UPGRADE done, level %d -> %d，强化页重判",
+                    cell_tag, before_disc.level, disc.level,
+                )
+                self._set_status("upgraded", f"level {before_disc.level} -> {disc.level}", cell_tag)
                 continue  # 留强化页再判断
             if decision.action == Action.MARK_DISCARD:
                 self.log.info("cell %s 强化页判弃置，Esc 回详情页按 R", cell_tag)
@@ -2349,6 +3105,140 @@ class Runner:
             )
             self._esc_back_to_grid(hwnd)
             return disc.level
+
+    # ---------------------------------------------------------------- 升级结果与返还（§6.2、§6.2.1）
+
+    def _await_upgrade_result(
+        self, hwnd: int, cell_tag: str, *, before: Disc, expected_level: int,
+        disc_slot: int, stage_started: float | None,
+    ) -> tuple[Disc, "QImage | None"]:
+        """§6.2/§6.3：用刚发出的升级输入时刻执行一次 upgrade_result 并消费返回帧/盘面。
+
+        成功消费返回帧/盘面后清空升级时刻；超时走有限诊断/素材不足出口；已确认返还抛
+        ReadinessInterrupted 时按 §6.2.1 接续（首个 wait_total 仍按真实出口记 interrupted）。
+        """
+        started = self._upgrade_started_at
+        if started is None:
+            raise RunnerError(f"{cell_tag} 未记录升级输入时刻，停止任务链")
+        try:
+            result = self._wait_ready(
+                "upgrade_result", started_at=started, before=before,
+                expected_level=expected_level, trigger_input_id=self._upgrade_input_id,
+            )
+        except ReadinessInterrupted as interrupted:
+            return self._resume_after_refund(
+                hwnd, cell_tag, interrupted, before=before, expected_level=expected_level,
+                disc_slot=disc_slot, stage_started=stage_started,
+            )
+        except ReadinessTimeout as timeout_exc:
+            return self._upgrade_result_timeout(
+                hwnd, cell_tag, timeout_exc, before=before, expected_level=expected_level,
+                disc_slot=disc_slot, stage_started=stage_started,
+            )
+        # §6.3：成功消费返回的新帧/盘面后清空升级时刻，普通成功路径不再附加固定等待。
+        self._upgrade_started_at = None
+        disc = result.disc
+        if disc is None:
+            raise RunnerError(f"{cell_tag} 升级结果未读出真实盘面，停止任务链")
+        if stage_started is not None:
+            self.stats.disc_stage(disc_slot, before.level, disc.level, time.monotonic() - stage_started)
+        return disc, result.frame
+
+    def _upgrade_result_timeout(
+        self, hwnd: int, cell_tag: str, timeout_exc, *, before: Disc, expected_level: int,
+        disc_slot: int, stage_started: float | None,
+    ) -> tuple[Disc, "QImage | None"]:
+        """§6.2：结果就绪超时后的有限诊断/素材不足出口，不重建预算、不转成功。"""
+        attempts = max(1, self.preset.ocr_retry)
+        last: Disc | None = None
+        image = None
+        for attempt in range(attempts):
+            self._checkpoint()
+            image, _page, *_ = self._grab(allow_esc=False, need_page=False)
+            disc = self._parse_upgrade_page(image)  # OcrError 原样传播（§6.1.1）
+            if disc is not None and disc.level >= expected_level:
+                # 迟到的满足等级：仍按结果就绪超时失败，不转成功、不抛素材不足。
+                self.trace.fail(
+                    "upgrade", "upgrade",
+                    f"{cell_tag} 升级结果就绪超时，补读已到 {disc.level} 级", image=image,
+                )
+                raise RunnerError(
+                    f"{cell_tag} 升级结果就绪超时（期望 {expected_level}，补读到 {disc.level}），停止任务链"
+                )
+            if disc is None:
+                refund_line = self._find_material_refund(image)
+                if refund_line is not None:
+                    # §6.2.1：实读仍无盘面且 finder 确认返还 → 走同一确认接续。
+                    return self._resume_after_refund(
+                        hwnd, cell_tag, None, refund_line=refund_line, before=before,
+                        expected_level=expected_level, disc_slot=disc_slot,
+                        stage_started=stage_started,
+                    )
+            else:
+                last = disc
+            if attempt + 1 < attempts:
+                time.sleep(0.2)
+        if last is None:
+            self.trace.fail("upgrade", "upgrade", f"{cell_tag} 升级结果始终无盘面", image=image)
+            raise RunnerError(f"{cell_tag} 升级结果无法确认（始终无盘面），停止任务链")
+        reason = (
+            f"升级素材不足：从 {before.level} 级升级后期望到 {expected_level} 级，"
+            f"实际只有 {last.level} 级，停止任务链"
+        )
+        self.log.error("cell %s %s", cell_tag, reason)
+        self.trace.fail("upgrade", "upgrade", reason, image=image)
+        if stage_started is not None:
+            self.stats.disc_stage(disc_slot, before.level, last.level, time.monotonic() - stage_started)
+        self.stats.disc_end(disc_slot, OUTCOME_FAILED, last.level)
+        # 素材耗尽是正常业务收尾：先把游戏退回仓库侧栏，回退失败也不盖掉真正原因。
+        try:
+            self._esc_back_to_grid(hwnd)
+        except RunnerError as esc_exc:
+            self.log.warning("素材不足收尾时回退仓库失败：%s", esc_exc)
+        raise MaterialShortfall(before.level, expected_level, last.level)
+
+    def _confirm_material_refund(self, hwnd: int, frame) -> bool:
+        """§6.2.1：确认绑定/帧有效后，用给定帧点一次「确认」，记录确认输入时刻与 ID。"""
+        self._checkpoint()
+        if frame is None or frame.isNull():
+            return False
+        self._refund_started_at = None
+        session = scanperf.current_session()
+        self._refund_input_id = session.new_event_id() if session is not None else None
+        return self._dismiss_material_refund(hwnd, frame)
+
+    def _resume_after_refund(
+        self, hwnd: int, cell_tag: str, interrupted, *, refund_line=None,
+        before: Disc, expected_level: int, disc_slot: int, stage_started: float | None,
+    ) -> tuple[Disc, "QImage | None"]:
+        """§6.2.1：确认一次材料返还后，从确认输入时刻重建第二次 upgrade_result（不重发升级）。
+
+        每档最多一次确认尝试、两次结果等待；第二次再出现返还/超时或始终无盘面则有限失败。
+        """
+        if interrupted is not None:
+            frame = interrupted.last_sample.frame
+            resume_from = getattr(interrupted, "wait_id", None) or self._last_wait_id
+        else:
+            frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
+            resume_from = self._last_wait_id
+        if not self._confirm_material_refund(hwnd, frame):
+            raise RunnerError(f"{cell_tag} 材料返还确认失败，停止任务链")
+        if self._refund_started_at is None:
+            raise RunnerError(f"{cell_tag} 未记录返还确认输入时刻，停止任务链")
+        try:
+            result = self._wait_ready(
+                "upgrade_result", started_at=self._refund_started_at, before=before,
+                expected_level=expected_level, trigger_input_id=self._refund_input_id,
+                resume_from_wait_id=resume_from,
+            )
+        except (ReadinessTimeout, ReadinessInterrupted) as exc:
+            raise RunnerError(f"{cell_tag} 返还确认后升级结果仍未确认：{exc}，停止任务链")
+        disc = result.disc
+        if disc is None:
+            raise RunnerError(f"{cell_tag} 返还确认后未读出真实盘面，停止任务链")
+        if stage_started is not None:
+            self.stats.disc_stage(disc_slot, before.level, disc.level, time.monotonic() - stage_started)
+        return disc, result.frame
 
     def _record(self, job: TaskJob, disc: Disc, decision: Decision) -> None:
         self.results.append(

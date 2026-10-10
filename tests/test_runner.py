@@ -59,6 +59,20 @@ def generated_preset(**kwargs):
         preset.effective_weights(), stage_require=preset.stage_require)))
 
 
+def upgrade_once_stub(runner):
+    """替身升级输入：按 §6.2 记录升级时刻，供 _await_upgrade_result 使用。
+
+    返回一个 Mock，既可断言调用次数，又能在被调用时写入 ``_upgrade_started_at``，
+    使 §6.1 的取时刻契约在离线替身下仍然成立。
+    """
+
+    def _fn(hwnd, material_slot=0, *, before=None):
+        runner._upgrade_started_at = runner_module.time.monotonic()
+        return True
+
+    return Mock(side_effect=_fn)
+
+
 def make_cell(global_row0, col, screen_row0, level=0):
     return GridCell(
         global_index=global_row0 * GRID_COLS + col,
@@ -153,7 +167,7 @@ def fake_env():
 
 
 @pytest.fixture
-def offline_runner(monkeypatch):
+def offline_runner(monkeypatch, fast_wait):
     """所有屏幕、输入、窗口与导航接口全部替换，不操作真实游戏。"""
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
@@ -591,7 +605,7 @@ def test_restore_failure_stops_entire_chain(offline_runner, monkeypatch):
     monkeypatch.setattr(runner, "_scan_cells", scan)
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(runner, "_upgrade_loop", Mock())
     runner.run()
     assert runner.outcome == "failed"
@@ -629,7 +643,7 @@ def test_upgrade_saves_resume_point_before_entering_page(offline_runner, monkeyp
     runner._profile = fake_profile()
     monkeypatch.setattr(runner, "_grab", lambda *a, **kw: (blank_image(), "drive_disc", "test", 1))
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     seen: dict = {}
 
     def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts, disc_slot, *, initial_disc=None):
@@ -655,7 +669,7 @@ def test_max_discs_reached_after_upgrade_does_not_restore(offline_runner, monkey
     )
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(runner, "_upgrade_loop", Mock())
     runner.run()
     assert runner.outcome == "completed"
@@ -682,7 +696,7 @@ def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatc
     )
     offline_runner["apply_game_filter"].side_effect = lambda *a, **kw: order.append("filter")
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(runner, "_upgrade_loop", Mock())
     runner.run()
     assert order[:2] == ["profile", "filter"], order
@@ -736,20 +750,23 @@ def test_dismiss_material_refund_only_clicks_confirm_when_popup_present(offline_
 
 
 def test_click_leaving_page_recovers_and_rescans(offline_runner, monkeypatch):
+    """点格子点飞（停在 menu）：select 超时补拍仍为错页 → 按一次 Esc 退回仓库 → 重扫本批。
+
+    §6.3：错页在 select 等待里按不就绪处理；只有超时后补拍的新帧仍是已知错页才走原恢复。
+    """
     runner = Runner(Preset(max_discs=3, accepted=()), hotkeys=False)
     grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=6))
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
-    calls = {"n": 0}
-
-    def grab(*args, **kwargs):
-        calls["n"] += 1
-        # 第 1 次是任务初始抓图，第 2 次（点击格子后）才模拟点飞
-        return (image, "menu" if calls["n"] == 2 else "drive_disc", "test", 1)
-
-    monkeypatch.setattr(runner, "_grab", grab)
+    state = {"menu": True}
+    monkeypatch.setattr(
+        runner, "_grab",
+        lambda *a, **kw: (image, "menu" if state["menu"] else "drive_disc", "test", 1),
+    )
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_act", Mock())
+    # Esc 退回后画面回到驱动盘仓库
+    offline_runner["press_key"].side_effect = lambda *a, **kw: state.__setitem__("menu", False)
     runner.run()
     assert runner.outcome == "completed"
     assert offline_runner["press_key"].call_count == 1  # 只按一次 Esc 退回
@@ -807,7 +824,7 @@ def test_run_preserves_empty_whitelist(offline_runner, monkeypatch, accepted, ex
     job = TaskJob(slot=4, weights={"暴击率": 1.0}, accepted=accepted)
     runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     actions = []
     monkeypatch.setattr(runner, "_act", lambda hwnd, action, disc: actions.append(action))
 
@@ -859,9 +876,9 @@ def test_uncertain_origin_stops_entire_chain(offline_runner, monkeypatch, page):
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     uncertain = sample_disc(level=6)  # +6 却无强化次数，三/四词来源均不成立。
     monkeypatch.setattr(runner, "_parse_disc", lambda image: uncertain if page == "detail" else sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: uncertain)
-    upgrade = Mock()
+    upgrade = upgrade_once_stub(runner)
     discard = Mock()
     back = Mock()
     monkeypatch.setattr(runner, "_upgrade_once", upgrade)
@@ -946,7 +963,7 @@ def test_run_calls_real_upgrade_buttons_then_rejudges(offline_runner, monkeypatc
     upgraded = Disc(3, (Substat("暴击率", 2),) + initial.substats[1:])
     readings = iter((upgraded,))
     monkeypatch.setattr(runner, "_parse_disc", lambda image: initial)
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     def parse_after_input(image):
         # 第一次词条 OCR 必须发生在格位点击、阶段添加和升级三次输入之后。
         assert offline_runner["click_client"].call_count == 3
@@ -986,11 +1003,11 @@ def test_upgrade_page_falls_back_to_detail_layout_when_maxed(offline_runner, mon
     # +15 四词条盘：强化 5 次全部落在已有词条上（rolls 6 = 1+5），origin 才能推断为 four
     maxed = Disc(15, (Substat("暴击率", 6),) + initial.substats[1:])
     monkeypatch.setattr(runner, "_parse_disc", lambda image: initial)
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: None)
     fallback = Mock(return_value=maxed)
     monkeypatch.setattr(ocr_module, "parse_disc", fallback)
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade_once_stub(runner))
     back = Mock(return_value=True)
     monkeypatch.setattr(runner, "_esc_back_to_grid", back)
 
@@ -1010,23 +1027,24 @@ def test_upgrade_page_fails_when_both_layouts_unreadable(offline_runner, monkeyp
     job = generated_job(slot=4, weights={"暴击率": 1}, stage_require={"four": {0: 0}})
     runner = Runner(Preset(task_chain=(job,), max_discs=1), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: None)
     monkeypatch.setattr(ocr_module, "parse_disc", lambda image: None)
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade_once_stub(runner))
     monkeypatch.setattr(runner, "_dismiss_material_refund", Mock(return_value=False))
+    monkeypatch.setattr(runner, "_find_material_refund", Mock(return_value=None))
 
     runner.run()
 
     assert runner.outcome == "failed"
-    assert "未识别出盘面" in runner.end_reason
+    assert "升级结果" in runner.end_reason
 
 
 @pytest.mark.parametrize("missing, click_count", [("stage", 0), ("confirm", 1)])
 def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch, missing, click_count):
     runner = Runner(Preset(), hotkeys=False)
     button_lines(runner, monkeypatch, missing=missing)
-    assert runner._upgrade_once(99) is False
+    assert runner._upgrade_once(99, before=sample_disc()) is False
     assert offline_runner["click_client"].call_count == click_count
     if click_count:
         offline_runner["click_client"].assert_called_once_with(99, 1280, 860)
@@ -1036,7 +1054,7 @@ def test_missing_upgrade_button_stops_later_jobs(offline_runner, monkeypatch):
     jobs = (generated_job(slot=4, weights={"暴击率": 1}), generated_job(slot=5, weights={"暴击率": 1}))
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: sample_disc())
     button_lines(runner, monkeypatch, missing="stage")
     runner.run()
@@ -1064,7 +1082,7 @@ def test_auto_substat_filter_is_applied_for_each_task(offline_runner, monkeypatc
     )
     runner = Runner(Preset(task_chain=jobs, max_discs=1), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     monkeypatch.setattr(runner, "_upgrade_loop", Mock())
     monkeypatch.setattr(runner, "_restore_position", Mock())
     runner.run()
@@ -1090,14 +1108,44 @@ def test_disabled_labels_suppress_all_discard_changes_but_return_to_grid(offline
     assert runner._sub_preset(TaskJob(slot=4)).labels == runner.preset.labels
 
 
+@pytest.mark.parametrize(
+    "page,modal,is_home,preview,expected",
+    [
+        ("menu", False, False, False, None),
+        ("storage", False, False, False, None),
+        ("overworld", False, False, False, None),
+        ("unknown", True, False, False, "modal"),
+        ("unknown", False, True, False, "warehouse"),
+        ("unknown", False, False, True, "preview"),
+        ("unknown", False, False, False, "unknown"),
+    ],
+)
+def test_return_layer_classifies_without_pixel_guessing(
+    monkeypatch, page, modal, is_home, preview, expected
+):
+    """§6.2：层级只由 screen 判据枚举；错页直接抛 RunnerError，其余四层严格归位。
+
+    modal 优先于 warehouse/preview（关闭 X 在弹窗上），warehouse 需严格命中 DRIVE_DISC，
+    达不到任一判据才落 unknown，绝不靠像素变化认层。
+    """
+    runner = Runner(Preset(), hotkeys=False)
+    image = QImage(4, 4, QImage.Format.Format_RGB32)
+    monkeypatch.setattr(runner_module, "classify_image", lambda img: page)
+    monkeypatch.setattr(runner_module, "is_disc_modal", lambda img: modal)
+    monkeypatch.setattr(runner_module, "is_page", lambda img, target: is_home)
+    monkeypatch.setattr(runner_module, "is_disc_preview", lambda img: preview)
+    if expected is None:
+        with pytest.raises(RunnerError, match="返回层级时停在"):
+            runner._return_layer(image)
+    else:
+        assert runner._return_layer(image) == expected
+
+
 def test_return_from_zoom_preview_escapes_then_r(offline_runner, monkeypatch):
     """强化页 Esc 一层后停在缩放预览层：认出来再 Esc 一次，不能当未知画面卡住。"""
-    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
-    image.fill(0)
-    frames = iter([(image, "unknown", "test", 1), (image, "drive_disc", "test", 1)])
     runner = Runner(Preset(), hotkeys=False)
-    monkeypatch.setattr(runner, "_grab", lambda **kw: next(frames))
-    monkeypatch.setattr(screen_module, "is_disc_preview", lambda img: True)
+    layers = iter(["preview", "warehouse"])
+    monkeypatch.setattr(runner, "_return_layer", lambda image: next(layers))
     runner._discard_from_upgrade(1)
     assert offline_runner["press_key_once"].call_args_list == [
         call(1, runner_module.VK_ESCAPE),
@@ -1108,14 +1156,10 @@ def test_return_from_zoom_preview_escapes_then_r(offline_runner, monkeypatch):
 
 @pytest.mark.parametrize("layers", [1, 2])
 def test_discard_returns_only_existing_modal_layers(offline_runner, monkeypatch, layers):
-    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
-    image.fill(0)
-    frames = iter([(image, "unknown", "test", 1)] * layers + [(image, "drive_disc", "test", 1)])
+    """modal 层每层一次 Esc（同层不重复计），确认仓库后才按 R；不盲按多余键。"""
     runner = Runner(Preset(), hotkeys=False)
-    import zzz_ddtool.screen as screen_module
-
-    monkeypatch.setattr(runner, "_grab", lambda **kw: next(frames))
-    monkeypatch.setattr(screen_module, "is_disc_modal", lambda img: True)
+    seq = iter(["modal"] * layers + ["warehouse"])
+    monkeypatch.setattr(runner, "_return_layer", lambda image: next(seq))
     runner._discard_from_upgrade(1)
     assert offline_runner["press_key_once"].call_args_list == [
         call(1, runner_module.VK_ESCAPE)
@@ -1125,10 +1169,13 @@ def test_discard_returns_only_existing_modal_layers(offline_runner, monkeypatch,
 
 @pytest.mark.parametrize("page", ["menu", "overworld", "storage"])
 def test_return_from_wrong_page_stops_without_keypress(offline_runner, monkeypatch, page):
-    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
-    image.fill(0)
+    """错页时适配层抛 RunnerError，_esc_back_to_grid 包成返回失败，绝不盲按按键。"""
     runner = Runner(Preset(), hotkeys=False)
-    monkeypatch.setattr(runner, "_grab", lambda **kw: (image, page, "test", 1))
+
+    def _wrong(image):
+        raise RunnerError(f"返回层级时停在{page}，停止任务链")
+
+    monkeypatch.setattr(runner, "_return_layer", _wrong)
     with pytest.raises(RunnerError, match="返回驱动盘仓库失败"):
         runner._discard_from_upgrade(1)
     offline_runner["press_key_once"].assert_not_called()
@@ -1140,10 +1187,10 @@ def test_unrecognized_return_retries_without_escape(offline_runner, monkeypatch)
     image.fill(0)
     runner = Runner(Preset(ocr_retry=3), hotkeys=False)
     grab = Mock(return_value=(image, "unknown", "test", 1))
-    import zzz_ddtool.screen as screen_module
 
     monkeypatch.setattr(runner, "_grab", grab)
-    monkeypatch.setattr(screen_module, "is_disc_modal", lambda img: False)
+    # 持续未知层：有限重拍后失败，绝不盲按 Esc（返回层级由 _return_layer 提供）。
+    monkeypatch.setattr(runner, "_return_layer", lambda image: "unknown")
     with pytest.raises(RunnerError, match="无法确认盘面弹窗或仓库"):
         runner._discard_from_upgrade(1)
     assert grab.call_count == 3
@@ -1159,14 +1206,28 @@ def test_return_failure_fails_entire_chain(offline_runner, monkeypatch, level, r
     runner = Runner(Preset(task_chain=jobs), hotkeys=False)
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
+    state = {"page": "unknown"}
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
-    frames = iter([(image, "unknown", "test", 1)] * 3 + [(image, "menu", "test", 1)])
-    monkeypatch.setattr(runner, "_grab", lambda *a, **kw: next(frames))
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
+    monkeypatch.setattr(runner, "_grab", lambda *a, **kw: (image, state["page"], "test", 1))
+
+    def return_layer(img):
+        # §6.2：错页在适配层直接抛 RunnerError（不在层枚举里返回字符串）。
+        if state["page"] in {"menu", "storage", "overworld"}:
+            raise RunnerError(f"返回层级时停在 {state['page']}，停止任务链")
+        return "warehouse"
+
+    monkeypatch.setattr(runner, "_return_layer", return_layer)
     # +3 判弃置 / +15 判保留：两条真实回退分支都必须传播失败，不能继续 job。
     disc = Disc(level, (Substat("暴击率", rolls),) + sample_disc().substats[1:])
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: disc)
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
+
+    def once(hwnd, material_slot=0, *, before=None):
+        runner._upgrade_started_at = runner_module.time.monotonic()
+        state["page"] = "menu"  # 升级后回退时停在主菜单
+        return True
+
+    monkeypatch.setattr(runner, "_upgrade_once", Mock(side_effect=once))
     runner.run()
     assert runner.outcome == "failed"
     assert "返回驱动盘仓库失败" in runner.end_reason
@@ -1177,7 +1238,7 @@ def test_return_failure_fails_entire_chain(offline_runner, monkeypatch, level, r
 def test_enter_upgrade_failure_cannot_complete(offline_runner, monkeypatch):
     runner = Runner(generated_preset(), hotkeys=False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: False)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: False)
     runner.run()
     assert runner.outcome == "failed"
     assert "进入强化页失败" in runner.end_reason
@@ -1644,14 +1705,15 @@ def test_upgrade_shortfall_stops_chain(offline_runner, monkeypatch):
         return sample_disc(0 if calls["n"] == 1 else 1)
 
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
-    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade_once_stub(runner))
     esc = Mock()
     monkeypatch.setattr(runner, "_esc_back_to_grid", esc)
 
     with pytest.raises(RunnerError, match="升级素材不足"):
         runner._upgrade_loop(1, job, 0, "R1C1", runner._sub_preset(job), None, {})
 
-    assert calls["n"] == runner.preset.ocr_retry + 1
+    # 1 次初始读 + 1 次 upgrade_result probe + ocr_retry 次超时有限重读
+    assert calls["n"] == runner.preset.ocr_retry + 2
     # 素材不足要留下失败记录，且报的就是素材不足（不许被收尾时的回退失败盖掉）
     assert any("升级素材不足" in str(c) for c in runner.trace.fail.call_args_list)
     # 收尾先把游戏退回仓库，别把玩家卡在强化弹层里（正常业务场景的干净收尾）
@@ -1674,7 +1736,7 @@ def test_upgrade_reaching_next_stage_keeps_going(offline_runner, monkeypatch):
         return initial if calls["n"] == 1 else upgraded
 
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
-    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade_once_stub(runner))
     discard = Mock()
     monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
 
@@ -1696,7 +1758,7 @@ def test_upgrade_shortfall_stops_later_jobs(offline_runner, monkeypatch):
     )
     monkeypatch.setattr(runner, "_advance", lambda hwnd, state, cells, *, rows: False)
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc(0))
-    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd: True)
+    monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     calls = {"n": 0}
 
     def parse_upgrade(img):
@@ -1704,7 +1766,7 @@ def test_upgrade_shortfall_stops_later_jobs(offline_runner, monkeypatch):
         return sample_disc(0 if calls["n"] == 1 else 1)
 
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", parse_upgrade)
-    monkeypatch.setattr(runner, "_upgrade_once", lambda hwnd, slot=0: True)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade_once_stub(runner))
 
     runner.run()
 
@@ -1727,7 +1789,7 @@ def test_material_slot_entry_clicks_slot_not_stage_add(offline_runner, monkeypat
 
     monkeypatch.setattr(ocr_module, "read_rect", read_rect)
 
-    assert runner._upgrade_once(99, 3) is True
+    assert runner._upgrade_once(99, 3, before=sample_disc()) is True
     assert offline_runner["click_client"].call_args_list == [call(99, 1405, 677), call(99, 1510, 860)]
 
 
@@ -1742,7 +1804,7 @@ def test_material_slot_scales_with_window_size(offline_runner, monkeypatch):
         ocr_module, "read_rect", lambda img, area: [confirm] if area == runner.UPGRADE_CONFIRM_AREA else []
     )
 
-    assert runner._upgrade_once(99, 2) is True
+    assert runner._upgrade_once(99, 2, before=sample_disc()) is True
     assert offline_runner["click_client"].call_args_list[0] == call(99, 1069, 564)
 
 
@@ -2154,9 +2216,10 @@ def test_first_upgrade_reuses_only_once_and_times_full_stage(offline_runner, mon
                     for level, rolls in [(3, 2), (6, 3)]])
     events = []
 
-    def upgrade(hwnd, material_slot=0):
+    def upgrade(hwnd, material_slot=0, *, before=None):
         events.append("upgrade")
         clock[0] += 3
+        runner._upgrade_started_at = clock[0]
         return True
 
     def parse(image):
@@ -2222,7 +2285,7 @@ def test_first_upgrade_seed_preserves_control_checkpoint(offline_runner, monkeyp
 
 def test_seeded_upgrade_shortfall_reads_fresh_and_stops(offline_runner, monkeypatch):
     runner = Runner(Preset(ocr_retry=2), hotkeys=False)
-    upgrade = Mock(return_value=True)
+    upgrade = upgrade_once_stub(runner)
     parser = Mock(return_value=sample_disc(1))
     monkeypatch.setattr(runner, "_upgrade_once", upgrade)
     monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
@@ -2231,24 +2294,23 @@ def test_seeded_upgrade_shortfall_reads_fresh_and_stops(offline_runner, monkeypa
         runner._upgrade_loop(1, runner._default_job(), 0, "R1C1", runner.preset, None, {},
                              initial_disc=sample_disc())
     upgrade.assert_called_once()
-    assert parser.call_count == 2
+    # 1 次 upgrade_result probe + ocr_retry 次超时有限重读
+    assert parser.call_count == 1 + runner.preset.ocr_retry
 
 
-def test_seeded_upgrade_still_dismisses_refund_after_upgrade(offline_runner, monkeypatch):
+def test_seeded_upgrade_consumes_result_frame_without_extra_read(offline_runner, monkeypatch):
+    """§6.3：种子首档升级后由 upgrade_result 消费返回帧，不再附加固定等待或重复解析。"""
     runner = Runner(Preset(ocr_retry=1), hotkeys=False)
     maxed = Disc(15, (Substat("暴击率", 6),) + sample_disc().substats[1:])
-    parser = Mock(side_effect=[RunnerError("弹窗遮住盘面"), maxed])
-    refund = Mock(return_value=True)
-    upgrade = Mock(return_value=True)
+    parser = Mock(return_value=maxed)
+    upgrade = upgrade_once_stub(runner)
     monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
-    monkeypatch.setattr(runner, "_dismiss_material_refund", refund)
     monkeypatch.setattr(runner, "_upgrade_once", upgrade)
     monkeypatch.setattr(runner, "_esc_back_to_grid", Mock(return_value=True))
     assert runner._upgrade_loop(1, runner._default_job(), 0, "R1C1", runner.preset, None, {},
                                 initial_disc=sample_disc()) == 15
     upgrade.assert_called_once()
-    refund.assert_called_once()
-    assert parser.call_count == 2
+    assert parser.call_count == 1  # 升级结果只读一次，不重复解析该返回帧
 
 
 @pytest.mark.parametrize("button", ["查看", "强化", "缺失"])
@@ -2260,15 +2322,15 @@ def test_enter_upgrade_reads_detail_button_area_once(offline_runner, monkeypatch
         region_calls.append(area)
         if area == runner.UPGRADE_BTN_AREA:
             return [] if button == "缺失" else [ocr_module.OcrLine(button, 1, 1600, 800, 1800, 860)]
+        if area == runner.ZOOM_LEVEL_AREA:
+            return [ocr_module.OcrLine("等级03", 1, 1200, 200, 1310, 240)]
         assert area == runner.STAGE_ADD_AREA
         return [ocr_module.OcrLine("阶段添加", 1, 1200, 840, 1360, 880)]
 
     monkeypatch.setattr(ocr_module, "read_rect", read_rect)
-    monkeypatch.setattr(runner, "_read_zoom_level_line", lambda hwnd:
-                        (ocr_module.OcrLine("等级03", 1, 1200, 200, 1310, 240), blank_image()))
     back = Mock(return_value=True)
     monkeypatch.setattr(runner, "_esc_back_to_grid", back)
-    assert runner._enter_upgrade_page(1) is (button != "缺失")
+    assert runner._enter_upgrade_page(1, before=sample_disc(3)) is (button != "缺失")
     assert region_calls.count(runner.UPGRADE_BTN_AREA) == 1
     if button == "缺失":
         offline_runner["click_client"].assert_not_called()

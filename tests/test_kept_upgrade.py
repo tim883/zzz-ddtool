@@ -23,12 +23,19 @@ def kept_disc(level=15, **kwargs):
 
 
 @pytest.fixture
-def setup(monkeypatch):
+def setup(monkeypatch, fast_wait):
     runner = Runner(Preset(ocr_retry=2, weights={"暴击率": 1.0}), hotkeys=False)
     runner.trace = Mock()
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
     monkeypatch.setattr(runner, "_grab", Mock(return_value=(image, "drive_disc", "test", 1)))
+
+    def fake_upgrade_once(hwnd, material_slot=0, *, before=None):
+        # 替身升级输入：按 §6.2 记录升级时刻，供 _await_upgrade_result 使用。
+        runner._upgrade_started_at = rm.time.monotonic()
+        return True
+
+    monkeypatch.setattr(runner, "_upgrade_once", fake_upgrade_once)
     back = Mock(return_value=True)
     monkeypatch.setattr(runner, "_esc_back_to_grid", back)
     monkeypatch.setattr(rm.time, "sleep", lambda _: None)
@@ -127,7 +134,6 @@ def test_upgraded_keep_is_counted_as_success_even_when_save_disabled(setup, monk
     runner.preset = replace(runner.preset, labels=LabelPolicy(save=save))
     finish = Mock()
     monkeypatch.setattr(runner, "_finish_kept_upgrade", finish)
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     job = runner._default_job()
     index = runner.stats.disc_begin(job.job_id, 0, 12)
@@ -141,7 +147,6 @@ def test_upgraded_keep_is_counted_as_success_even_when_save_disabled(setup, monk
 def test_keep_label_failure_is_not_counted_as_success(setup, monkeypatch):
     runner, _, _, _, _ = setup
     monkeypatch.setattr(runner, "_finish_kept_upgrade", Mock(side_effect=RunnerError("lock failed")))
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     job = runner._default_job()
     index = runner.stats.disc_begin(job.job_id, 0, 12)
@@ -165,7 +170,6 @@ def test_originally_max_level_remains_skipped(setup, monkeypatch):
 
 def test_real_kept_finish_runs_inside_upgrade_loop_and_counts_only_after_lock(setup, monkeypatch):
     runner, state, _, keys, _ = setup
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     job = runner._default_job()
     index = runner.stats.disc_begin(job.job_id, 0, 12)
@@ -174,12 +178,13 @@ def test_real_kept_finish_runs_inside_upgrade_loop_and_counts_only_after_lock(se
     assert runner.stats.summary()["max_level_kept"] == 1
 
 
-def test_ocr_error_is_bounded_and_becomes_failed_finish(setup):
+def test_ocr_error_propagates_immediately_without_retry(setup):
+    """§6.1.1：保留锁定盘面复核抛 OcrError 立即原样传播，不重读、不发后续 T/R。"""
     runner, _, parser, keys, _ = setup
     parser.side_effect = OcrError("OCR unavailable")
-    with pytest.raises(RunnerError, match="无法确认"):
+    with pytest.raises(OcrError):
         runner._finish_kept_upgrade(1, kept_disc())
-    assert parser.call_count == 2 and keys == []
+    assert parser.call_count == 1 and keys == []
 
 
 def test_unknown_after_t_fails_without_second_t(setup, monkeypatch):
@@ -199,7 +204,6 @@ def test_level_fifteen_final_discard_uses_original_discard_path(setup, monkeypat
     finish, discard = Mock(), Mock()
     monkeypatch.setattr(runner, "_finish_kept_upgrade", finish)
     monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     decisions = iter([Decision(Action.UPGRADE, "test_upgrade", 1, 1, 4, 12),
                       Decision(Action.MARK_DISCARD, "test_discard", 0, 0, 4, 15)])
@@ -217,7 +221,6 @@ def test_level_fifteen_final_discard_uses_original_discard_path(setup, monkeypat
 def test_upgrade_discard_failure_is_not_counted_as_success(setup, monkeypatch):
     runner, _, _, _, _ = setup
     monkeypatch.setattr(runner, "_discard_from_upgrade", Mock(side_effect=RunnerError("discard failed")))
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     decisions = iter([Decision(Action.UPGRADE, "test_upgrade", 1, 1, 4, 12),
                       Decision(Action.MARK_DISCARD, "test_discard", 0, 0, 4, 15)])
@@ -235,7 +238,6 @@ def test_upgrade_discard_failure_is_not_counted_as_success(setup, monkeypatch):
 def test_finish_transport_errors_are_counted_failed(setup, monkeypatch, error):
     runner, _, _, _, _ = setup
     monkeypatch.setattr(runner, "_finish_kept_upgrade", Mock(side_effect=error("backend")))
-    monkeypatch.setattr(runner, "_upgrade_once", Mock(return_value=True))
     monkeypatch.setattr(runner, "_parse_upgrade_page", Mock(return_value=kept_disc()))
     job = runner._default_job()
     index = runner.stats.disc_begin(job.job_id, 0, 12)
