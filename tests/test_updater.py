@@ -111,3 +111,40 @@ def test_apply_data_update_strips_protected_and_merges_into_data(tmp_path: Path,
     assert (data_root / "keep.json").read_text(encoding="utf-8") == "KEEP"  # 不删除 data/ 多余文件
     assert not (data_root / "user").exists()
     assert not (data_root / "log").exists()
+
+
+def _http_404(body: bytes):
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError("http://x", 404, "Not Found", {}, io.BytesIO(body))
+
+
+def _raiser(exc):
+    def _raise(*args, **kwargs):
+        raise exc
+
+    return _raise
+
+
+def test_check_for_update_distinguishes_invisible_repo(monkeypatch) -> None:
+    """仓库不可见（不存在/未公开）不能伪装成"没有新版本"。"""
+    body = b'{"message":"Not Found Project"}'
+    monkeypatch.setattr(updater.urllib.request, "urlopen", _raiser(_http_404(body)))
+
+    st = updater.check_for_update()
+
+    assert st.available is False
+    assert "仓库" in st.error
+    assert "暂无可用版本" not in st.error
+
+
+def test_check_for_update_plain_404_means_no_release(monkeypatch) -> None:
+    """仓库可见但还没有发行版 —— 维持原文案。"""
+    body = b'{"message":"404 Not Found"}'
+    monkeypatch.setattr(updater.urllib.request, "urlopen", _raiser(_http_404(body)))
+
+    st = updater.check_for_update()
+
+    assert st.available is False
+    assert st.error == "暂无可用版本"

@@ -72,6 +72,15 @@ def check_for_update() -> UpdateStatus:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
+            # Gitee 对"仓库不存在/未公开"与"仓库可见但无发行版"给不同的 message；
+            # 混判会让"仓库没公开"伪装成"没有新版本"。
+            try:
+                payload = json.loads(exc.read().decode("utf-8", "replace")) or {}
+            except Exception:
+                payload = {}
+            message = str(payload.get("message") or "")
+            if "Not Found Project" in message:
+                return UpdateStatus(False, "", current, error="仓库不可访问（不存在或未公开）")
             return UpdateStatus(False, "", current, error="暂无可用版本")
         return UpdateStatus(False, "", current, error=f"检查失败（HTTP {exc.code}）")
     except Exception as exc:  # 网络错误、超时、JSON 解析失败等
