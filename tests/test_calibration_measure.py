@@ -446,7 +446,9 @@ def test_report_digest_ignores_self_reference_and_written_state():
 
 
 def test_policies_from_summary_use_floors_with_fixed_schedule():
-    summary = {kind: {"floor_ms": 700} for kind in mw.readiness.KINDS}
+    summary = {
+        kind: {"floor_ms": 700, "status": "calibrated"} for kind in mw.readiness.KINDS
+    }
     policies = mw.policies_from_summary(summary)
 
     assert set(policies) == set(mw.readiness.KINDS)
@@ -457,13 +459,90 @@ def test_policies_from_summary_use_floors_with_fixed_schedule():
         assert policy.timeout_ms == mw.readiness.default_policy(kind).timeout_ms
 
 
-def test_measurements_carry_the_report_digest_for_every_kind():
+def test_policies_from_summary_keeps_only_calibrated_kinds():
+    """§6.4：档案仅存已完成标定的 kind；失败/不足/被动观测从两侧省略、运行时用默认。"""
     summary = {
-        kind: {"floor_ms": 600, "measurement": {"count": 3, "max_stable_ms": 120.0}}
+        "select_disc": {"floor_ms": 1560, "status": "calibrated"},
+        "open_preview": {"floor_ms": 1260, "status": "calibrated"},
+        "open_upgrade": {"floor_ms": 1500, "status": "failed"},
+        "material_ready": {"floor_ms": 600, "status": "measured_only"},
+        "upgrade_result": {"floor_ms": 1500, "status": "measured_only"},
+        "return_warehouse": {"floor_ms": 600, "status": "insufficient"},
+    }
+    policies = mw.policies_from_summary(summary)
+
+    assert set(policies) == {"select_disc", "open_preview"}
+    assert [policy.min_wait_ms for policy in policies.values()] == [1560, 1260]
+
+
+def test_measurements_carry_the_report_digest_for_calibrated_kinds():
+    summary = {
+        kind: {"floor_ms": 600, "status": "calibrated",
+               "measurement": {"count": 3, "max_stable_ms": 120.0}}
         for kind in mw.readiness.KINDS
     }
+    summary["open_upgrade"] = {"floor_ms": 1500, "status": "failed",
+                               "measurement": {"count": 0, "max_stable_ms": None}}
     measurements = mw.measurements_from_summary(summary, "abc123")
 
-    assert set(measurements) == set(mw.readiness.KINDS)
+    assert set(measurements) == set(mw.readiness.KINDS) - {"open_upgrade"}
     assert all(body["report_sha256"] == "abc123" for body in measurements.values())
     assert all(body["floor_ms"] == 600 for body in measurements.values())
+
+
+def _env():
+    return {
+        "machine_id": "machine-1",
+        "client_width": 1920,
+        "client_height": 1080,
+        "window_dpi": 96,
+        "game_exe_path": r"C:\game\zzz.exe",
+        "game_build": "build-1",
+    }
+
+
+def test_profile_written_from_mixed_summary_is_loadable_and_applies_floors(tmp_path):
+    """写出→加载回环：混合状态 summary 只写已标定 kind，加载后下限真正生效（修 R6 回归）。"""
+    summary = {
+        "select_disc": {"floor_ms": 1560, "status": "calibrated",
+                        "measurement": {"count": 20, "max_stable_ms": 1455.1}},
+        "open_preview": {"floor_ms": 1260, "status": "calibrated",
+                         "measurement": {"count": 5, "max_stable_ms": 1157.4}},
+        "open_upgrade": {"floor_ms": 1500, "status": "failed",
+                         "measurement": {"count": 0, "max_stable_ms": None}},
+        "material_ready": {"floor_ms": 600, "status": "measured_only",
+                           "measurement": {"count": 0, "max_stable_ms": None}},
+        "upgrade_result": {"floor_ms": 1500, "status": "measured_only",
+                           "measurement": {"count": 0, "max_stable_ms": None}},
+        "return_warehouse": {"floor_ms": 600, "status": "insufficient",
+                             "measurement": {"count": 5, "max_stable_ms": 399.1}},
+    }
+    path = tmp_path / "scan-waits.json"
+    policies = mw.policies_from_summary(summary)
+    measurements = mw.measurements_from_summary(summary, "abc123")
+    assert set(policies) == set(measurements) == {"select_disc", "open_preview"}
+
+    assert mw.readiness.write_wait_profile(_env(), policies, measurements, path=path).status == "ok"
+    loaded = mw.readiness.load_wait_policies(_env(), path=path)
+    assert loaded["select_disc"].min_wait_ms == 1560
+    assert loaded["open_preview"].min_wait_ms == 1260
+    assert loaded["open_upgrade"] == mw.readiness.default_policy("open_upgrade")
+    assert loaded["material_ready"] == mw.readiness.default_policy("material_ready")
+    assert loaded["upgrade_result"] == mw.readiness.default_policy("upgrade_result")
+
+
+def test_profile_without_calibrated_kinds_is_empty_and_legal(tmp_path):
+    """全部 kind 未完成标定时，空档案合法：两侧省略、加载全用默认（§6.4）。"""
+    summary = {
+        kind: {"floor_ms": mw.readiness.DEFAULT_FLOOR_MS[kind], "status": "insufficient",
+               "measurement": {"count": 0, "max_stable_ms": None}}
+        for kind in mw.readiness.KINDS
+    }
+    policies = mw.policies_from_summary(summary)
+    measurements = mw.measurements_from_summary(summary, "abc123")
+    assert policies == {} and measurements == {}
+
+    path = tmp_path / "scan-waits.json"
+    assert mw.readiness.write_wait_profile(_env(), policies, measurements, path=path).status == "ok"
+    loaded = mw.readiness.load_wait_policies(_env(), path=path)
+    assert all(loaded[kind] == mw.readiness.default_policy(kind) for kind in mw.readiness.KINDS)

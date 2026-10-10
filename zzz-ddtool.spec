@@ -31,6 +31,8 @@ a = Analysis(
         ("src/zzz_ddtool/assets/templates", "zzz_ddtool/assets/templates"),
         # 扫描提速的固定行布局清单与模板，运行时 assets_dir()/discocr 从包内读
         ("src/zzz_ddtool/assets/discocr", "zzz_ddtool/assets/discocr"),
+        # 套装名图片模板（套装筛选点选），运行时 assets_dir()/picker 从包内读
+        ("src/zzz_ddtool/assets/picker", "zzz_ddtool/assets/picker"),
     ],
     hiddenimports=[],
     hookspath=[],

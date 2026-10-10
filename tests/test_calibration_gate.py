@@ -645,6 +645,54 @@ def test_check_calibration_passes_with_calibrated_open_preview(gate):
     assert evidence["recomputed_summary"]["open_preview"]["floor_ms"] == 150
 
 
+def test_check_calibration_k8_profile_round_trip_and_rejects_extra_kinds(gate, monkeypatch):
+    """§6.4：档案只存已完成标定的 kind，且写出结果必须能被加载端接受（修 R6 回归）。
+
+    正向：混合状态 summary 只把 open_preview 写进档案，加载端接受、下限生效 → K8 通过；
+    反向：档案里混入未标定的 open_upgrade（旧写法的全六 kind）→ K8 不通过。
+    """
+    import zzz_ddtool.readiness as readiness
+
+    env = {"machine_id": "m", "client_width": 1920, "client_height": 1080,
+           "window_dpi": 96, "game_exe_path": r"C:\game\zzz.exe", "game_build": "build-1"}
+    summary = json.loads(json.dumps(EMPTY_SUMMARY))
+    summary["open_preview"] = {"status": "calibrated", "reason_codes": [],
+                               "valid_count": 5, "floor_ms": 150}
+    body = calib_body(gate, profile_status="ok", environment=env, summary=summary, samples=[
+        sample(f"open-{i}", "open_preview", probes(62)) for i in range(5)
+    ])
+    profile = gate.root / "user" / "scan-waits.json"
+    result = readiness.write_wait_profile(
+        env,
+        {"open_preview": readiness.WaitPolicy(150, 5000, 50, 2)},
+        {"open_preview": {"count": 5, "max_stable_ms": 100.0, "floor_ms": 150,
+                          "report_sha256": body["report_sha256"]}},
+        path=profile,
+    )
+    assert result.status == "ok"
+    body["profile_sha256"] = result.profile_sha256
+    write_calib(gate, body)
+    monkeypatch.setattr(readiness, "wait_profile_path", lambda: profile)
+
+    checks, _evidence, passed = vs.check_calibration()
+    assert checks_by_id(checks)["K8"]["passed"] is True
+    assert passed is True
+
+    doc = json.loads(profile.read_text(encoding="utf-8"))
+    for section in ("policies", "measurements"):
+        assert set(doc[section]) == {"open_preview"}
+
+    doc["policies"]["open_upgrade"] = {"min_wait_ms": 1500, "timeout_ms": 8000,
+                                       "poll_ms": 50, "stable_frames": 2}
+    doc["measurements"]["open_upgrade"] = {"count": 0, "max_stable_ms": None, "floor_ms": 1500,
+                                           "report_sha256": body["report_sha256"]}
+    profile.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    body["profile_sha256"] = vs.sha256_file(profile)
+    write_calib(gate, body)
+
+    assert checks_by_id(vs.check_calibration()[0])["K8"]["passed"] is False
+
+
 # --------------------------------------------------------------------------
 # check_final（F1～F6）
 # --------------------------------------------------------------------------

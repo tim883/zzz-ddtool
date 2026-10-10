@@ -363,6 +363,8 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch, stub: _PickerStub, *, passthr
     image = QImage(1920, 1080, QImage.Format_RGB32)
     image.fill(0)
 
+    # 替身帧与真实模板资产无关：本组用例统一走名称带 OCR 路径，结果只由脚本决定。
+    monkeypatch.setattr(gf, "_picker_templates_disabled", True)
     monkeypatch.setattr(gf, "_grab", lambda: (image, stub.hwnd))
     monkeypatch.setattr(gf, "_window_dpi", lambda _hwnd: 96)
     monkeypatch.setattr(gf, "window_pid", lambda _hwnd: 200)
@@ -1094,6 +1096,77 @@ def test_span_failure_stops_before_any_click(monkeypatch: pytest.MonkeyPatch) ->
         _run(session, stub, ("河豚电音", "静听嘉音"))
     assert stub.clicks == []  # 同帧另一个目标也不点
     assert session.routes == {}
+
+
+def test_approximate_name_retries_on_fresh_frame_before_clicking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """用户决定（2026-10-11）：近似命中不点击，重拍重读，认对一次即用。"""
+    stub = _PickerStub([["静听嘉音", "河豚电音"]])
+    _install_stub(monkeypatch, stub)
+    original = gf.read_name_bands
+    calls = {"n": 0}
+
+    def batch(image, bands):
+        calls["n"] += 1
+        lines = original(image, bands)
+        if calls["n"] == 1:  # 首次近似命中：不点击，换新帧重读
+            return [replace(line, text="河豚电台") if line.text == "河豚电音" else line
+                    for line in lines]
+        return lines
+
+    monkeypatch.setattr(gf, "read_name_bands", batch)
+    session = FilterReplaySession()
+    _run(session, stub, ("河豚电音", "静听嘉音"))
+
+    assert calls["n"] == 2  # 第一次近似命中后重读一次即认对
+    assert len(stub.clicks) == 3  # 两个目标各一次 + 确认
+    assert stub.selected == {"河豚电音", "静听嘉音"}
+    assert stub.popup_open is False
+    assert session.last_metrics is not None and session.last_metrics["success"] is True
+
+
+def test_approximate_name_retries_are_bounded_and_never_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重读有上限：始终认不对时按 R21 整段零点击停止，不无限重拍。"""
+    stub = _PickerStub([["静听嘉音", "河豚电音"]])
+    _install_stub(monkeypatch, stub)
+    original = gf.read_name_bands
+    calls = {"n": 0}
+
+    def batch(image, bands):
+        calls["n"] += 1
+        return [replace(line, text="河豚电台") if line.text == "河豚电音" else line
+                for line in original(image, bands)]
+
+    monkeypatch.setattr(gf, "read_name_bands", batch)
+    session = FilterReplaySession()
+    with pytest.raises(gf.FilterClickError, match="无法隔离精确文字框"):
+        _run(session, stub, ("河豚电音", "静听嘉音"))
+
+    assert calls["n"] == gf._PICKER_NAME_READ_ATTEMPTS
+    assert stub.clicks == [] and stub.wheels == []
+    assert session.routes == {}
+
+
+def test_picker_template_asset_failure_falls_back_to_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """模板资产损坏：只点名告警一次并回落名称带 OCR，点选流程照常完成、不点击错目标。"""
+    stub = _PickerStub([["静听嘉音", "河豚电音"]])
+    _install_stub(monkeypatch, stub)
+    monkeypatch.setattr(gf, "_picker_templates_disabled", False)
+    warnings: list = []
+    monkeypatch.setattr(
+        gf.get_logger("zzz_ddtool.gamefilter"), "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    def broken(_image, _band):
+        raise gf.picker_names.PickerAssetError("boom")
+
+    monkeypatch.setattr(gf.picker_names, "classify", broken)
+    session = FilterReplaySession()
+    _run(session, stub, ("河豚电音", "静听嘉音"))
+
+    assert stub.selected == {"河豚电音", "静听嘉音"}
+    assert gf._picker_templates_disabled is True
+    assert warnings
 
 
 # ---------------------------------------------------------------- R25

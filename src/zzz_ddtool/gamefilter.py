@@ -36,6 +36,7 @@ from zzz_ddtool.layout import (
 )
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.ocr import OcrLine, read_name_bands, read_name_span, read_rect
+from zzz_ddtool import picker_names
 from zzz_ddtool.wininput import (
     VK_ESCAPE,
     click_client,
@@ -93,6 +94,11 @@ _PICKER_MAX_ROUNDS = 8
 _PICKER_OBSERVE_FRAMES = 3
 _PICKER_OBSERVE_INTERVAL_S = 0.1
 _PICKER_CONFIRM_TEXT = "确认筛选"
+# 名称带近似命中但未能精确隔离时的重拍重读上限（用户决定 2026-10-11）：
+# 识别错误不点击，重拍新帧再认，认对一次即用；上限内仍无法精确隔离才按 R21 停止。
+_PICKER_NAME_READ_ATTEMPTS = 5
+# 重拍前的短暂等待：给游戏一帧新的呈现，不改变任何点击/滚动时序。
+_PICKER_NAME_RETRY_DELAY_S = 0.1
 
 
 class _PickerMetrics:
@@ -376,6 +382,95 @@ def _picker_name_bands(
     return tuple(bands)
 
 
+#: 套装名模板资产不可用时置真：本轮回落名称带 OCR（不阻断点选流程）。
+_picker_templates_disabled = False
+
+
+def _read_picker_targets(
+    image: QImage, pending: Sequence[str], layout: SetPickerLayout, metrics: _PickerMetrics
+) -> dict | None:
+    """一帧的名称读取与匹配（§5.1.2）：列表区粗读 → 完整名称带逐带认名 → 匹配。
+
+    名称带先走本地图片模板（`picker_names`，用户决定 2026-10-11）：命中即可靠认定，
+    未命中/歧义的带才送批量 OCR；模板资产损坏时整轮回落 OCR。冲突返回 None。
+    """
+    global _picker_templates_disabled
+    lines = read_rect(image, layout.list_area)
+    metrics.search_ocr_calls += 1
+    bands = _picker_name_bands(image, lines, layout)
+    if not bands:
+        return _match_targets([], pending)
+    decided: dict[int, OcrLine] = {}
+    undecided: list[int] = []
+    for index, band in enumerate(bands):
+        hit = None
+        if not _picker_templates_disabled:
+            try:
+                hit = picker_names.classify(image, band)
+            except picker_names.PickerAssetError as exc:
+                _picker_templates_disabled = True
+                get_logger("zzz_ddtool.gamefilter").warning(
+                    "套装名模板资产不可用，本轮回落名称带 OCR：%s", exc
+                )
+        if hit is None:
+            undecided.append(index)
+            continue
+        name, score, box = hit
+        decided[index] = OcrLine(
+            text=name, score=score, left=box[0], top=box[1], right=box[2], bottom=box[3]
+        )
+    if undecided:
+        read = read_name_bands(image, [bands[i] for i in undecided])
+        metrics.search_ocr_calls += 1
+        for index, line in zip(undecided, read):
+            if line is not None:
+                decided[index] = line
+    return _match_targets([decided[i] for i in sorted(decided)], pending)
+
+
+def _prepare_picker_clicks(
+    image: QImage,
+    names: Sequence[str],
+    matched: dict,
+    prepared: list[tuple[str, SetPickerClick]],
+    prepared_boxes: list[tuple[str, SetPickerClick, tuple[int, int, int, int]]],
+) -> str | None:
+    """准备本帧全部候选的点击框与指纹（§5.1.3 / R21）。
+
+    返回第一个近似命中但未能精确隔离的名称（调用方可重拍重读）；框重叠或指纹生成失败
+    立即抛错。任何点击之前必须全部就绪。
+    """
+    prepared.clear()
+    prepared_boxes.clear()
+    for name in [n for n in names if n in matched]:
+        line = matched[name]
+        if _normalize_match_text(line.text) != _normalize_match_text(name):
+            return name
+        box = (line.left, line.top, line.right, line.bottom)
+        if any(_boxes_overlap(box, other) for _n, _c, other in prepared_boxes):
+            raise FilterClickError("两个目标的名称框重叠，停止。")
+        identity = make_identity(image, box)
+        if identity is None:
+            raise FilterClickError(f"套装名 {name!r} 的文字指纹生成失败，停止。")
+        prepared.append(
+            (
+                name,
+                SetPickerClick(
+                    name=name,
+                    left=box[0],
+                    top=box[1],
+                    right=box[2],
+                    bottom=box[3],
+                    x=(box[0] + box[2]) // 2,
+                    y=(box[1] + box[3]) // 2,
+                    identity=identity,
+                ),
+            )
+        )
+        prepared_boxes.append((name, prepared[-1][1], box))
+    return None
+
+
 def _select_sets_learn(
     hwnd: int,
     names: Sequence[str],
@@ -386,7 +481,11 @@ def _select_sets_learn(
     key: SetPickerKey,
     metrics: _PickerMetrics,
 ) -> SetPickerRoute:
-    """§5.1 学习：定位、执行并记录滚动与点击；成功后才返回完整路径（失败不发布半成品）。"""
+    """§5.1 学习：定位、执行并记录滚动与点击；成功后才返回完整路径（失败不发布半成品）。
+
+    名称带近似命中但未精确隔离时，不点击并重拍新帧重读（上限见
+    `_PICKER_NAME_READ_ATTEMPTS`），认对一次即用；上限内仍不精确才按 R21 停止。
+    """
     stages: list[SetPickerStage] = []
     pending = list(names)
     stage_index = 0
@@ -397,15 +496,7 @@ def _select_sets_learn(
     image, _ = _grab()
 
     for round_index in range(_PICKER_MAX_ROUNDS):
-        lines = read_rect(image, layout.list_area)
-        metrics.search_ocr_calls += 1
-        bands = _picker_name_bands(image, lines, layout)
-        if bands:
-            lines = [line for line in read_name_bands(image, bands) if line is not None]
-            metrics.search_ocr_calls += 1
-        else:
-            lines = []
-        matched = _match_targets(lines, pending)
+        matched = _read_picker_targets(image, pending, layout, metrics)
         if matched is None:
             raise FilterClickError("套装名称匹配到冲突框（同分或同框），停止。")
         clicks: list[SetPickerClick] = []
@@ -414,33 +505,23 @@ def _select_sets_learn(
         prepared: list[tuple[str, SetPickerClick]] = []
         prepared_boxes: list[tuple[str, SetPickerClick, tuple[int, int, int, int]]] = []
         # §5.1.3 / R21：本帧**所有**候选的名称框与指纹先全部就绪，任何一项失败都在任何点击之前停止
-        for name in [n for n in names if n in matched]:
-            line = matched[name]
-            if _normalize_match_text(line.text) != _normalize_match_text(name):
-                raise FilterClickError(f"套装名 {name!r} 无法隔离精确文字框，停止。")
-            span = line
-            box = (span.left, span.top, span.right, span.bottom)
-            if any(_boxes_overlap(box, other) for _n, _c, other in prepared_boxes):
-                raise FilterClickError("两个目标的名称框重叠，停止。")
-            identity = make_identity(image, box)
-            if identity is None:
-                raise FilterClickError(f"套装名 {name!r} 的文字指纹生成失败，停止。")
-            prepared.append(
-                (
-                    name,
-                    SetPickerClick(
-                        name=name,
-                        left=box[0],
-                        top=box[1],
-                        right=box[2],
-                        bottom=box[3],
-                        x=(box[0] + box[2]) // 2,
-                        y=(box[1] + box[3]) // 2,
-                        identity=identity,
-                    ),
-                )
+        failing = _prepare_picker_clicks(image, names, matched, prepared, prepared_boxes)
+        # 近似命中但未精确隔离：识错不点击，重拍新帧再认，认对一次即用（用户决定 2026-10-11）。
+        for attempt in range(2, _PICKER_NAME_READ_ATTEMPTS + 1):
+            if failing is None:
+                break
+            get_logger("zzz_ddtool.gamefilter").info(
+                "套装名 %r 未精确隔离，重拍重读第 %d/%d 次", failing, attempt, _PICKER_NAME_READ_ATTEMPTS
             )
-            prepared_boxes.append((name, prepared[-1][1], box))
+            time.sleep(_PICKER_NAME_RETRY_DELAY_S)
+            image, _ = _grab()
+            metrics.verification_frames += 1
+            matched = _read_picker_targets(image, pending, layout, metrics)
+            if matched is None:
+                raise FilterClickError("套装名称匹配到冲突框（同分或同框），停止。")
+            failing = _prepare_picker_clicks(image, names, matched, prepared, prepared_boxes)
+        if failing is not None:
+            raise FilterClickError(f"套装名 {failing!r} 无法隔离精确文字框，停止。")
         for name, click in prepared:
             box = (click.left, click.top, click.right, click.bottom)
             ref = _click_ref(box)

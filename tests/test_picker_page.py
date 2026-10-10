@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtGui import QImage
 
-from zzz_ddtool import gamefilter as gf, ocr
+from zzz_ddtool import gamefilter as gf, ocr, picker_names
 from zzz_ddtool.control import checkpoint_input, controlled_inputs
 from zzz_ddtool.filter_replay import FilterReplaySession, identity_matches, make_identity
 
@@ -60,10 +60,15 @@ def test_page_learning_then_replay_uses_real_identity_and_no_name_ocr(page, monk
     monkeypatch.setattr(gf, "_picker_popup_closed", lambda _: not popup[0])
     monkeypatch.setattr(gf, "_panel_present", lambda _: not popup[0])
 
+    def name_of_box(box, tol=8):
+        """按名称框认名字；模板命中的框与 OCR 框可能差几像素，用容差匹配。"""
+        left, top, right, bottom = box
+        return next((n for n, line in by_name.items()
+                     if abs(line.left - left) <= tol and abs(line.top - top) <= tol
+                     and abs(line.right - right) <= tol and abs(line.bottom - bottom) <= tol), None)
+
     def state(frame, ref):
-        name = next((n for n, line in by_name.items() if
-                     (line.left,line.top,line.right,line.bottom) ==
-                     (ref.left,ref.top,ref.right,ref.bottom)), None)
+        name = name_of_box((ref.left, ref.top, ref.right, ref.bottom))
         return True if name in selected else original_selected(frame, ref)
 
     def click(hwnd, x, y):
@@ -220,3 +225,50 @@ def test_measured_three_row_pages_cover_contiguous_rows():
         bands = gf._picker_name_bands(image, ocr.read_rect(image, layout.list_area), layout)
         names = ocr.read_name_bands(image, bands)
         assert [line.text for line in names if line] == expected[start:stop]
+
+
+CANONICAL_SET_NAMES = [
+    "荆棘玫瑰", "谶羽之誓", "拂晓行纪", "呼啸沙龙",
+    "囚徒手记", "雪兔梦游仙境", "流光咏叹", "沧浪行歌",
+    "月光骑士颂", "拂晓生花", "山大王", "云岿如我",
+    "法厄同之歌", "如影相随", "折枝剑歌", "静听嘉音",
+    "混沌爵士", "原始朋克", "啄木鸟电音", "河豚电音",
+    "震星迪斯科", "自由蓝调", "激素朋克", "灵魂摇滚",
+    "摇摆爵士", "炎狱重金属", "混沌重金属", "雷暴重金属",
+    "极地重金属", "獠牙重金属",
+]
+
+
+def test_picker_name_templates_cover_all_thirty_names():
+    entries = picker_names.load_entries()
+    assert {entry.name for entry in entries} == set(CANONICAL_SET_NAMES)
+    assert all(entry.array.size for entry in entries)
+
+
+def test_templates_decide_real_bottom_and_misread_frames():
+    """2026-10-11 误读帧与既有底部帧：模板逐带认定，含「獠牙重金属」不靠 OCR。"""
+    layout = gf._calibrated_layout(1920, 1080)
+    expected = ["震星迪斯科", "自由蓝调", "激素朋克", "灵魂摇滚", "摇摆爵士",
+                "炎狱重金属", "混沌重金属", "雷暴重金属", "极地重金属", "獠牙重金属",
+                None, None]
+    for filename in ("套装弹窗-三行翻页-底部.png", "套装弹窗-底部獠牙误读-20261011.png"):
+        image = QImage(str(BASE / filename))
+        assert not image.isNull()
+        bands = gf._picker_name_bands(image, ocr.read_rect(image, layout.list_area), layout)
+        got = [picker_names.classify(image, band) for band in bands]
+        assert [hit[0] if hit else None for hit in got] == expected, filename
+
+
+def test_read_targets_decides_by_template_without_name_ocr(monkeypatch):
+    """生产入口：獠牙重金属 由图片模板认定；批量名称 OCR 即使整批返回空也不影响。"""
+    layout = gf._calibrated_layout(1920, 1080)
+    image = QImage(str(BASE / "套装弹窗-底部獠牙误读-20261011.png"))
+    metrics = gf._PickerMetrics("learn")
+    monkeypatch.setattr(gf, "read_name_bands", lambda _image, _bands: [])
+
+    matched = gf._read_picker_targets(image, ["獠牙重金属"], layout, metrics)
+
+    assert matched is not None and "獠牙重金属" in matched
+    line = matched["獠牙重金属"]
+    assert line.text == "獠牙重金属"
+    assert 40 < line.right - line.left < 130
