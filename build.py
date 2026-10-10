@@ -35,8 +35,12 @@ def _read_version() -> str:
 
 
 def copy_runtime_data(source: Path, target: Path) -> None:
-    """YAML files are saved task plans, not release resources."""
+    """只丢最外层 `data/` 直属的 YAML（任务存档），放行 `data/examples/` 下的示例。"""
+    root = source.resolve()
+
     def ignore_plans(directory: str, names: list[str]) -> list[str]:
+        if Path(directory).resolve() != root:
+            return []
         return [name for name in names if Path(name).suffix.lower() in {".yaml", ".yml"}]
 
     shutil.copytree(source, target, ignore=ignore_plans, dirs_exist_ok=True)

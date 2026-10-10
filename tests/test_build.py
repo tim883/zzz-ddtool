@@ -183,3 +183,31 @@ def test_external_output_directory_remains_supported(tmp_path: Path, monkeypatch
     _stub_pyinstaller(monkeypatch, outdir)
     assert build.main(["--outdir", str(outdir)]) == 0
     assert (outdir / build.PKG_NAME / "zzz-ddtool.exe").is_file()
+
+
+def test_examples_are_packaged_but_loose_yaml_is_not(tmp_path: Path) -> None:
+    """data/ 直属的 YAML 是任务存档、不出厂；data/examples/ 下的示例要随包发。"""
+    src = tmp_path / "data"
+    (src / "examples").mkdir(parents=True)
+    (src / "examples" / "example.yaml").write_text("name: x", encoding="utf-8")
+    (src / "sets.json").write_text("[]", encoding="utf-8")
+    (src / "test-material-short.yaml").write_text("name: dev", encoding="utf-8")
+
+    out = tmp_path / "out"
+    build.copy_runtime_data(src, out)
+
+    assert (out / "examples" / "example.yaml").exists()
+    assert (out / "sets.json").exists()
+    assert not (out / "test-material-short.yaml").exists()
+
+
+def test_nested_directory_named_data_keeps_its_yaml(tmp_path: Path) -> None:
+    """过滤只作用于本次复制的最外层：嵌套的 data/ 目录不该被连带丢掉。"""
+    src = tmp_path / "data"
+    (src / "examples" / "data").mkdir(parents=True)
+    (src / "examples" / "data" / "nested.yaml").write_text("name: n", encoding="utf-8")
+
+    out = tmp_path / "out"
+    build.copy_runtime_data(src, out)
+
+    assert (out / "examples" / "data" / "nested.yaml").exists()
