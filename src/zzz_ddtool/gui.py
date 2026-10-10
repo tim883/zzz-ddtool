@@ -3658,11 +3658,19 @@ def run_gui(config: Path | None = None) -> int:
     # 先把上次存的日志级别 / 截图上限装回去。放在最前：get_logger 首次调用会懒
     # setup() 按默认级别配置，restore 越早，启动最早那批日志的级别越准。
     from zzz_ddtool.logprefs import restore
+    from zzz_ddtool.singleinstance import acquire, release
 
     restore()
     app = QApplication.instance() or QApplication(sys.argv)
-    apply_light_style(app)
-    window = MainWindow(config)
-    window.show()
-    return app.exec()
+    lock = acquire()
+    if lock is None:
+        QMessageBox.information(None, "zzz-ddtool", "程序已在运行。")
+        return 0
+    try:
+        apply_light_style(app)
+        window = MainWindow(config)
+        window.show()
+        return app.exec()
+    finally:
+        release(lock)
 
