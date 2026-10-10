@@ -26,3 +26,6 @@ user/
 
 # Scratch / probe scripts, not committed
 tmp/
+
+# Runner single-instance lock (runtime artifact)
+.zzz-ddtool.lock

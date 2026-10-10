@@ -108,11 +108,17 @@ _FORWARD_ROWS = 2
 _SETTLE_FALLBACK_MS = 500
 
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
-# 经验/预计等级条 ROI 的平均绝对灰度差：变化阈值必须大于稳定阈值。
-# 真实帧对的候选值核对留步骤 7（被动复用真实添加前后帧），未触发则记未覆盖。
-_MATERIAL_BAR_CHANGE_THRESHOLD = 6.0
-_MATERIAL_BAR_STABLE_THRESHOLD = 2.0
-_MATERIAL_BAR_QUANT = 4
+# 描述子＝经验/预计等级条 ROI 的「饱和度」（max(R,G,B)-min(R,G,B)）再按各帧自身 p85 归一化。
+# 空条与底色是灰（饱和度恒为 0），只有填充色像素有饱和度 → 彩色掩码天然排掉灰区；
+# 按本帧 p85 归一化又抵消了填充色上那层亮度呼吸动画。变化阈值必须大于稳定阈值。
+# 真实帧对核对（步骤 9 真机，2026-10-10）：
+#   就绪态 24 帧两两最大差 0.008；操作前空条 → 就绪态 ≥0.63（空条归一化后全 0）→ 分离度约 78x。
+_MATERIAL_BAR_CHANGE_THRESHOLD = 0.20
+_MATERIAL_BAR_STABLE_THRESHOLD = 0.05
+#: 逐格「是否已填充」的二值判据（归一化饱和度）；24 帧就绪态离该阈值最差裕量 0.129。
+_MATERIAL_BAR_FILL_THRESHOLD = 0.5
+#: 本帧饱和度 p85 低于此值＝整条无彩色（空条/尚未填充）→ 归一化后视为全 0。
+_MATERIAL_BAR_MIN_SATURATION = 12.0
 
 
 def _jsonable_key(key):
@@ -551,7 +557,12 @@ class Runner:
         return int(match.group(1)) if match else None
 
     def _material_bar_crop(self, image):
-        """§6.2 material_ready：经验/预计等级条的灰度数组（各帧同一 ROI/归一化）。"""
+        """§6.2 material_ready：经验/预计等级条的归一化饱和度数组（各帧同一 ROI/口径）。
+
+        掩码＝**彩色掩码**：空条与底色是灰（饱和度 0），只有填充色像素有饱和度，
+        灰区因此自动被排除；再按本帧 p85 归一化，抵消填充色上的亮度呼吸动画。
+        整条都无彩色（空条/尚未填充）时返回全 0，与「已更新」明显分离。
+        """
         import numpy as np
 
         from zzz_ddtool.ocr import qimage_to_bgr
@@ -565,9 +576,18 @@ class Runner:
             return None
         crop = image.copy(left, top, right - left, bottom - top)
         bgr = qimage_to_bgr(crop)
-        if bgr.ndim == 3:
-            bgr = bgr.mean(axis=2)
-        return np.asarray(bgr, dtype="float32")
+        if bgr.ndim != 3:
+            return None
+        blue = bgr[:, :, 0].astype("float32")
+        green = bgr[:, :, 1].astype("float32")
+        red = bgr[:, :, 2].astype("float32")
+        saturation = np.maximum(np.maximum(red, green), blue) - np.minimum(
+            np.minimum(red, green), blue
+        )
+        scale = float(np.percentile(saturation, 85))
+        if scale < _MATERIAL_BAR_MIN_SATURATION:
+            return np.zeros_like(saturation)
+        return saturation / scale
 
     @staticmethod
     def _mean_abs_diff(a, b) -> float | None:
@@ -579,16 +599,20 @@ class Runner:
 
     @staticmethod
     def _material_bar_key(crop):
-        """候选像素状态的粗量化 key（可 JSON 化，非物品 ID）。"""
+        """候选像素状态的粗 key（可 JSON 化，非物品 ID）：逐格「是否已填充」。
+
+        归一化饱和度 ≥ 填充阈值记 1。填充过程从左到右逐格点亮（key 变化→未稳定），
+        填满后各格稳定为 1，与呼吸动画的亮度强弱无关。
+        """
         import numpy as np
 
         if crop is None:
             return None
-        cells: list[float] = []
+        bits: list[int] = []
         for band in np.array_split(crop, 4, axis=0):
             for block in np.array_split(band, 4, axis=1):
-                cells.append(float(block.mean()))
-        return tuple(int(round(value / _MATERIAL_BAR_QUANT)) for value in cells)
+                bits.append(1 if float(block.mean()) >= _MATERIAL_BAR_FILL_THRESHOLD else 0)
+        return tuple(bits)
 
     # ---------------------------------------------------------------- probe 工厂（§6.1、§6.2）
 

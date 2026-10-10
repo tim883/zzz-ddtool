@@ -204,6 +204,62 @@ def test_w2_material_ready_two_stable_changed_frames_complete(monkeypatch, sim_t
     parse.assert_not_called()             # 不增加预计等级 OCR/Disc
 
 
+def _grade_bar_frame(fill_rgb) -> QImage:
+    """合成一帧：只有经验/预计等级条 ROI 有给定颜色，其余全黑。"""
+    import zzz_ddtool.layout as layout_module
+
+    left, top, right, bottom = layout_module.UPGRADE_LEVEL_BAR
+    arr = np.zeros((1080, 1920, 4), dtype=np.uint8)
+    arr[:, :, 3] = 255                                    # 不透明
+    arr[top:bottom, left:right, 0] = fill_rgb[2]          # B
+    arr[top:bottom, left:right, 1] = fill_rgb[1]          # G
+    arr[top:bottom, left:right, 2] = fill_rgb[0]          # R
+    return QImage(arr.tobytes(), 1920, 1080, QImage.Format.Format_RGB32).copy()
+
+
+def test_w2_material_bar_descriptor_survives_fill_brightness_pulse():
+    """§6.2 / §10：等级条描述子必须是「归一化饱和度」，不能是灰度。
+
+    真机（2026-10-10 步骤 9，plan4 首盘）该条填充色上有一层**亮度呼吸动画**：
+    旧的灰度逐格 key 每帧都变 → `wait_ready` 的稳定帧对永远凑不齐 →
+    material_ready 3000ms 超时 → 整轮 RunnerError 失败（空条 54.6 与就绪暗相位
+    94.8 的灰度差仅 1.7x，不足以做稳定 key）。守卫三件事：
+    ① 空条为纯灰（无饱和度）→ 归一化后全 0；
+    ② 同一填充结构的亮/暗相位给**同一个 key**，且差不超过稳定阈值；
+    ③ 操作前→已填充达到变化阈值且 key 不同（「退回操作前状态则 ready=False」）。
+    """
+    runner = Runner(Preset(), hotkeys=False)
+    blank = _grade_bar_frame((60, 60, 60))       # 操作前：空条＝纯灰
+    bright = _grade_bar_frame((210, 225, 50))    # 已填充：黄绿（亮相位）
+    dim = _grade_bar_frame((150, 165, 35))       # 同一填充的暗相位
+
+    crop_blank = runner._material_bar_crop(blank)
+    crop_bright = runner._material_bar_crop(bright)
+    crop_dim = runner._material_bar_crop(dim)
+
+    assert not crop_blank.any()                  # ① 无彩色 → 全 0
+    assert crop_bright.any()
+
+    # ② 亮度呼吸不改 key，也不超过稳定阈值
+    assert runner._material_bar_key(crop_bright) == runner._material_bar_key(crop_dim)
+    assert (
+        runner._mean_abs_diff(crop_bright, crop_dim)
+        <= runner_module._MATERIAL_BAR_STABLE_THRESHOLD
+    )
+    assert runner._material_bar_key(crop_bright) is not None
+
+    # ③ 操作前 → 已填充：达到变化阈值，且 key 与空条不同
+    assert (
+        runner._mean_abs_diff(crop_blank, crop_bright)
+        >= runner_module._MATERIAL_BAR_CHANGE_THRESHOLD
+    )
+    assert runner._material_bar_key(crop_blank) != runner._material_bar_key(crop_bright)
+    assert (
+        runner_module._MATERIAL_BAR_CHANGE_THRESHOLD
+        > runner_module._MATERIAL_BAR_STABLE_THRESHOLD
+    )
+
+
 def test_w2_material_started_at_is_click_return_not_release(monkeypatch, sim_time):
     """模拟鼠标释放 1.000s、click_client 返回 1.100s：素材时刻必须取点击返回时刻。"""
     runner = Runner(Preset(), hotkeys=False)
