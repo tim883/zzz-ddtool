@@ -27,16 +27,24 @@ def lock_path() -> Path:
     return paths.user_data_root() / LOCK_NAME
 
 
-def acquire() -> QLockFile | None:
-    """拿到独占锁返回锁对象；已有实例在运行、或共享根不可写时返回 ``None``。
+class LockUnavailable(Exception):
+    """锁建不出来（共享根不可写、权限不足等）。
 
-    共享根建不出来（只读位置、权限不足）时不抛异常 —— 单实例限制失败不该
-    让界面起不来，由调用方决定提示。
+    与"已有实例在运行"是两回事：调用方应让位（照常启动）并给出提示，
+    而不是报"程序已在运行"。
+    """
+
+
+def acquire() -> QLockFile | None:
+    """拿到独占锁返回锁对象；**已有实例在运行**返回 ``None``。
+
+    锁本身建不出来时抛 ``LockUnavailable`` —— 单实例限制不该让界面起不来，
+    但也不能把"建不出来"说成"已在运行"。
     """
     try:
         lock_path().parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
+    except OSError as exc:
+        raise LockUnavailable(str(exc)) from exc
     lock = QLockFile(str(lock_path()))
     return lock if lock.tryLock(0) else None
 

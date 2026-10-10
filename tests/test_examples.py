@@ -274,3 +274,83 @@ def test_save_all_examples_counts_ok_and_reports_each_failure(tmp_path: Path, mo
     assert len(problems) == 1
     assert "b.yaml" in problems[0]
     assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"
+
+
+# --- 修复轮（独立评审发现）--------------------------------------------------
+
+def test_seed_does_not_mark_done_when_a_copy_failed(tmp_path: Path, monkeypatch) -> None:
+    """首投遇到瞬时写盘失败时**不能**落下"已投放"标记，否则示例永久缺失。"""
+    import zzz_ddtool.userdata as userdata
+
+    data, plans = _wire(tmp_path, monkeypatch)
+    (data / "examples" / "example.yaml").write_text("a", encoding="utf-8")
+    marker = tmp_path / "user" / ".examples-seeded"
+
+    def disk_full(source, target):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(examples, "copy_missing", disk_full)
+    assert examples.seed_examples() == []
+    assert not marker.exists()
+
+    # 磁盘恢复后重试应当补上
+    monkeypatch.setattr(examples, "copy_missing", userdata.copy_missing)
+    assert [p.name for p in examples.seed_examples()] == ["example.yaml"]
+    assert (plans / "example.yaml").exists()
+
+
+def test_fetch_rejects_impossible_or_trailing_newline_date(monkeypatch) -> None:
+    """Spec 要求"合法日期"：2026-13-45 与带尾随换行的都不行。"""
+    content = b"x"
+    for bad_date in ("2026-13-45", "2026-10-10\n", "2026-02-30"):
+        manifest = _manifest(
+            [
+                {
+                    "file": "a.yaml",
+                    "title": "t",
+                    "updated_at": bad_date,
+                    "note": "",
+                    "sha256": _sha(content),
+                }
+            ]
+        )
+        _patch_fetch(monkeypatch, {_MANIFEST_URL: manifest, _EXAMPLE_URL: content})
+        with pytest.raises(examples.ExamplesError, match="时间"):
+            examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_fetch_rejects_dot_only_or_nul_file_names(monkeypatch) -> None:
+    content = b"x"
+    for bad_name in (".yaml", "a\x00b.yaml", "a.yaml\n"):
+        manifest = _manifest(
+            [
+                {
+                    "file": bad_name,
+                    "title": "t",
+                    "updated_at": "2026-10-10",
+                    "note": "",
+                    "sha256": _sha(content),
+                }
+            ]
+        )
+        _patch_fetch(monkeypatch, {_MANIFEST_URL: manifest, _EXAMPLE_URL: content})
+        with pytest.raises(examples.ExamplesError, match="文件名"):
+            examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_save_all_examples_absorbs_unexpected_exception(tmp_path: Path, monkeypatch) -> None:
+    """单项的意外异常也必须被收纳成"该条失败"，不能从界面槽里逃出去。"""
+    plans = tmp_path / "user" / "plan"
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    def boom(*args, **kwargs):
+        raise ValueError("bad path")
+
+    monkeypatch.setattr(examples, "_atomic_write", boom)
+
+    ok, problems = examples.save_all_examples([item])
+
+    assert ok == 0
+    assert len(problems) == 1
+    assert "bad path" in problems[0]

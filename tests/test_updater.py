@@ -148,3 +148,26 @@ def test_check_for_update_plain_404_means_no_release(monkeypatch) -> None:
 
     assert st.available is False
     assert st.error == "暂无可用版本"
+
+
+def test_log_stripped_reaches_the_text_log(tmp_path, monkeypatch) -> None:
+    """Spec §4.2 要求把被剥离项写进日志。
+
+    必须走 logutil 的 logger —— 只用 `logging.getLogger(__name__)` 不会触发
+    logutil.setup()，windowed exe 里既没有 handler 也没有 stderr，这条警告会丢。
+    """
+    import logging
+
+    from zzz_ddtool import logutil
+
+    monkeypatch.setattr(logutil, "logs_dir", lambda: tmp_path / "text")
+    monkeypatch.setattr(logutil, "_configured", False)
+    root = logging.getLogger("zzz_ddtool")
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    updater._log_stripped(["user", "log"])
+
+    text = (tmp_path / "text" / "ddtool.log").read_text(encoding="utf-8")
+    assert "user" in text
+    assert "log" in text

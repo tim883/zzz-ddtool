@@ -3779,19 +3779,29 @@ def run_gui(config: Path | None = None) -> int:
     # 先把上次存的日志级别 / 截图上限装回去。放在最前：get_logger 首次调用会懒
     # setup() 按默认级别配置，restore 越早，启动最早那批日志的级别越准。
     from zzz_ddtool.logprefs import restore
-    from zzz_ddtool.singleinstance import acquire, release
+    from zzz_ddtool.singleinstance import LockUnavailable, acquire, release
 
     restore()
     app = QApplication.instance() or QApplication(sys.argv)
-    lock = acquire()
-    if lock is None:
+
+    lock = None
+    hint = ""
+    try:
+        lock = acquire()
+    except LockUnavailable as exc:
+        # 锁建不出来（共享根只读等）：让位照常启动，但不能说成"已在运行"
+        hint = f"提示：无法建立单实例锁（{exc}）；本次不限制重复启动。"
+    if lock is None and not hint:
         QMessageBox.information(None, "zzz-ddtool", "程序已在运行。")
         return 0
     try:
         apply_light_style(app)
         window = MainWindow(config)
+        if hint:
+            window.status.setText(hint)
         window.show()
         return app.exec()
     finally:
-        release(lock)
+        if lock is not None:
+            release(lock)
 

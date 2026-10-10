@@ -48,22 +48,28 @@ def setup(level: int | str = logging.INFO, *, console: bool = False) -> None:
     """初始化日志。可重复调用，后一次覆盖级别。"""
     global _configured, _level
     _level = level if isinstance(level, int) else getattr(logging, str(level).upper(), logging.INFO)
-    folder = logs_dir()
-    folder.mkdir(parents=True, exist_ok=True)
-
     root = logging.getLogger("zzz_ddtool")
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
 
-    file_handler = RotatingFileHandler(
-        folder / "ddtool.log",
-        maxBytes=2 * 1024 * 1024,
-        backupCount=MAX_LOG_FILES,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(ChineseFormatter())
-    root.addHandler(file_handler)
+    file_handler = None
+    try:
+        folder = logs_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            folder / "ddtool.log",
+            maxBytes=2 * 1024 * 1024,
+            backupCount=MAX_LOG_FILES,
+            encoding="utf-8",
+        )
+    except OSError:
+        # 日志目录建不出来（共享根只读、权限不足）：日志让位，程序照常起
+        file_handler = None
+
+    if file_handler is not None:
+        file_handler.setFormatter(ChineseFormatter())
+        root.addHandler(file_handler)
 
     if console:
         stream = logging.StreamHandler(sys.stdout)

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -128,7 +127,9 @@ def _strip_protected(root: Path) -> list[str]:
 def _log_stripped(removed: list[str]) -> None:
     """更新包混进 user//log/ 是发布方失误：记一条日志，但不打断更新。"""
     if removed:
-        logging.getLogger(__name__).warning(
+        from zzz_ddtool.logutil import get_logger
+
+        get_logger(__name__).warning(
             "更新包内含 %s，已忽略：更新不会改写用户的 user/ 与 log/",
             "、".join(removed),
         )

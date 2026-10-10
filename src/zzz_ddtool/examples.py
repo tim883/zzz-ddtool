@@ -1,8 +1,8 @@
-"""随包示例的投放。
+"""随包示例的投放，以及从远端取公共示例。
 
 用户已确认的语义（方案 A）：示例是**用户自己的存档**，不是程序管理的模板。
-所以这里只在首次运行时把包里缺的示例种进 ``user/plan/``，此后用户改、删都不再
-干预；要拿新示例走界面「获取公共示例」的主动通道。
+启动时只把包里缺的示例种进 ``user/plan/``，此后用户改、删都不再干预；要拿新
+示例走界面「获取公共示例」的主动通道，它同样从不覆盖本地文件。
 
 「只种一次」用 ``user/.examples-seeded`` 标记，与 ``userdata.migrate_plans()``
 的 ``.plans-imported`` 是两条独立的生命周期。
@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from zzz_ddtool import paths, updater
@@ -36,13 +37,15 @@ def seed_examples() -> list[Path]:
     """把尚未种下的示例复制进 ``user/plan/``，返回本次新复制的目标路径。
 
     标记存在即直接返回：用户删掉的示例不复活，用户改过的示例不覆盖。
-    磁盘失败不抛给界面 —— 投放失败不该让客户端起不来。
+    磁盘失败不抛给界面 —— 投放失败不该让客户端起不来；但**只要有失败的项就不写
+    "已投放"标记**，否则一次瞬时失败（磁盘满、权限、杀软占用）会让示例永久缺失。
     """
     marker = paths.user_dir() / SEEDED_MARKER
     if marker.exists():
         return []
 
     copied: list[Path] = []
+    failed = False
     for source in shipped_examples():
         target = paths.plans_dir() / source.name
         try:
@@ -50,14 +53,16 @@ def seed_examples() -> list[Path]:
                 continue
             copy_missing(source, target)
         except OSError:
+            failed = True
             continue
         copied.append(target)
 
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch(exist_ok=True)
-    except OSError:
-        pass
+    if not failed:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch(exist_ok=True)
+        except OSError:
+            pass
     return copied
 
 
@@ -69,8 +74,7 @@ def seed_examples() -> list[Path]:
 EXAMPLES_MANIFEST_URL = "https://gitee.com/qzl2077/zzz-ddtool/raw/master/data/examples/manifest.json"
 
 _MANIFEST_SCHEMA = 1
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class ExamplesError(Exception):
@@ -85,6 +89,26 @@ class ExampleItem:
     note: str
     sha256: str
     content: bytes
+
+
+def _is_plain_yaml_name(name: str) -> bool:
+    """只接受"纯文件名 + ``.yaml``"。
+
+    这条是路径穿越的唯一闸门：挡掉 ``../``、``..\\``、绝对路径、盘符、NUL，
+    也挡掉 ``.yaml`` 这种只有后缀、没有主名的名字。
+    """
+    if not name or "\x00" in name or Path(name).name != name:
+        return False
+    return Path(name).stem not in ("", ".") and Path(name).suffix == ".yaml"
+
+
+def _is_calendar_date(text: str) -> bool:
+    """必须是真实存在的日期 —— 只对形状做正则不够（``2026-13-45`` 也长得像日期）。"""
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
 
 
 def _parse_manifest(payload: object) -> list[dict]:
@@ -103,11 +127,11 @@ def _parse_manifest(payload: object) -> list[dict]:
         name = str(entry.get("file") or "")
         updated_at = str(entry.get("updated_at") or "")
         digest = str(entry.get("sha256") or "")
-        if not name or Path(name).name != name or not name.endswith(".yaml"):
+        if not _is_plain_yaml_name(name):
             raise ExamplesError(f"远端示例清单里的文件名不合法：{name!r}")
-        if not _DATE_RE.match(updated_at):
+        if not _is_calendar_date(updated_at):
             raise ExamplesError(f"远端示例清单里的时间不合法：{name} -> {updated_at!r}")
-        if not _SHA256_RE.match(digest):
+        if not _SHA256_RE.fullmatch(digest):
             raise ExamplesError(f"远端示例清单里的 sha256 不合法：{name}")
         if name in seen:
             raise ExamplesError(f"远端示例清单里 {name} 重复")
@@ -198,14 +222,15 @@ def _atomic_write(target: Path, content: bytes) -> None:
 def save_all_examples(items: list[ExampleItem]) -> tuple[int, list[str]]:
     """逐个落盘并汇总，返回 ``(成功数, 失败说明列表)``。
 
-    单项失败不影响其余 —— 用户勾了一堆，不该因为其中一个名字冲突就一个都没落。
+    单项失败不影响其余，而且**什么异常都不往外抛** —— 它跑在 Qt 槽里，
+    让意外异常逃出去就是界面上的未捕获异常。
     """
     ok = 0
     problems: list[str] = []
     for item in items:
         try:
             save_example(item)
-        except (OSError, ExamplesError) as exc:
+        except Exception as exc:  # noqa: BLE001 - 槽边界，任何异常都要变成可展示的结果
             problems.append(f"{item.file}：{exc}")
             continue
         ok += 1

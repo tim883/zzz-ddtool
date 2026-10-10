@@ -41,8 +41,14 @@ def test_acquire_creates_root_when_missing(tmp_path: Path, monkeypatch) -> None:
     singleinstance.release(lock)
 
 
-def test_acquire_returns_none_when_root_unwritable(tmp_path: Path, monkeypatch) -> None:
-    """共享根不可写时返回 None，界面仍能启动并提示，而不是启动即崩。"""
+def test_acquire_raises_when_root_unwritable(tmp_path: Path, monkeypatch) -> None:
+    """共享根不可写时**不能假装"已有实例"** —— 抛 LockUnavailable 让调用方让位。
+
+    原来返回 None 会让界面报"程序已在运行"并直接退出：明明没有第二个实例，
+    程序却永远起不来，提示还是错的原因。
+    """
+    import pytest
+
     monkeypatch.setattr(paths, "user_data_root", lambda: tmp_path / "readonly")
 
     def boom(self, *args, **kwargs):
@@ -50,7 +56,8 @@ def test_acquire_returns_none_when_root_unwritable(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(Path, "mkdir", boom)
 
-    assert singleinstance.acquire() is None
+    with pytest.raises(singleinstance.LockUnavailable):
+        singleinstance.acquire()
 
 
 def _stub_app(monkeypatch, events: list[str]):
@@ -121,3 +128,36 @@ def test_run_gui_proceeds_when_lock_acquired(monkeypatch) -> None:
 
     assert gui.run_gui() == 0
     assert events == ["window", "show", "exec", "release:True"]
+
+
+def test_run_gui_starts_without_lock_when_unavailable(monkeypatch) -> None:
+    """I1/I6：锁建不出来时**照常启动**并给出提示，不能报"程序已在运行"。"""
+    import types
+
+    import pytest
+
+    from zzz_ddtool import gui, singleinstance
+
+    events: list[str] = []
+    _stub_app(monkeypatch, events)
+
+    def unavailable():
+        raise singleinstance.LockUnavailable("read-only")
+
+    monkeypatch.setattr(singleinstance, "acquire", unavailable)
+    monkeypatch.setattr(gui.QMessageBox, "information", lambda *args, **kwargs: pytest.fail("不该说已在运行"))
+
+    hints: list[str] = []
+
+    class _StubWindow:
+        def __init__(self):
+            self.status = types.SimpleNamespace(setText=hints.append)
+
+        def show(self):
+            events.append("show")
+
+    monkeypatch.setattr(gui, "MainWindow", lambda *args, **kwargs: _StubWindow())
+
+    assert gui.run_gui() == 0
+    assert events == ["show", "exec"]
+    assert hints and "单实例锁" in hints[0]
