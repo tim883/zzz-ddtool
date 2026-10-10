@@ -379,6 +379,17 @@ def test_report_summary_select_needs_count_and_diversity():
     assert same["reason_codes"] == ["content_diversity"]
 
 
+def test_gate_accepts_the_sample_core_the_sampler_writes():
+    """跨模块形状守卫：采样端写进 ``final_core`` 的 core 字典，门禁须取到同一个 key。"""
+    evidence = {"core": {"level": 15, "rarity": "S",
+                         "substats": [{"name": "攻击力", "rolls": 1}]}}
+    core = mw.core_of_evidence(evidence)
+
+    assert isinstance(core, dict)
+    assert vs._core_key({"final_core": core}) == (15, (("攻击力", 1),))
+    assert mw.core_key_of_core(core) == vs._core_key({"final_core": core})
+
+
 def test_report_summary_return_needs_every_edge_and_takes_the_max():
     rows = []
     for index in range(15):

@@ -257,6 +257,47 @@ def test_select_stat_key_comes_from_final_core_without_rarity():
     assert mw.core_key_of_core(None) is None
 
 
+def test_final_core_is_a_core_dict_not_a_stat_key():
+    """回归：``core_of_evidence`` 必须产出 core 字典，不能直接产出统计 key。
+
+    样本的 ``final_core`` 由 ``build_sample_record`` 写入；两个消费方
+    （本模块 ``summarize_select_kind``、门禁 ``verify_spec._core_key``）都按
+    ``core_key_of_core(final_core)`` 取 key。生产端若先转成 ``(level, pairs)``，
+    消费方二次转换会因「不是 dict」拿到 ``None``，相邻不同内容转换恒计 0。
+    """
+    evidence = {"core": {"level": 15, "rarity": "S",
+                         "substats": [{"name": "攻击力", "rolls": 1}]}}
+    core = mw.core_of_evidence(evidence)
+
+    assert isinstance(core, dict)
+    assert core == evidence["core"]
+    assert mw.core_key_of_core(core) == (15, (("攻击力", 1),))
+    assert mw.core_of_evidence({"core": "不是字典"}) is None
+    assert mw.core_of_evidence({"nothing": 1}) is None
+    assert mw.core_of_evidence(None) is None
+
+
+def test_summarize_counts_transitions_on_cores_from_core_of_evidence():
+    """端到端形状：生产端 ``core_of_evidence`` 的产物喂进汇总，必须真的数出转换。"""
+    high = mw.core_of_evidence(
+        {"core": {"level": 15, "substats": [{"name": "攻击力", "rolls": 3}]}}
+    )
+    low = mw.core_of_evidence(
+        {"core": {"level": 0, "substats": [{"name": "暴击率", "rolls": 1}]}}
+    )
+    rows = [
+        {"sample_id": f"select-{i:02d}", "selection_id": "s1" if i % 2 == 0 else "s2",
+         "final_core": high if i % 2 == 0 else low,
+         "valid_for_floor": True, "t_stable_ms": 200.0, "false_ready": False}
+        for i in range(20)
+    ]
+    entry = mw.summarize_select_kind(rows, default_floor_ms=500)
+
+    assert entry["valid_count"] == 20
+    assert entry["different_transitions"] == 19
+    assert entry["status"] == "calibrated"
+
+
 def test_select_needs_both_count_and_content_diversity():
     same = select_rows([(f"c{i % 10}", (0, (("攻击力", 1),))) for i in range(20)])
     entry = mw.summarize_select_kind(same, default_floor_ms=500)
