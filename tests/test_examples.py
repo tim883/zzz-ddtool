@@ -91,3 +91,166 @@ def test_copy_missing_is_the_real_no_overwrite_guard(tmp_path: Path) -> None:
     copy_missing(source, target)
 
     assert target.read_text(encoding="utf-8") == "MINE"
+
+
+# --- 公共示例获取（阶段二）-------------------------------------------------
+# 本节新增需要 hash / json / pytest，就近导入（模块级，pytest 收集前已执行）。
+
+import hashlib
+import json
+
+import pytest
+
+_FETCH_BASE = "https://example.invalid/examples"
+_MANIFEST_URL = f"{_FETCH_BASE}/manifest.json"
+_EXAMPLE_URL = f"{_FETCH_BASE}/a.yaml"
+
+
+def _manifest(items: list[dict]) -> bytes:
+    return json.dumps({"schema": 1, "examples": items}).encode("utf-8")
+
+
+def _sha(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _patch_fetch(monkeypatch, payload_map: dict[str, bytes]) -> None:
+    def fake(url: str, dest) -> None:
+        Path(dest).write_bytes(payload_map[url])
+
+    monkeypatch.setattr(examples.updater, "_download", fake)
+
+
+def test_fetch_downloads_and_verifies_sha256(monkeypatch) -> None:
+    content = b"name: ok\n"
+    manifest = _manifest(
+        [
+            {
+                "file": "a.yaml",
+                "title": "示例",
+                "updated_at": "2026-10-10",
+                "note": "说明",
+                "sha256": _sha(content),
+            }
+        ]
+    )
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: manifest, _EXAMPLE_URL: content})
+
+    items = examples.fetch_examples(_MANIFEST_URL)
+
+    assert [(i.file, i.title, i.updated_at, i.content) for i in items] == [
+        ("a.yaml", "示例", "2026-10-10", content)
+    ]
+
+
+def test_fetch_rejects_path_traversal_file_name(monkeypatch) -> None:
+    """远端可指定任意文件名，绝不能拼出 user/plan/ 之外的路径。"""
+    content = b"x"
+    manifest = _manifest(
+        [
+            {
+                "file": "../../evil.yaml",
+                "title": "t",
+                "updated_at": "2026-10-10",
+                "note": "",
+                "sha256": _sha(content),
+            }
+        ]
+    )
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: manifest, _EXAMPLE_URL: content})
+
+    # 必须由"文件名校验"拒绝，而不是因为取不到那个 URL —— 否则测试会为错误的原因通过
+    with pytest.raises(examples.ExamplesError, match="文件名不合法"):
+        examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_fetch_rejects_sha256_mismatch(monkeypatch) -> None:
+    manifest = _manifest(
+        [
+            {
+                "file": "a.yaml",
+                "title": "t",
+                "updated_at": "2026-10-10",
+                "note": "",
+                "sha256": "0" * 64,
+            }
+        ]
+    )
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: manifest, _EXAMPLE_URL: b"different"})
+
+    with pytest.raises(examples.ExamplesError):
+        examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_fetch_rejects_bad_updated_at_and_duplicates(monkeypatch) -> None:
+    content = b"x"
+    entry = {
+        "file": "a.yaml",
+        "title": "t",
+        "updated_at": "10/10/2026",
+        "note": "",
+        "sha256": _sha(content),
+    }
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: _manifest([entry]), _EXAMPLE_URL: content})
+    with pytest.raises(examples.ExamplesError):
+        examples.fetch_examples(_MANIFEST_URL)
+
+    good = dict(entry, updated_at="2026-10-10")
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: _manifest([good, good]), _EXAMPLE_URL: content})
+    with pytest.raises(examples.ExamplesError):
+        examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_fetch_rejects_wrong_schema_and_missing_fields(monkeypatch) -> None:
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: json.dumps({"schema": 2, "examples": []}).encode("utf-8")})
+    with pytest.raises(examples.ExamplesError):
+        examples.fetch_examples(_MANIFEST_URL)
+
+    bad = _manifest([{"file": "a.yaml", "title": "t", "updated_at": "2026-10-10"}])
+    _patch_fetch(monkeypatch, {_MANIFEST_URL: bad})
+    with pytest.raises(examples.ExamplesError):
+        examples.fetch_examples(_MANIFEST_URL)
+
+
+def test_save_example_writes_plain_when_absent(tmp_path: Path, monkeypatch) -> None:
+    plans = tmp_path / "user" / "plan"
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    assert examples.save_example(item).name == "a.yaml"
+    assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"
+
+
+def test_save_example_skips_identical_and_never_overwrites(tmp_path: Path, monkeypatch) -> None:
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "a.yaml").write_text("MINE", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    saved = examples.save_example(item)
+
+    assert saved.name == "a-2026-10-10.yaml"
+    assert (plans / "a.yaml").read_text(encoding="utf-8") == "MINE"
+    # 同样内容再存一次：并列文件已存在且相同 → 不重复落盘
+    assert examples.save_example(item) == saved
+    assert sorted(p.name for p in plans.iterdir()) == ["a-2026-10-10.yaml", "a.yaml"]
+
+
+def test_save_example_leaves_no_partial_file_when_write_fails(tmp_path: Path, monkeypatch) -> None:
+    """写盘失败不得留下半截 YAML，也不能破坏已有文件。"""
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "a.yaml").write_text("MINE", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(examples.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        examples.save_example(item)
+    assert (plans / "a.yaml").read_text(encoding="utf-8") == "MINE"
+    assert sorted(p.name for p in plans.iterdir()) == ["a.yaml"]

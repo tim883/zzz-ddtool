@@ -10,9 +10,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import re
+import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
-from zzz_ddtool import paths
+from zzz_ddtool import paths, updater
 from zzz_ddtool.userdata import copy_missing
 
 SEEDED_MARKER = ".examples-seeded"
@@ -53,3 +59,137 @@ def seed_examples() -> list[Path]:
     except OSError:
         pass
     return copied
+
+
+# --- 公共示例：从远端清单拉取 -------------------------------------------------
+# 远端就是本仓库自身（已公开），清单与示例同目录：
+#   .../raw/master/data/examples/manifest.json
+#   .../raw/master/data/examples/<file>
+
+EXAMPLES_MANIFEST_URL = "https://gitee.com/qzl2077/zzz-ddtool/raw/master/data/examples/manifest.json"
+
+_MANIFEST_SCHEMA = 1
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class ExamplesError(Exception):
+    """远端清单或示例不可用。消息面向用户，调用方直接展示。"""
+
+
+@dataclass(frozen=True)
+class ExampleItem:
+    file: str
+    title: str
+    updated_at: str
+    note: str
+    sha256: str
+    content: bytes
+
+
+def _parse_manifest(payload: object) -> list[dict]:
+    """先把整份清单校验完 —— 非法清单不得触发任何下载或落盘。"""
+    if not isinstance(payload, dict) or payload.get("schema") != _MANIFEST_SCHEMA:
+        raise ExamplesError("远端示例清单版本不认识（schema 不匹配）")
+    raw = payload.get("examples")
+    if not isinstance(raw, list):
+        raise ExamplesError("远端示例清单缺少 examples 列表")
+
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ExamplesError("远端示例清单里有非法条目")
+        name = str(entry.get("file") or "")
+        updated_at = str(entry.get("updated_at") or "")
+        digest = str(entry.get("sha256") or "")
+        if not name or Path(name).name != name or not name.endswith(".yaml"):
+            raise ExamplesError(f"远端示例清单里的文件名不合法：{name!r}")
+        if not _DATE_RE.match(updated_at):
+            raise ExamplesError(f"远端示例清单里的时间不合法：{name} -> {updated_at!r}")
+        if not _SHA256_RE.match(digest):
+            raise ExamplesError(f"远端示例清单里的 sha256 不合法：{name}")
+        if name in seen:
+            raise ExamplesError(f"远端示例清单里 {name} 重复")
+        seen.add(name)
+        entries.append(
+            {
+                "file": name,
+                "title": str(entry.get("title") or Path(name).stem),
+                "updated_at": updated_at,
+                "note": str(entry.get("note") or ""),
+                "sha256": digest,
+            }
+        )
+    return entries
+
+
+def fetch_examples(url: str = EXAMPLES_MANIFEST_URL) -> list[ExampleItem]:
+    """下载并校验远端清单与每个示例。
+
+    任何问题都抛 ``ExamplesError``，且**不写入任何文件**（全部在临时目录里做完）。
+    """
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="zzz-examples-"))
+    try:
+        manifest_path = tmp / "manifest.json"
+        try:
+            updater._download(url, manifest_path)
+        except Exception as exc:
+            raise ExamplesError(f"取不到远端示例清单：{exc}") from exc
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ExamplesError(f"远端示例清单读不出来：{exc}") from exc
+
+        entries = _parse_manifest(payload)
+        base = url.rsplit("/", 1)[0]
+        items: list[ExampleItem] = []
+        for entry in entries:
+            blob = tmp / entry["file"]
+            try:
+                updater._download(f"{base}/{entry['file']}", blob)
+            except Exception as exc:
+                raise ExamplesError(f"取不到示例 {entry['file']}：{exc}") from exc
+            content = blob.read_bytes()
+            if hashlib.sha256(content).hexdigest() != entry["sha256"]:
+                raise ExamplesError(f"示例 {entry['file']} 的内容与清单不符")
+            items.append(ExampleItem(content=content, **entry))
+        return items
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def save_example(item: ExampleItem) -> Path:
+    """把示例落到 ``user/plan/``，**从不覆盖**已有的同名文件。
+
+    - 目标不存在 → 写 ``<file>``
+    - 目标已存在且内容相同 → 不重复落盘
+    - 目标已存在但内容不同 → 并列写 ``<stem>-<updated_at><ext>``，原文件不动
+    """
+    plans = paths.plans_dir()
+    plans.mkdir(parents=True, exist_ok=True)
+    target = plans / item.file
+    if target.exists():
+        if target.read_bytes() == item.content:
+            return target
+        target = plans / f"{target.stem}-{item.updated_at}{target.suffix}"
+        if target.exists():
+            if target.read_bytes() == item.content:
+                return target
+            raise ExamplesError(f"{target.name} 已存在且内容不同，未覆盖")
+    _atomic_write(target, item.content)
+    return target
+
+
+def _atomic_write(target: Path, content: bytes) -> None:
+    """先写同目录临时文件再改名 —— 中途失败不留半截文件，也不动已有文件。"""
+    tmp = target.with_name(f".{target.name}.part")
+    try:
+        with open(tmp, "wb") as stream:
+            stream.write(content)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
