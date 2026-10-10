@@ -9,7 +9,12 @@ from pathlib import Path
 from zzz_ddtool import paths
 
 
-def _copy_missing(source: Path, target: Path) -> None:
+def copy_missing(source: Path, target: Path) -> None:
+    """把 ``source`` 复制到 ``target``，**已存在就跳过**（`open("xb")` 语义）。
+
+    这是"绝不覆盖用户文件"的实现基础：存在与否由创建本身决定，
+    不做"先检查再写"的竞态窗口。失败时清掉半截文件再抛出。
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         destination = target.open("xb")
@@ -29,7 +34,7 @@ def _import_plan(source: Path) -> Path:
         digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
         target = target.with_name(f"{source.stem}-import-{digest}{source.suffix}")
     if source.exists():
-        _copy_missing(source, target)
+        copy_missing(source, target)
     return target
 
 

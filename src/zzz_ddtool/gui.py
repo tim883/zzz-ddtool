@@ -497,10 +497,12 @@ def write_layout(data: dict) -> None:
 
 def default_config_path() -> Path:
     """打开公共存档目录中的上次配置，默认档也是普通可编辑存档。"""
+    from zzz_ddtool.examples import seed_examples
     from zzz_ddtool.paths import plans_dir
     from zzz_ddtool.userdata import migrate_plans
 
     migrate_plans()
+    seed_examples()
     remembered = last_config_path()
     if remembered is not None:
         return remembered
