@@ -555,6 +555,51 @@ def test_w9_open_upgrade_fails_when_preview_is_lost(monkeypatch):
     runner._esc_back_to_grid.assert_called_once_with(1)
 
 
+def test_w9_open_upgrade_probe_ignores_unknown_rarity_on_upgrade_page(monkeypatch):
+    """强化页不显示等级上限 → 解析 rarity=None；对象接续只比等级与词条（§6.2 表）。
+
+    2026-10-10 真机标定实测：若按含稀有度的 ``_core_key`` 全字段比较，强化页解析出的
+    rarity 恒为 None，而 before 来自详情页（「等级12/15」→ 上限 15 → S），这条等待在
+    真机上永远不就绪（`open_upgrade` 5/5 超时，12 帧全 `stage_add=True` 且词条一致）。
+    """
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    bind_grab(monkeypatch, runner, Frames([{"image": image()}]))
+    monkeypatch.setattr(runner, "_has_stage_add", lambda _frame: True)
+    before = Disc(12, (Substat("暴击率", 1), Substat("攻击力", 1)), rarity="S")
+
+    # 强化页：rarity 读不出，等级与词条与 before 一致 → 就绪
+    upgrade = Disc(12, (Substat("攻击力", 1), Substat("暴击率", 1)), rarity=None)
+    monkeypatch.setattr(runner, "_parse_upgrade_page", lambda _frame: upgrade)
+    assert runner._probe_open_upgrade(before)().ready is True
+
+    # 词条区域还没渲染完（少一条）→ 不就绪
+    monkeypatch.setattr(
+        runner, "_parse_upgrade_page",
+        lambda _frame: Disc(12, (Substat("攻击力", 1),), rarity=None),
+    )
+    assert runner._probe_open_upgrade(before)().ready is False
+
+    # 等级与 before 不一致 → 不就绪
+    monkeypatch.setattr(
+        runner, "_parse_upgrade_page",
+        lambda _frame: Disc(11, upgrade.substats, rarity=None),
+    )
+    assert runner._probe_open_upgrade(before)().ready is False
+
+    # 两侧稀有度都已知且不同 → 仍不就绪（稀有度只在都已知时参与比较）
+    monkeypatch.setattr(
+        runner, "_parse_upgrade_page",
+        lambda _frame: Disc(12, upgrade.substats, rarity="A"),
+    )
+    assert runner._probe_open_upgrade(before)().ready is False
+
+    # 没有「阶段添加」→ 不就绪
+    monkeypatch.setattr(runner, "_has_stage_add", lambda _frame: False)
+    monkeypatch.setattr(runner, "_parse_upgrade_page", lambda _frame: upgrade)
+    assert runner._probe_open_upgrade(before)().ready is False
+
+
 # --------------------------------------------------------------------------
 # W10：标签目标状态即可完成、不盲按
 # --------------------------------------------------------------------------

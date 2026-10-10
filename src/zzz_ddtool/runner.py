@@ -471,6 +471,36 @@ class Runner:
         )
 
     @staticmethod
+    def _same_upgrade_object(disc: Disc | None, before: Disc) -> bool:
+        """强化页对象接续：等级与可见词条一致即可，稀有度不单方向阻塞就绪。
+
+        §6.2 表中 `open_upgrade` 的 ready 条件是「实际等级与 before 一致，词条区域
+        完成渲染」；§6.3 只要求两次转场的**等级/布局证据**与 before 一致，并明确
+        「合法 rarity=None 不单独阻塞就绪」。
+
+        强化页不显示等级上限（只有当前等级 `12` 与材料进度 `2040/5760`），
+        `parse_disc_upgrade_page` 的 rarity 必为 None；而 before 来自详情页
+        （读到「等级12/15」→ 上限 15 → S）。若按 `_core_key` 全字段比较，这条等待
+        在真机上永远不就绪（2026-10-10 真机标定实测：`open_upgrade` 5/5 超时，
+        探针 12 帧全为 `layer=upgrade, stage_add=True, 词条与 before 一致`
+        却从未形成稳定帧对）。故稀有度只在两侧都已知时比较。
+        """
+        if disc is None:
+            return False
+        if disc.level != before.level:
+            return False
+        if (
+            disc.rarity is not None
+            and before.rarity is not None
+            and disc.rarity != before.rarity
+        ):
+            return False
+        return (
+            tuple(sorted((s.name, s.rolls) for s in disc.substats))
+            == tuple(sorted((s.name, s.rolls) for s in before.substats))
+        )
+
+    @staticmethod
     def _evidence(*, core=None, return_layer=None, label_state=None,
                   target_selected=None, refund=None, **extra):
         evidence = {
@@ -651,12 +681,7 @@ class Runner:
             captured = time.monotonic()
             has_add = self._has_stage_add(frame)
             disc = self._parse_upgrade_page(frame) if has_add else None
-            ready = bool(
-                has_add
-                and disc is not None
-                and disc.level == before.level
-                and self._core_key(disc) == self._core_key(before)
-            )
+            ready = bool(has_add and self._same_upgrade_object(disc, before))
             return readiness.WaitSample(
                 frame=frame,
                 captured_at=captured,
