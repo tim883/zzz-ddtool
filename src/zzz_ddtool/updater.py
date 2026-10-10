@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 from zzz_ddtool.version import current_version
 
@@ -92,12 +94,42 @@ def _download(url: str, dest) -> None:
         shutil.copyfileobj(resp, f)
 
 
+def _strip_protected(root: Path) -> list[str]:
+    """删除暂存树顶层的 user/、log/，返回被删除的条目名。
+
+    xcopy 只把暂存树内容铺到程序目录，所以只需处理顶层。这一步是
+    "更新绝不改写用户的 user/ 与 log/" 的硬保证：即使发布方失误
+    （把跑过的包拿去打 zip），用户侧也不会被覆盖。
+    """
+    import shutil
+
+    removed: list[str] = []
+    for name in ("user", "log"):
+        target = root / name
+        if not target.exists():
+            continue
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        removed.append(name)
+    return removed
+
+
+def _log_stripped(removed: list[str]) -> None:
+    """更新包混进 user//log/ 是发布方失误：记一条日志，但不打断更新。"""
+    if removed:
+        logging.getLogger(__name__).warning(
+            "更新包内含 %s，已忽略：更新不会改写用户的 user/ 与 log/",
+            "、".join(removed),
+        )
+
+
 def apply_data_update(url: str) -> None:
-    """数据更新：下载数据包 zip，解压覆盖 data/（只碰 data，不碰 user）。"""
+    """数据更新：下载数据包 zip，剥离 user//log/ 后覆盖 data/（只碰 data，不碰 user）。"""
     import shutil
     import tempfile
     import zipfile
-    from pathlib import Path
 
     from zzz_ddtool.paths import data_dir
 
@@ -105,10 +137,15 @@ def apply_data_update(url: str) -> None:
     try:
         zip_path = tmp / "data.zip"
         _download(url, zip_path)
+        staged = tmp / "new"
+        staged.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(staged)
+        _log_stripped(_strip_protected(staged))
         data = data_dir()
         data.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(data)
+        # 覆盖式复制：同名覆盖，不删除 data/ 里多出来的文件
+        shutil.copytree(staged, data, dirs_exist_ok=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -123,7 +160,6 @@ def apply_program_update(url: str) -> None:
     import subprocess
     import tempfile
     import zipfile
-    from pathlib import Path
 
     from zzz_ddtool.paths import base_dir
 
@@ -132,8 +168,10 @@ def apply_program_update(url: str) -> None:
         zip_path = tmp / "prog.zip"
         _download(url, zip_path)
         new_dir = tmp / "new"
+        new_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as zf:
             zf.extractall(new_dir)
+        _log_stripped(_strip_protected(new_dir))
 
         app_dir = base_dir()
         bat = app_dir / "_update.bat"
