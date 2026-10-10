@@ -418,6 +418,66 @@ def test_w4_title_only_never_interrupts_and_upgrade_result_stays_pending(monkeyp
     assert click.call_count == 0
 
 
+def _generation_interrupted(frame, pause_generation):
+    sample = WaitSample(
+        frame=frame, captured_at=0.0, ready=False, state_key=("upgrade_result", "refund"),
+        evidence={"refund": {"text": "材料返还确认"}}, interrupt_reason="material_refund",
+    )
+    return ReadinessInterrupted(
+        "material_refund", last_sample=sample, active_ms=0.0, samples=2,
+        pause_generation=pause_generation,
+    )
+
+
+def test_w4_refund_confirmation_stops_on_pause_generation_change(monkeypatch, sim_time):
+    """§6.2.1/W4：中断帧属于旧暂停代次 → 接续失效，确认输入前停止，不按旧截图坐标点击。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    controller = Mock(paused=False)  # 暂停已恢复，但中断帧来自代次 0、当前代次 1
+    controller.checkpoint = Mock(return_value=1)
+    runner.hotkeys = controller
+    click = Mock()
+    monkeypatch.setattr(runner_module, "click_client", click)
+    refund_frame = image()
+    patch_regions(monkeypatch, {None: [line("材料返还"), line("确认", (10, 10, 60, 40))]})
+
+    with pytest.raises(RunnerError, match="接续失效"):
+        runner._resume_after_refund(
+            1, "R1C1", _generation_interrupted(refund_frame, 0),
+            before=disc(0), expected_level=3, disc_slot=-1, stage_started=None,
+        )
+
+    click.assert_not_called()  # 危险点击必须不发生
+
+
+def test_w4_refund_confirmation_allows_same_pause_generation(monkeypatch, sim_time):
+    """§6.2.1/W4：中断帧代次与当前一致 → 接续有效，正常确认一次并重建第二次结果等待。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    controller = Mock(paused=False)
+    controller.checkpoint = Mock(return_value=0)
+    runner.hotkeys = controller
+    click = Mock()
+    monkeypatch.setattr(runner_module, "click_client", click)
+    refund_frame = image()
+    result_frame = image()
+    patch_regions(monkeypatch, {None: [line("材料返还"), line("确认", (10, 10, 60, 40))]})
+    monkeypatch.setattr(
+        runner, "_wait_ready",
+        Mock(return_value=WaitResult(frame=result_frame, disc=disc(3), active_ms=0.0,
+                                     samples=1, pause_generation=0)),
+    )
+
+    result, frame = runner._resume_after_refund(
+        1, "R1C1", _generation_interrupted(refund_frame, 0),
+        before=disc(0), expected_level=3, disc_slot=-1, stage_started=None,
+    )
+
+    assert result.level == 3
+    assert frame is result_frame
+    click.assert_called_once()
+
+
 # --------------------------------------------------------------------------
 # W7：return_warehouse 逐层 Esc 循环
 # --------------------------------------------------------------------------

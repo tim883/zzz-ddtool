@@ -648,10 +648,48 @@ def test_check_calibration_passes_with_calibrated_open_preview(gate):
 # --------------------------------------------------------------------------
 # check_final（F1～F6）
 # --------------------------------------------------------------------------
-PERF_LINES = (
-    '{"component": "disc_total", "duration_ms": 12.5, "disc_index": 3}\n'
-    '{"component": "run_total", "duration_ms": 900.0, "details": {"processed_discs": 1}}\n'
-)
+FINAL_RUN_ID = "gate-run-" + "0" * 32
+
+
+def _perf_event(event_id, component, *, job_index=None, disc_index=None,
+                duration_ms=1.0, details=None, run_id=FINAL_RUN_ID):
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "event_id": event_id,
+        "parent_id": None,
+        "job_index": job_index,
+        "disc_index": disc_index,
+        "stage_level": None,
+        "component": component,
+        "duration_ms": duration_ms,
+        "details": details or {},
+    }
+
+
+def final_perf_events():
+    """一份满足 §9.2 关联要求的最小真实事件集：run/disc/probe/wait 各一，run_id 一致。"""
+    return [
+        _perf_event("e00000001", "disc_total", job_index=0, disc_index=3, duration_ms=12.5,
+                    details={"input_sent": True, "outcome": "succeeded", "result": "done",
+                             "core": {"level": 0, "rarity": "S", "substats": []},
+                             "decisions": [{"job_id": "j1", "action": "skip", "reason": "r",
+                                            "score": 1.0, "level": 0}]}),
+        _perf_event("e00000002", "probe", job_index=0, disc_index=3,
+                    details={"kind": "select_disc", "wait_id": "e00000003"}),
+        _perf_event("e00000003", "wait_total", job_index=0, disc_index=3,
+                    details={"kind": "select_disc", "outcome": "succeeded"}),
+        _perf_event("e00000004", "run_total", duration_ms=900.0,
+                    details={"runner_outcome": "completed", "termination_kind": "completed",
+                             "end_reason": "已处理 1 个盘"}),
+    ]
+
+
+def write_perf(gate, events):
+    gate.perf_path.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
@@ -659,27 +697,66 @@ def final_gate(gate):
     config = gate.root / "plan.yaml"
     config.write_text("max_pages: 3\n", encoding="utf-8")
     perf = gate.root / "perf.jsonl"
-    perf.write_text(PERF_LINES, encoding="utf-8")
     gate.config_rel = "plan.yaml"
     gate.config_path = config
     gate.perf_rel = "perf.jsonl"
     gate.perf_path = perf
+    write_perf(gate, final_perf_events())
     return gate
 
 
+def _coverage_entry(status="not_observed", count=0, refs=None):
+    return {"status": status, "count": count,
+            "evidence_refs": [] if refs is None else refs}
+
+
+def final_coverage():
+    return {key: _coverage_entry() for key in
+            ("upgrade", "label_save", "label_discard",
+             "label_unlock_before_discard", "maxed_refund", "material_shortfall")}
+
+
 def final_body(gate, **over):
+    config_sha = vs.sha256_file(gate.config_path)
     body = {
         "schema_version": 1,
         "spec_sha256": vs.sha256_file(gate.spec),
         "execution_identity": dict(gate.identity),
-        "config": {"path": gate.config_rel, "sha256": vs.sha256_file(gate.config_path)},
-        "jobs": [{"slot": 1, "sets": [], "mainstats": [], "accepted": 0, "max_discs": 3000}],
+        "run_id": FINAL_RUN_ID,
+        "environment": {"machine_id": "m" * 8, "client_width": 1920, "client_height": 1080,
+                        "window_dpi": 96, "game_exe_path": "c:/game/z.exe", "game_build": "1"},
+        "config_path": gate.config_rel,
+        "config_sha256_before": config_sha,
+        "config_sha256_after": config_sha,
+        "wait_profile_status": {"status": "default", "profile_path": "user/scan-waits.json",
+                                "profile_sha256": None},
+        "effective_policies": {"select_disc": {"min_wait_ms": 500, "timeout_ms": 3000,
+                                               "poll_ms": 50, "stable_frames": 2}},
+        "jobs": [{"job_index": 0, "job_id": "j1", "slot": 1, "sets": [], "mainstats": [],
+                  "accepted": 0, "max_discs": 3000, "quota_effective": 3000,
+                  "labels": {"save": False, "discard": False},
+                  "skipped": False, "processed": 1, "end_reason": "exhausted"}],
+        "discs": [{"job_index": 0, "disc_index": 3, "event_id": "e00000001",
+                   "duration_ms": 12.5, "input_sent": True, "result": "done",
+                   "outcome": "succeeded", "core": {"level": 0, "rarity": "S", "substats": []},
+                   "decisions": [{"job_id": "j1", "action": "skip", "reason": "r",
+                                  "score": 1.0, "level": 0}]}],
+        "timing": {"run_total_event_id": "e00000004", "run_duration_ms": 900.0,
+                   "first_parse_event_id": None, "disc_event_ids": ["e00000001"],
+                   "capture_count": 0, "png_save_count": 0, "parse_total_count": 0,
+                   "waits": [{"event_id": "e00000003", "kind": "select_disc",
+                              "outcome": "succeeded", "job_index": 0, "disc_index": 3,
+                              "parent_id": None, "trigger_input_id": None,
+                              "upgrade_input_id": None, "resume_from_wait_id": None}]},
+        "coverage": final_coverage(),
         "perf_file": gate.perf_rel,
-        "component_counts": {"disc_total": 1, "run_total": 1},
+        "component_counts": {"disc_total": 1, "probe": 1, "wait_total": 1, "run_total": 1},
         "processed_discs": 1,
         "runner_outcome": "completed",
         "termination_kind": "completed",
-        "run_total": {"processed_discs": 1},
+        "end_reason": "已处理 1 个盘",
+        "run_total": {"runner_outcome": "completed", "termination_kind": "completed",
+                      "end_reason": "已处理 1 个盘"},
         "coverage_status": "sufficient",
         "evidence_complete": True,
         "passed": True,
@@ -717,6 +794,21 @@ def test_check_final_fails_f1_when_a_top_level_field_is_missing(final_gate):
     assert "coverage_status" in checks[0]["detail"]["missing"]
 
 
+def test_check_final_fails_f1_when_contract_keys_are_missing(final_gate):
+    """§9.2 约定键（run_id/discs/timing/coverage 等）缺失时 F1 必须拦下。"""
+    body = final_body(final_gate)
+    for key in ("run_id", "environment", "config_sha256_before", "config_sha256_after",
+                "wait_profile_status", "effective_policies", "discs", "timing", "coverage"):
+        del body[key]
+    write_final(final_gate, body)
+
+    checks, _evidence, passed = vs.check_final()
+    assert passed is False
+    missing = checks[0]["detail"]["missing"]
+    for key in ("run_id", "discs", "timing", "coverage", "config_sha256_after"):
+        assert key in missing
+
+
 def test_check_final_fails_f2_on_spec_digest_mismatch(final_gate):
     write_final(final_gate, final_body(final_gate, spec_sha256="0" * 64))
 
@@ -726,6 +818,13 @@ def test_check_final_fails_f2_on_spec_digest_mismatch(final_gate):
 def test_check_final_fails_f3_when_plan_bytes_changed(final_gate):
     write_final(final_gate, final_body(final_gate))
     final_gate.config_path.write_text("max_pages: 4\n", encoding="utf-8")
+
+    assert checks_by_id(vs.check_final()[0])["F3"]["passed"] is False
+
+
+def test_check_final_fails_f3_when_before_after_disagree(final_gate):
+    body = final_body(final_gate, config_sha256_after="0" * 64)
+    write_final(final_gate, body)
 
     assert checks_by_id(vs.check_final()[0])["F3"]["passed"] is False
 
@@ -741,7 +840,8 @@ def test_check_final_fails_f4_on_content_identity_mismatch(final_gate, monkeypat
 
 
 def test_check_final_fails_f5_when_perf_file_is_incomplete(final_gate):
-    final_gate.perf_path.write_text(PERF_LINES.rstrip("\n"), encoding="utf-8")
+    raw = final_gate.perf_path.read_text(encoding="utf-8")
+    final_gate.perf_path.write_text(raw.rstrip("\n"), encoding="utf-8")
     write_final(final_gate, final_body(final_gate))
 
     checks, _evidence, passed = vs.check_final()
@@ -760,6 +860,28 @@ def test_check_final_fails_f5_when_perf_file_is_missing(final_gate):
     assert by_id["F5"]["detail"]["error"]
 
 
+def test_check_final_fails_f5_when_perf_lacks_required_components(final_gate):
+    """负向对照：只剩一条真实 capture 事件（无 run_total/disc_total/probe/wait_total）必须拦下。"""
+    write_perf(final_gate, [
+        _perf_event("e00000001", "capture", details={"method": "PrintWindow", "hwnd": 1}),
+    ])
+    write_final(final_gate, final_body(final_gate))
+
+    checks, _evidence, passed = vs.check_final()
+    by_id = checks_by_id(checks)
+    assert by_id["F5"]["passed"] is False
+    assert by_id["F5"]["detail"]["components"] == {"capture": 1}
+    assert passed is False
+
+
+def test_check_final_fails_f5_on_run_id_mismatch(final_gate):
+    write_final(final_gate, final_body(final_gate, run_id="other-run"))
+
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F5"]["passed"] is False
+    assert by_id["F5"]["detail"]["run_id_ok"] is False
+
+
 def test_check_final_fails_f6_when_coverage_disagrees_with_outcome(final_gate):
     write_final(final_gate, final_body(final_gate, runner_outcome="stopped"))
 
@@ -773,10 +895,88 @@ def test_check_final_fails_f6_when_processed_is_below_one(final_gate):
     assert checks_by_id(vs.check_final()[0])["F6"]["passed"] is False
 
 
+def test_check_final_fails_f6_when_processed_discs_is_tampered(final_gate):
+    """报告自报计数与原始事件按 (job_index, disc_index) 复算不一致时必须拦下。"""
+    write_final(final_gate, final_body(final_gate, processed_discs=5))
+
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F6"]["passed"] is False
+    assert by_id["F6"]["detail"]["recomputed_processed"] == 1
+
+
+def test_check_final_counts_discs_by_job_identity_across_jobs(final_gate):
+    """跨任务全局索引可重复：不同任务的同一 disc_index 是两盘，不能按裸索引合并。"""
+    events = final_perf_events()
+    events.insert(1, _perf_event(
+        "e00000005", "disc_total", job_index=1, disc_index=3, duration_ms=9.0,
+        details={"input_sent": True, "outcome": "succeeded", "result": "done",
+                 "core": {"level": 0, "rarity": "A", "substats": []}, "decisions": []}))
+    write_perf(final_gate, events)
+    body = final_body(final_gate, processed_discs=2)
+    body["discs"].append({"job_index": 1, "disc_index": 3, "event_id": "e00000005",
+                          "duration_ms": 9.0, "input_sent": True, "result": "done",
+                          "outcome": "succeeded",
+                          "core": {"level": 0, "rarity": "A", "substats": []}, "decisions": []})
+    write_final(final_gate, body)
+
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F6"]["passed"] is True
+    assert by_id["F6"]["detail"]["recomputed_processed"] == 2
+
+    # 若报告把两盘按裸全局索引错并成 1 盘，必须拦下。
+    write_final(final_gate, final_body(final_gate, processed_discs=1))
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F6"]["passed"] is False
+
+
+def test_check_final_fails_f6_when_measured_coverage_has_no_refs(final_gate):
+    """已触发分支却无事件引用：如实报 measured 也判证据不完整，不能放过。"""
+    coverage = final_coverage()
+    coverage["upgrade"] = _coverage_entry(status="measured", count=1, refs=[])
+    write_final(final_gate, final_body(final_gate, coverage=coverage))
+
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F6"]["passed"] is False
+    assert by_id["F6"]["detail"]["refs_complete"] is False
+
+
+def test_check_final_fails_f6_when_coverage_ref_event_is_unresolvable(final_gate):
+    coverage = final_coverage()
+    coverage["upgrade"] = _coverage_entry(status="measured", count=1, refs=[{
+        "run_id": FINAL_RUN_ID, "job_index": 0, "disc_index": 3,
+        "input_ids": ["input-1"], "event_ids": ["e99999999"],
+        "log_refs": [], "exception": None,
+    }])
+    write_final(final_gate, final_body(final_gate, coverage=coverage))
+
+    by_id = checks_by_id(vs.check_final()[0])
+    assert by_id["F6"]["passed"] is False
+    assert by_id["F6"]["detail"]["refs_complete"] is False
+
+
 def test_check_final_fails_f6_when_passed_lies_about_coverage(final_gate):
     write_final(final_gate, final_body(final_gate, coverage_status="insufficient", passed=True))
 
     assert checks_by_id(vs.check_final()[0])["F6"]["passed"] is False
+
+
+def test_check_final_fails_f6_for_honest_failed_run(final_gate):
+    """素材不足/F10/失败的真实报告：如实记录也必须让 final 门禁不通过（§9.2）。"""
+    events = final_perf_events()
+    events[-1]["details"] = {"runner_outcome": "failed",
+                             "termination_kind": "material_shortfall",
+                             "end_reason": "升级素材不足"}
+    write_perf(final_gate, events)
+    write_final(final_gate, final_body(
+        final_gate,
+        runner_outcome="failed", termination_kind="material_shortfall",
+        coverage_status="insufficient", evidence_complete=True, passed=False,
+    ))
+
+    checks, _evidence, passed = vs.check_final()
+    by_id = checks_by_id(checks)
+    assert by_id["F6"]["passed"] is False
+    assert passed is False
 
 
 def test_check_final_requires_evidence_complete_for_sufficient_coverage(final_gate):

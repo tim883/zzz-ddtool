@@ -318,6 +318,81 @@ def test_pause_excluded_from_active_ms(sim_clock, fake_controller):
     assert result.pause_generation == 1
 
 
+def test_pause_then_timeout_without_new_sample_has_no_last_sample(sim_clock, fake_controller):
+    """§8 W5/W6b：代次改变后尚无新代次样本就超时，last_sample 必须为 None。
+
+    旧实现只清 mode/key/times，超时对象仍携带代次 0 的旧帧（captured_at 属于旧代次）。
+    """
+    policy = readiness.WaitPolicy(0, 150, 50, 2)
+    calls: list[int] = []
+
+    def step0(c, ctrl):
+        c.advance(0.060)
+        return _sample(c, ready=False, key=("old-generation",))
+
+    def step1(c, ctrl):
+        # probe 期间暂停并恢复：代次 0→1，暂停阻塞 1 秒（不计入有效预算）。
+        ctrl.simulate_pause(1.0)
+        return _sample(c, ready=False, key=("new-generation",))
+
+    with pytest.raises(readiness.ReadinessTimeout) as err:
+        _run(sim_clock, fake_controller, [step0, step1], calls=calls, policy=policy)
+    exc = err.value
+    assert exc.pause_generation == 1
+    assert exc.last_sample is None  # 恢复后没有新代次取帧，不能留旧代次帧当诊断证据
+
+
+def test_pause_during_probe_discards_inflight_sample(sim_clock, fake_controller):
+    """§8 W5：probe 返回后才发现跨代次，正在处理的样本同样作废，不能完成等待。"""
+    policy = readiness.WaitPolicy(0, 5000, 50, 2)
+    key = ("a",)
+    calls: list[int] = []
+
+    def step0(c, ctrl):
+        return _sample(c, ready=True, key=key)
+
+    def step1(c, ctrl):
+        ctrl.simulate_pause(1.0)  # 代次 0→1；即便本帧 ready 也不许与旧代次首帧凑对
+        return _sample(c, ready=True, key=key)
+
+    def step_n(c, ctrl):
+        return _sample(c, ready=True, key=key)
+
+    result, n = _run(sim_clock, fake_controller, [step0, step1] + [step_n] * 20,
+                     calls=calls, policy=policy)
+    # 跨代次的 step1 若被消费就会与 step0 凑成两帧（n==2 完成）；必须重建后再要两帧。
+    assert n == 4
+    assert result.pause_generation == 1
+
+
+# --------------------------------------------------------------------------
+# 调度（§6.1：按采集时刻调度下一帧）
+# --------------------------------------------------------------------------
+def test_slow_probe_schedules_next_frame_from_capture_time(sim_clock, fake_controller):
+    """probe 耗时达到 poll 后立即继续，不在慢 probe 后再机械睡足一个 poll。
+
+    旧实现 ``target = probe 结束时刻 + poll``：两次各 100 ms 的 probe 会把第二帧推到
+    150 ms 采集、250 ms 结束，220 ms 预算内本可完成的等待被拖成超时。
+    """
+    policy = readiness.WaitPolicy(0, 220, 50, 2)
+    key = ("same",)
+    captured: list[float] = []
+    calls: list[int] = []
+
+    def step(c, ctrl):
+        taken = c.now()
+        captured.append(taken - 10_000.0)  # sim_clock 起始 10000.0，记相对时刻
+        c.advance(0.100)  # 本次 probe 的截图/OCR 耗时 100 ms > poll 50 ms
+        return readiness.WaitSample(frame=_frame(), captured_at=taken, ready=True,
+                                    state_key=key, evidence={})
+
+    result, n = _run(sim_clock, fake_controller, [step, step], calls=calls, policy=policy)
+    assert n == 2
+    # 帧在 0/100 ms 采集（第二帧紧跟首次 probe 结束），200 ms 完成，预算 220 ms 内。
+    assert captured == [pytest.approx(0.0), pytest.approx(0.1)]
+    assert result.active_ms == pytest.approx(200.0)
+
+
 # --------------------------------------------------------------------------
 # material_refund 受控中断（§6.2.1）
 # --------------------------------------------------------------------------

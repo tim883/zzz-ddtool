@@ -257,8 +257,17 @@ class Runner:
         self._upgrade_input_id: str | None = None
         #: 最近一次 _wait_ready 产生的 wait_total 事件 ID（供 §6.2.1 第二次等待引用）。
         self._last_wait_id: str | None = None
+        #: 首档 seed 建立时的暂停代次（open_upgrade 完成时刻；§6.2 首档接续证据）。
+        self._upgrade_entry_generation: int | None = None
         #: 当前正在计时的 disc_total 区间句柄（供内部方法补 input_sent/result）。
         self._disc_span = None
+        #: §9.2 逐任务执行记录（job_index/skipped/processed/end_reason），每轮 run 重建。
+        self._job_records: list[dict] = []
+        #: §9.2 coverage：本轮实际发出的标签输入（label_save/label_discard/unlock），
+        #: 只在真实按键且复核确认的执行点记录，已达目标未按键不记。
+        self._label_inputs: list[dict] = []
+        #: §9.2 coverage：本轮实际捕获的 MaterialShortfall 证据（无则 None）。
+        self._shortfall_exception: dict | None = None
         # 本任务绑定实例与实测布局
         self._hwnd: int | None = None
         self._pid: int | None = None
@@ -1090,6 +1099,10 @@ class Runner:
         self._wait_policies = None
         self._disc_event_id = None
         self._upgrade_input_id = None
+        self._upgrade_entry_generation = None
+        self._job_records = []
+        self._label_inputs = []
+        self._shortfall_exception = None
         self.outcome = "running"
         self.end_reason = ""
         # spec §3.6：每次 _run 新建会话，本次 _run 的多个 _run_job 共享该实例。
@@ -1110,6 +1123,16 @@ class Runner:
         try:
             for index, job in enumerate(jobs, 1):
                 self._checkpoint()
+                # §7.1：本轮事件的任务归属用 0 起 job_index；盘/档作用域在更内层建立。
+                scanperf.set_scope(job_index=index - 1, disc_index=None, stage_level=None)
+                job_record = {
+                    "job_index": index - 1,
+                    "job_id": job.job_id,
+                    "skipped": job.accepted is None,
+                    "processed": 0,
+                    "end_reason": None,
+                }
+                self._job_records.append(job_record)
                 self.stats.job_begin(
                     index,
                     job.slot,
@@ -1126,11 +1149,23 @@ class Runner:
                     self.trace.ok("unknown", "job_skipped", message)
                     self._set_status("job_skipped", message)
                     self.stats.job_end(0.0, 0)
+                    job_record["end_reason"] = "skipped"
                     continue
                 job_started = time.monotonic()
                 try:
                     self._run_job(job, replay_session)
+                except RunnerStopped:
+                    job_record["end_reason"] = "stopped"
+                    raise
+                except Exception:
+                    job_record["end_reason"] = "failed"
+                    raise
+                else:
+                    job_record["end_reason"] = (
+                        "quota_reached" if self._job_limit_reached() else "exhausted"
+                    )
                 finally:
+                    job_record["processed"] = self._processed - self._job_started_at
                     # 进模型前就记上用量：任务中途抛错也要能看到它花了多久。
                     self.stats.job_end(
                         time.monotonic() - job_started,
@@ -1151,6 +1186,15 @@ class Runner:
             self.outcome = "failed"
             self.termination_kind = "material_shortfall"
             self.end_reason = str(exc)
+            self._shortfall_exception = {
+                "type": "zzz_ddtool.runner.MaterialShortfall",
+                "message": str(exc),
+                "attributes": {
+                    "from_level": exc.from_level,
+                    "expected_level": exc.expected_level,
+                    "actual_level": exc.actual_level,
+                },
+            }
             self.log.warning("run material_shortfall: %s", exc)
             self.trace.fail("unknown", "run", self.end_reason)
         except Exception as exc:
@@ -1965,6 +2009,9 @@ class Runner:
             raise RunnerError(f"{cell_tag} 盘面识别失败")
         self._processed += 1
         self._detail_disc = disc
+        if self._disc_span is not None:
+            # §9.2：本盘最新已验证 Disc 的核心盘面随 disc_total 事件保存。
+            self._disc_span.set(core=self._core_of(disc))
         # 统计：从认出盘面这一刻起算这件盘的耗时（含进强化页、逐档升级、收尾）。
         # slot/sets 取所属任务的过滤值（每个任务按固定号位+套装过滤），
         # line_count 取副词条条数——这些只用于「升满成功明细」，不影响统计口径。
@@ -2021,6 +2068,7 @@ class Runner:
                     up_counts,
                     disc_slot,
                     initial_disc=disc,
+                    initial_generation=self._upgrade_entry_generation,
                 )
             else:
                 raise RunnerError(f"{cell_tag} 进入强化页失败，停止任务链")
@@ -2662,6 +2710,22 @@ class Runner:
     def _label_core(disc: Disc) -> tuple:
         return disc.level, disc.rarity, sorted((s.name, s.rolls) for s in disc.substats)
 
+    def _note_label_input(self, kind: str, key: str) -> None:
+        """§9.2 coverage：在真实发出标签按键且复核确认后记录一次标签输入证据。
+
+        只记实际按键；已达目标未按键不记。事件归属取当前 disc_total 区间（无会话为 None）。
+        """
+        span = self._disc_span
+        self._label_inputs.append(
+            {
+                "kind": kind,
+                "key": key,
+                "disc_event_id": span.event_id if span is not None else None,
+                "job_index": span.job_index if span is not None else None,
+                "disc_index": span.disc_index if span is not None else None,
+            }
+        )
+
     def _verify_label(self, hwnd: int, *, key: str, value: bool, other_value: bool,
                       context: _LabelContext) -> QImage:
         """R/T 共用快速复核；轮询只读，不补发任何标签输入。"""
@@ -2710,6 +2774,7 @@ class Runner:
             self._verify_label(hwnd, key="locked", value=False,
                                other_value=state["discarded"], context=context)
             state = {"locked": False, "discarded": state["discarded"]}
+            self._note_label_input("label_unlock_before_discard", "T")
             self.log.info("弃置前已确认解锁 (T)")
         send(VK_R, state)
         self._verify_label(hwnd, key="discarded", value=value,
@@ -2718,6 +2783,7 @@ class Runner:
         if value:
             # 「判定为弃置」和「真打上标记」不是一个数，这里只数后者。
             self.stats.note_discard_label()
+            self._note_label_input("label_discard", "R")
         return True
 
     def _finish_kept_upgrade(self, hwnd: int, disc: Disc) -> None:
@@ -2763,6 +2829,7 @@ class Runner:
             press_key_once(hwnd, VK_T)
         image = self._verify_label(hwnd, key="locked", value=True,
                                    other_value=False, context=context)
+        self._note_label_input("label_save", "T")
         self.log.info("升满保留：已确认锁定标签 (T)")
         self.trace.ok("detail", "lock", "升满保留，已确认 T 锁定", image=image)
 
@@ -2868,6 +2935,7 @@ class Runner:
         """
         from zzz_ddtool.ocr import read_rect
 
+        self._upgrade_entry_generation = None
         # 1) 详情页大按钮（0 级也显示「查看」）
         image, *_ = self._grab(allow_esc=False, need_page=False)
         hit = None
@@ -2910,7 +2978,9 @@ class Runner:
             click_client(hwnd, ax, ay)
             upgrade_started = time.monotonic()
             try:
-                self._wait_ready("open_upgrade", started_at=upgrade_started, before=before)
+                entered = self._wait_ready("open_upgrade", started_at=upgrade_started, before=before)
+                # §6.2 首档接续证据：记录进入强化页确认时刻的暂停代次，供首档 seed 校验。
+                self._upgrade_entry_generation = entered.pause_generation
                 self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
                 return True
             except ReadinessTimeout as exc:
@@ -3009,6 +3079,27 @@ class Runner:
         if self._set_discard_label(hwnd, discarded=discarded, value=True):
             self.trace.ok("detail", "discard", "已按 R 打上弃置标记")
 
+    def _reread_seed_frame(self, hwnd: int, cell_tag: str, seed: Disc) -> tuple[Disc, "QImage"]:
+        """§6.2/W9：首档 seed 失效后的唯一一次补读——一张新帧、一次完整强化盘面读取。
+
+        不调用 ``_read_disc_with_retry`` 再包多帧重读；``OcrError`` 等读取异常原样传播。
+        返回 None（不在预期页面）或核心盘面与原盘不同都抛 RunnerError，不发素材/升级输入。
+        """
+        image, *_ = self._grab(allow_esc=False, need_page=False)
+        disc = self._parse_upgrade_page(image)
+        if disc is None:
+            self.trace.fail("upgrade", "decide", f"{cell_tag} 首档接续失效，补读未在强化页读出盘面", image=image)
+            raise RunnerError(f"{cell_tag} 首档接续失效后补读未读出强化盘面，停止任务链")
+        if not self._same_upgrade_object(disc, seed):
+            self.trace.fail(
+                "upgrade", "decide",
+                f"{cell_tag} 首档接续失效，补读盘面（{disc.level} 级）与原盘（{seed.level} 级）核心不符",
+                image=image,
+            )
+            raise RunnerError(f"{cell_tag} 首档接续失效后补读盘面与原盘核心不符，停止任务链")
+        self.log.info("cell %s 首档接续失效，补读新帧核对原盘一致，按补读盘面继续", cell_tag)
+        return disc, image
+
     def _upgrade_loop(
         self,
         hwnd: int,
@@ -3021,6 +3112,7 @@ class Runner:
         disc_slot: int = -1,
         *,
         initial_disc: Disc | None = None,
+        initial_generation: int | None = None,
     ) -> int:
         """在强化页循环判断+升级，直到弃置/升满/跳过，最后回到网格。
 
@@ -3031,6 +3123,7 @@ class Runner:
 
         返回强化页最终确认的等级，供单屏复核验证本件前移，不能用期望档位代替。
         disc_slot：这件盘在 RunStats 里的下标，用来记各档升级耗时（-1 = 不统计）。
+        initial_generation：首档 seed 建立（open_upgrade 完成）时的暂停代次（§6.2）。
         """
         upgraded = 0
         # 本档从阶段添加/材料操作前起算，包含按钮定位、输入、等待和结果识别。
@@ -3039,15 +3132,19 @@ class Runner:
         pending: tuple[Disc, QImage | None] | None = None
         while True:
             if initial_disc is not None:
+                seed, initial_disc = initial_disc, None
                 paused = self.hotkeys is not None and self.hotkeys.paused
-                self._checkpoint()
-                if paused:
-                    initial_disc = None
-                    continue  # 暂停期间画面可能改变，恢复后按原路径重新读盘。
-                # 已解析当前侧栏且已确认进入强化页；尚未升级，词条数据没有变化。
-                disc, initial_disc = initial_disc, None
-                image = None
-                self.log.info("cell %s 首档复用侧栏盘面，省略强化前重复词条 OCR", cell_tag)
+                generation = self._checkpoint()
+                if not paused and (generation is None or generation == initial_generation):
+                    # 接续证据完整：已解析当前侧栏且已确认进入强化页；尚未升级，词条数据没有变化。
+                    disc = seed
+                    image = None
+                    self.log.info("cell %s 首档复用侧栏盘面，省略强化前重复词条 OCR", cell_tag)
+                else:
+                    # §6.2/W9：暂停或代次改变使 seed 失效。只对一张新帧做一次完整强化盘面
+                    # 读取（_parse_upgrade_page 内部仍允许同帧 fast→legacy 及满级 detail 回退），
+                    # 与原盘比较核心盘面；读不出/核心不同则停止，不发素材/升级/标签输入。
+                    disc, image = self._reread_seed_frame(hwnd, cell_tag, seed)
             elif pending is not None:
                 # §6.3：升级结果等待已消费返回帧/盘面，不再附加固定等待或重复解析。
                 disc, image = pending
@@ -3251,6 +3348,11 @@ class Runner:
         self._checkpoint()
         if frame is None or frame.isNull():
             return False
+        env = self._env
+        if env is not None and (frame.width() != env.client_width or frame.height() != env.client_height):
+            self.log.warning("材料返还确认帧尺寸 %dx%d 与绑定客户区 %dx%d 不符，拒绝按旧坐标确认",
+                             frame.width(), frame.height(), env.client_width, env.client_height)
+            return False
         self._refund_started_at = None
         session = scanperf.current_session()
         self._refund_input_id = session.new_event_id() if session is not None else None
@@ -3263,8 +3365,20 @@ class Runner:
         """§6.2.1：确认一次材料返还后，从确认输入时刻重建第二次 upgrade_result（不重发升级）。
 
         每档最多一次确认尝试、两次结果等待；第二次再出现返还/超时或始终无盘面则有限失败。
+        中断帧属于旧暂停代次时接续失效：确认输入前停止，不按旧截图坐标点击（§8 W4）。
         """
         if interrupted is not None:
+            generation = self._checkpoint()
+            interrupted_generation = getattr(interrupted, "pause_generation", None)
+            if (
+                generation is not None
+                and interrupted_generation is not None
+                and generation != interrupted_generation
+            ):
+                raise RunnerError(
+                    f"{cell_tag} 材料返还接续失效（暂停代次 {interrupted_generation}→{generation}），"
+                    "不使用旧帧确认，停止任务链"
+                )
             frame = interrupted.last_sample.frame
             resume_from = getattr(interrupted, "wait_id", None) or self._last_wait_id
         else:
@@ -3299,3 +3413,15 @@ class Runner:
                 level=disc.level,
             )
         )
+        # §9.2：每次决策同时落进本盘 disc_total 事件（真实执行点，不在报告端重演）。
+        span = self._disc_span
+        if span is not None:
+            span.details.setdefault("decisions", []).append(
+                {
+                    "job_id": job.job_id,
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "score": decision.score,
+                    "level": disc.level,
+                }
+            )

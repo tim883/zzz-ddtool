@@ -646,7 +646,7 @@ def test_upgrade_saves_resume_point_before_entering_page(offline_runner, monkeyp
     monkeypatch.setattr(runner, "_enter_upgrade_page", lambda hwnd, **kw: True)
     seen: dict = {}
 
-    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts, disc_slot, *, initial_disc=None):
+    def upgrade_loop(hwnd, job, global_index, cell_tag, preset, accepted_ids, up_counts, disc_slot, *, initial_disc=None, initial_generation=None):
         seen["resume"] = state.resume_point
         seen["active"] = state.active_index
 
@@ -2269,18 +2269,100 @@ def test_first_upgrade_seed_preserves_control_checkpoint(offline_runner, monkeyp
     new_disc = Disc(3, (Substat("暴击率", 2),) + sample_disc().substats[1:])
     parser = Mock(return_value=new_disc)
     upgrade = Mock(return_value=True)
+    discard = Mock()
     monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
     monkeypatch.setattr(runner, "_upgrade_once", upgrade)
-    monkeypatch.setattr(runner, "_discard_from_upgrade", Mock())
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
     args = (1, runner._default_job(), 0, "R1C1", runner.preset, None, {})
     if control == "stop":
         with pytest.raises(RunnerStopped):
             runner._upgrade_loop(*args, initial_disc=sample_disc())
         parser.assert_not_called()
     else:
-        assert runner._upgrade_loop(*args, initial_disc=sample_disc()) == 3
-        parser.assert_called_once()
+        # §6.2/W9：暂停使 seed 失效；只允许一次补读并与原盘核对，核心不同 → RunnerError，
+        # 不能继续对变化后的盘分派弃置/升级输入。
+        with pytest.raises(RunnerError, match="核心不符"):
+            runner._upgrade_loop(*args, initial_disc=sample_disc())
+        parser.assert_called_once()  # 一张新帧一次完整读取，不走多帧重读
+        discard.assert_not_called()
     upgrade.assert_not_called()
+
+
+def _generation_changed_controller(generation=2):
+    controller = Mock(paused=False)  # 暂停已恢复，但代次已改变
+    controller.checkpoint = Mock(return_value=generation)
+    return controller
+
+
+def test_first_upgrade_seed_generation_change_rereads_and_compares(offline_runner, monkeypatch):
+    """§6.2/W9：暂停已恢复但代次改变 → seed 失效；补读一次，核心一致才按补读盘面继续。"""
+    runner = Runner(Preset(stage_require={"four": {3: 999}}), hotkeys=False)
+    runner.hotkeys = _generation_changed_controller()
+    seed = Disc(3, (Substat("暴击率", 2),) + sample_disc().substats[1:])
+    parser = Mock(return_value=Disc(3, (Substat("暴击率", 2),) + sample_disc().substats[1:]))
+    upgrade = Mock(return_value=True)
+    discard = Mock()
+    monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade)
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
+    args = (1, runner._default_job(), 0, "R1C1", runner.preset, None, {})
+    assert runner._upgrade_loop(*args, initial_disc=seed, initial_generation=1) == 3
+    parser.assert_called_once()  # 失效后只补读一次
+    discard.assert_called_once()  # 核对一致后按补读盘面正常判定
+
+
+def test_first_upgrade_seed_generation_change_core_mismatch_stops(offline_runner, monkeypatch):
+    """§6.2/W9：代次改变后补读核心与原盘不同 → RunnerError，升级/弃置输入均为 0。"""
+    runner = Runner(Preset(stage_require={"four": {3: 999}}), hotkeys=False)
+    runner.hotkeys = _generation_changed_controller()
+    different = Disc(3, (Substat("暴击率", 2),) + sample_disc().substats[1:])
+    parser = Mock(return_value=different)
+    upgrade = Mock(return_value=True)
+    discard = Mock()
+    monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade)
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
+    args = (1, runner._default_job(), 0, "R1C1", runner.preset, None, {})
+    with pytest.raises(RunnerError, match="核心不符"):
+        runner._upgrade_loop(*args, initial_disc=sample_disc(), initial_generation=1)
+    parser.assert_called_once()
+    upgrade.assert_not_called()
+    discard.assert_not_called()
+
+
+def test_first_upgrade_seed_generation_change_reread_none_stops(offline_runner, monkeypatch):
+    """§6.2/W9：代次改变后补读不在强化页（None）→ RunnerError，输入为 0。"""
+    runner = Runner(Preset(stage_require={"four": {3: 999}}), hotkeys=False)
+    runner.hotkeys = _generation_changed_controller()
+    parser = Mock(return_value=None)
+    upgrade = Mock(return_value=True)
+    discard = Mock()
+    monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade)
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
+    args = (1, runner._default_job(), 0, "R1C1", runner.preset, None, {})
+    with pytest.raises(RunnerError, match="未读出强化盘面"):
+        runner._upgrade_loop(*args, initial_disc=sample_disc(), initial_generation=1)
+    parser.assert_called_once()
+    upgrade.assert_not_called()
+    discard.assert_not_called()
+
+
+def test_first_upgrade_seed_same_generation_reused_without_reread(offline_runner, monkeypatch):
+    """§6.2：代次与 seed 建立时一致 → 首档复用，不重复词条 OCR（parser 0 次）。"""
+    runner = Runner(Preset(stage_require={"four": {3: 999}}), hotkeys=False)
+    runner.hotkeys = _generation_changed_controller(generation=1)
+    seed = Disc(3, (Substat("暴击率", 2),) + sample_disc().substats[1:])
+    parser = Mock(return_value=None)
+    upgrade = Mock(return_value=True)
+    discard = Mock()
+    monkeypatch.setattr(runner, "_parse_upgrade_page", parser)
+    monkeypatch.setattr(runner, "_upgrade_once", upgrade)
+    monkeypatch.setattr(runner, "_discard_from_upgrade", discard)
+    args = (1, runner._default_job(), 0, "R1C1", runner.preset, None, {})
+    assert runner._upgrade_loop(*args, initial_disc=seed, initial_generation=1) == 3
+    parser.assert_not_called()  # 接续证据完整：复用 seed，不补读
+    discard.assert_called_once()
 
 
 def test_seeded_upgrade_shortfall_reads_fresh_and_stops(offline_runner, monkeypatch):

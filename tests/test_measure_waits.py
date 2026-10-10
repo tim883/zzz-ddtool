@@ -240,3 +240,138 @@ def test_c3_execution_identity_is_normalized_and_complete():
     recomputed = sha256(canonical_json_bytes(identity["files"])).hexdigest()
     assert identity["content_sha256"] == recomputed
     assert isinstance(identity["worktree_status"], str)
+
+
+# --------------------------------------------------------------------------
+# §9.2 最终流程报告组装（纯函数层：计数/关联/覆盖/证据完整性）
+# --------------------------------------------------------------------------
+def _fevent(event_id, component, *, job_index=None, disc_index=None, details=None,
+            duration_ms=1.0, run_id="run-x"):
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "event_id": event_id,
+        "parent_id": None,
+        "job_index": job_index,
+        "disc_index": disc_index,
+        "stage_level": None,
+        "component": component,
+        "duration_ms": duration_ms,
+        "details": details or {},
+    }
+
+
+def _final_events():
+    return [
+        _fevent("e1", "disc_total", job_index=0, disc_index=3,
+                details={"input_sent": True, "outcome": "succeeded", "result": "done",
+                         "core": {"level": 0, "rarity": "S", "substats": []},
+                         "decisions": [{"action": "skip", "reason": "r", "score": 1.0,
+                                        "level": 0, "job_id": "j1"}]}),
+        _fevent("e2", "probe", job_index=0, disc_index=3, details={"kind": "select_disc"}),
+        _fevent("e3", "wait_total", job_index=0, disc_index=3,
+                details={"kind": "select_disc", "outcome": "succeeded"}),
+        _fevent("e4", "run_total", details={"runner_outcome": "completed",
+                                            "termination_kind": "completed"}),
+    ]
+
+
+def test_final_processed_counts_by_job_identity_not_bare_index():
+    """跨任务全局索引可重复：job 0 与 job 1 的 disc_index=3 是两盘（§9.2）。"""
+    events = _final_events()
+    events.insert(1, _fevent("e5", "disc_total", job_index=1, disc_index=3,
+                             details={"input_sent": True, "outcome": "succeeded"}))
+    events.insert(2, _fevent("e6", "disc_total", job_index=1, disc_index=3,
+                             details={"input_sent": True, "outcome": "failed"}))
+    # 同一 (job, disc) 的多条 disc_total 只算一盘（异常重入不会产生第二条，容错去重）。
+    assert mw._final_processed(events) == 2
+    # 缺 job_index（旧版事件 null）只能按 (None, disc) 合并，如实反映为 1。
+    legacy = [dict(event, job_index=None) for event in events]
+    assert mw._final_processed(legacy) == 1
+
+
+def test_final_discs_and_timing_reference_real_events():
+    events = _final_events()
+    discs = mw._final_discs(events)
+    assert [d["event_id"] for d in discs] == ["e1"]
+    assert discs[0]["decisions"][0]["action"] == "skip"
+    timing = mw._final_timing(events, {"capture": 2, "png_save": 1, "parse_total": 0},
+                              events[-1])
+    assert timing["run_total_event_id"] == "e4"
+    assert timing["waits"][0]["event_id"] == "e3"
+    assert timing["capture_count"] == 2
+
+
+def test_final_coverage_upgrade_groups_by_input_id():
+    events = _final_events()
+    events.insert(2, _fevent("e7", "wait_total", job_index=0, disc_index=3,
+                             details={"kind": "upgrade_result", "outcome": "succeeded",
+                                      "upgrade_input_id": "u1", "trigger_input_id": "u1",
+                                      "resume_from_wait_id": None}))
+    events.insert(3, _fevent("e8", "wait_total", job_index=0, disc_index=3,
+                             details={"kind": "upgrade_result", "outcome": "interrupted",
+                                      "upgrade_input_id": "u2", "trigger_input_id": "u2",
+                                      "resume_from_wait_id": None}))
+    events.insert(4, _fevent("e9", "wait_total", job_index=0, disc_index=3,
+                             details={"kind": "upgrade_result", "outcome": "succeeded",
+                                      "upgrade_input_id": "u2", "trigger_input_id": "r1",
+                                      "resume_from_wait_id": "e8"}))
+    coverage = mw._final_coverage(events, "run-x", [], None, "e4")
+    # 两次升级输入：u1 一档成功，u2 一档先返还再成功（同一输入 ID 不重复计）。
+    assert coverage["upgrade"]["status"] == "measured"
+    assert coverage["upgrade"]["count"] == 2
+    # 一次返还处理分支：首个等待 e8 + 重建等待 e9 + 返还确认输入 r1。
+    refund = coverage["maxed_refund"]
+    assert refund["status"] == "measured" and refund["count"] == 1
+    ref = refund["evidence_refs"][0]
+    assert ref["event_ids"] == ["e8", "e9"]
+    assert ref["input_ids"] == ["r1"]
+    assert coverage["label_save"]["status"] == "not_observed"
+    assert coverage["material_shortfall"]["count"] == 0
+
+
+def test_final_coverage_labels_and_shortfall_use_real_records():
+    events = _final_events()
+    labels = [
+        {"kind": "label_unlock_before_discard", "key": "T", "disc_event_id": "e1",
+         "job_index": 0, "disc_index": 3},
+        {"kind": "label_discard", "key": "R", "disc_event_id": "e1",
+         "job_index": 0, "disc_index": 3},
+    ]
+    shortfall = {"type": "zzz_ddtool.runner.MaterialShortfall", "message": "m",
+                 "attributes": {"from_level": 0, "expected_level": 3, "actual_level": 1}}
+    coverage = mw._final_coverage(events, "run-x", labels, shortfall, "e4")
+    assert coverage["label_unlock_before_discard"]["count"] == 1
+    assert coverage["label_discard"]["count"] == 1
+    assert coverage["label_save"]["status"] == "not_observed"
+    short = coverage["material_shortfall"]
+    assert short["count"] == 1
+    assert short["evidence_refs"][0]["exception"]["attributes"]["expected_level"] == 3
+    assert short["evidence_refs"][0]["event_ids"] == ["e4"]
+
+
+def test_final_evidence_complete_rejects_missing_or_tampered_links():
+    events = _final_events()
+    coverage = mw._final_coverage(events, "run-x", [], None, "e4")
+    discs = mw._final_discs(events)
+    run_total = events[-1]
+    base = dict(perf_complete=True, run_total=run_total, processed=1, run_id="run-x",
+                coverage=coverage, discs=discs)
+    assert mw._final_evidence_complete(events, **base) is True
+    # 零盘、缺根事件、run_id 不一致都不完整。
+    assert mw._final_evidence_complete(events, **{**base, "processed": 0}) is False
+    assert mw._final_evidence_complete(events, **{**base, "run_total": None}) is False
+    assert mw._final_evidence_complete(events, **{**base, "run_id": None}) is False
+    assert mw._final_evidence_complete(events, **{**base, "perf_complete": False}) is False
+    # discs 引用不存在的事件 → 关联缺失。
+    bad_discs = [dict(discs[0], event_id="e404")]
+    assert mw._final_evidence_complete(events, **{**base, "discs": bad_discs}) is False
+    # 已触发分支无引用 / 引用不可解析 → 不完整。
+    bad_coverage = mw._final_coverage(events, "run-x", [], None, "e4")
+    bad_coverage["upgrade"] = {"status": "measured", "count": 1, "evidence_refs": []}
+    assert mw._final_evidence_complete(events, **{**base, "coverage": bad_coverage}) is False
+    bad_coverage2 = mw._final_coverage(events, "run-x", [], None, "e4")
+    bad_coverage2["upgrade"] = {"status": "measured", "count": 1, "evidence_refs": [
+        {"run_id": "run-x", "job_index": 0, "disc_index": 3, "input_ids": [],
+         "event_ids": ["e404"], "log_refs": [], "exception": None}]}
+    assert mw._final_evidence_complete(events, **{**base, "coverage": bad_coverage2}) is False

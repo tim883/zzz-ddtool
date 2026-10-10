@@ -301,7 +301,7 @@ def wait_ready(
 
     - 只做调度/判定/返回或抛错；不写性能事件。
     - ``probe``/``checkpoint`` 抛出的异常原样向上传播（§6.1.1）。
-    - 暂停阻塞不计入 ``active_ms``/超时；代次改变丢弃旧帧与候选，下限从恢复时刻重算。
+    - 暂停阻塞不计入 ``active_ms``/超时；代次改变丢弃旧帧、候选与最后样本，下限从恢复时刻重算。
     - ``material_refund`` 需两个独立稳定候选，满足后抛 ``ReadinessInterrupted``。
     """
     if kind not in KINDS:
@@ -340,19 +340,27 @@ def wait_ready(
         "count": 0,
     }
 
-    def _on_checkpoint() -> None:
+    def _on_checkpoint() -> bool:
+        """检查暂停代次；返回本次检查是否发生了代次改变。
+
+        代次改变时丢弃旧帧、连续计数、返回候选与最后样本（§6.1、§8 W5/W6b）：
+        旧代次证据既不能完成等待，也不能作为超时诊断的 last_sample。
+        """
         gen = checkpoint()
         if gen is None:
-            return
+            return False
         if isinstance(gen, bool) or not isinstance(gen, int):
             raise ValueError(f"checkpoint 返回的代次必须是 int 或 None：{gen!r}")
         if state["gen"] is not None and gen != state["gen"]:
-            # 暂停代次改变：丢弃旧帧、连续计数与返回候选，下限从恢复时刻重算。
             state["mode"] = None
             state["key"] = None
             state["times"] = []
+            state["last"] = None
             state["gen_start_active"] = _active_at(_now())
+            state["gen"] = gen
+            return True
         state["gen"] = gen
+        return False
 
     def _raise_timeout(moment: float) -> None:
         raise ReadinessTimeout(
@@ -393,11 +401,14 @@ def wait_ready(
         state["last"] = sample
 
         end = _now()
-        _on_checkpoint()
+        crossed = _on_checkpoint()
         if _active_at(end) > timeout_s:
             _raise_timeout(end)
 
-        if not sample.ready and sample.interrupt_reason is None:
+        if crossed:
+            # probe 期间跨代次：当前样本采自旧代次（_on_checkpoint 已清 last），不消费。
+            pass
+        elif not sample.ready and sample.interrupt_reason is None:
             state["mode"] = None
             state["key"] = None
             state["times"] = []
@@ -417,8 +428,9 @@ def wait_ready(
                     if len(state["times"]) >= need:
                         return _finish(sample, end)
 
-        # 调度下一帧：按 probe 结束时刻 + poll 间隔；probe 已耗时足够则立即继续。
-        target = end + poll_s
+        # 调度下一帧：按本帧采集时刻 + poll 间隔（§6.1）；probe 耗时达到 poll 时立即继续，
+        # 不在慢 probe 后机械再睡足一个 poll（那会把本可在预算内完成的等待拖成超时）。
+        target = sample.captured_at + poll_s
         while True:
             moment = _now()
             if moment >= target:
