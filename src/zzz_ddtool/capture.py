@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -337,6 +338,14 @@ def _resume_overlay(hidden: bool) -> None:
         pass
 
 
+#: 抓帧遇到瞬时无效帧（切页过渡黑屏、PrintWindow 与 DWM 竞争）时的重试次数与间隔。
+#: 实测点击「查看」打开驱动盘详情后约 150~230ms 有一帧全暗，随后立即恢复；旧实现
+#: 对它零容忍、直接抛 CaptureError，会中断等待/标定。现在两级取图都无效时短暂等待
+#: 后重试整条链，连续 _CAPTURE_ATTEMPTS 次都无效才判定为「真的截不到」。
+_CAPTURE_ATTEMPTS = 3
+_CAPTURE_RETRY_DELAY_S = 0.08
+
+
 def grab_game_image(hwnd: int | None = None):
     target = hwnd if hwnd is not None else find_game_hwnd()
     _restore_window(target)
@@ -347,17 +356,24 @@ def grab_game_image(hwnd: int | None = None):
         # 失败未取得结果时记 null，异常照原样往外抛。
         with scanperf.timed("capture", details={"method": None, "hwnd": None}) as span:
             try:
-                image = _print_window(target)
-                method = "printwindow"
-                if image is None or _looks_unusable(image):
+                for attempt in range(_CAPTURE_ATTEMPTS):
+                    image = _print_window(target)
+                    method = "printwindow"
+                    if image is not None and not _looks_unusable(image):
+                        break
                     # 提权运行的游戏会把 PrintWindow 拒成 ERROR_ACCESS_DENIED；
                     # 屏幕 BitBlt 不打开目标进程，可兜底。窗口已由 _restore_window 提到最前。
                     image = _bitblt_screen(target)
                     method = "bitblt"
-                    if image is None or _looks_unusable(image):
-                        raise CaptureError(
-                            "窗口截到的是黑图/空白图。确认游戏窗口化、可见、没有被别的窗口挡住。"
-                        )
+                    if image is not None and not _looks_unusable(image):
+                        break
+                    # 两级都拿到无效帧：多半是切页过渡黑屏，短暂等待后整条链重试。
+                    if attempt + 1 < _CAPTURE_ATTEMPTS:
+                        time.sleep(_CAPTURE_RETRY_DELAY_S)
+                else:
+                    raise CaptureError(
+                        "窗口截到的是黑图/空白图。确认游戏窗口化、可见、没有被别的窗口挡住。"
+                    )
             finally:
                 span.set(method=method, hwnd=target if method is not None else None)
     finally:
