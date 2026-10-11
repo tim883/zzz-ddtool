@@ -38,7 +38,44 @@ def test_required_substats_intersect_manual_choices_counts_and_bulk_qualifying()
     assert rebase_selection(replace(job, accepted=())) == ()
 
 
-def test_required_substat_zero_or_blocked_by_mainstat_has_no_matches():
+def _card(*tokens):
+    from zzz_ddtool.origin import Origin
+    from zzz_ddtool.patterns import Pattern, Slot
+
+    slots = []
+    for token in tokens:
+        name, plus, bonus = token.rpartition("+")
+        slots.append(Slot(name if plus else token, int(bonus) if plus else 0))
+    return Pattern(Origin.THREE, 0, tuple(slots), 0.0)
+
+
+def test_has_required_substats_counts_each_unrevealed_slot_as_one_required_substat():
+    """必带判定：命中数 + 未出槽数 >= 必带数；废词条是已出词条，不能顶。"""
+    from zzz_ddtool.taskcards import has_required_substats
+
+    required = ("攻击力%", "暴击率")
+    assert has_required_substats(_card("攻击力%", "暴击率", "废词条", "废词条"), required)
+    assert has_required_substats(_card("攻击力%", "废词条", "废词条", "未出"), required)
+    assert has_required_substats(_card("暴击率", "废词条", "废词条", "未出"), required)
+    assert not has_required_substats(_card("废词条", "废词条", "废词条", "未出"), required)
+    assert not has_required_substats(_card("废词条", "废词条", "废词条", "废词条"), required)
+    assert has_required_substats(_card("攻击力%", "废词条+1", "废词条", "废词条"), ("攻击力%",))
+
+    four = ("攻击力%", "暴击率", "穿透值", "异常精通")
+    assert not has_required_substats(_card("攻击力%", "暴击率", "穿透值", "废词条"), four)
+    assert has_required_substats(_card("攻击力%", "暴击率", "穿透值", "未出"), four)
+    assert not has_required_substats(_card("攻击力%", "暴击率", "废词条", "未出"), four)
+
+    assert has_required_substats(_card("废词条", "废词条", "废词条", "未出"), ("攻击力%",))
+    assert has_required_substats(_card("废词条", "废词条", "废词条", "废词条"), ())
+
+
+def test_required_substat_zero_or_blocked_by_mainstat_only_passes_via_unrevealed_slot():
+    """零单价或被主属性屏蔽的词条永远不会以该名字出现在卡片上。
+
+    已出满 4 条的档位（初始 4 词、+3 及以上）没有未出槽，必带它恒不通过；
+    只有初始 3 词 @+0 能靠那 1 个未出槽顶上，等强化出第 4 词再按严格条件判。
+    """
     from zzz_ddtool.gui import qualifying_pattern_ids
 
     for mainstats, weights in (((), {"攻击力%": 0, "暴击率": 1}),
@@ -46,16 +83,31 @@ def test_required_substat_zero_or_blocked_by_mainstat_has_no_matches():
         job = TaskJob(slot=4, mainstats=mainstats, weights=weights,
                       required_substats=("攻击力%",), accepted=("four:0:暴击率|废词条|废词条|废词条",))
         assert rebase_selection(job) == ()
-        assert qualifying_pattern_ids(4, mainstats, weights, required_substats=job.required_substats) == ()
+        accepted = qualifying_pattern_ids(4, mainstats, weights, required_substats=job.required_substats)
+        assert accepted
+        assert all(pid.startswith("three:0:") and "未出" in pid for pid in accepted)
+        assert all("攻击力%" not in pid for pid in accepted)
 
 
-def test_four_required_substats_exclude_initial_three_zero_level():
+def test_four_required_substats_pass_initial_three_only_by_one_unrevealed_slot():
+    """4 个必带 + 初始 3 词 @+0：3 条已出必须全部命中，缺的那个由未出槽顶。
+
+    缺 2 个以上仍不通过，未出槽不会整片放行初始 3 词；已出满 4 条时照旧全命中。
+    """
     from zzz_ddtool.gui import qualifying_pattern_ids
 
     names = ("暴击率", "暴击伤害", "攻击力%", "穿透值")
     accepted = qualifying_pattern_ids(5, (), dict.fromkeys(names, 1), required_substats=names)
     assert accepted
-    assert not any(pid.startswith("three:0:") for pid in accepted)
+    initial_three = [pid for pid in accepted if pid.startswith("three:0:")]
+    assert initial_three
+    for pid in accepted:
+        tokens = {token.split("+", 1)[0] for token in pid.split(":", 2)[2].split("|")}
+        if pid.startswith("three:0:"):
+            assert "未出" in tokens
+            assert len(set(names) - tokens) == 1
+        else:
+            assert set(names) <= tokens
     assert any(pid.startswith("four:0:") for pid in accepted)
     assert any(pid.startswith("three:3:") for pid in accepted)
 

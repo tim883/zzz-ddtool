@@ -21,7 +21,22 @@ def effective_weights(job: TaskJob) -> dict[str, float]:
 
 
 def has_required_substats(pattern: Pattern, required_substats: tuple[str, ...]) -> bool:
-    return not required_substats or set(required_substats).issubset(slot.name for slot in pattern.slots)
+    """卡片是否满足必带：已出的命中数不够时，每个「未出」槽顶一个必带词条。
+
+    「未出」（EMPTY）表示该槽尚未揭示，可能是任一副词条，所以初始 3 词 @+0 的
+    卡片允许缺一个必带。判据是 `命中数 + 未出槽数 >= 必带数`。
+
+    「废词条」是已经出来的词条、只是不参与计分，不算未知，不能顶。初始 4 词与
+    强化后的档位已经出满 4 条，没有未出，等价于原来的「必须全部命中」。
+    """
+    if not required_substats:
+        return True
+    required = set(required_substats)
+    names = {slot.name for slot in pattern.slots}
+    if required <= names:
+        return True
+    empty = sum(1 for slot in pattern.slots if slot.name == EMPTY)
+    return empty > 0 and len(required & names) + empty >= len(required)
 
 
 def rebase_selection(job: TaskJob, *, filtered: bool = True,

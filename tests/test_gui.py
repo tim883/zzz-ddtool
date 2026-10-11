@@ -1708,8 +1708,12 @@ def test_required_filter_reduces_existing_selection_without_enumeration_and_save
         first = set(window._accepted_ids())
         assert 0 < len(first) < 100
         assert all("攻击力%" in pid for pid in first)
-        assert all("攻击力%" in pattern.pattern_id for section in window.sections.values()
-                   for pattern in (section.patterns[i] for i in section._visible_indices))
+        # 已出满 4 条的档位必须含必带词条；只有初始 3 词 @+0 能靠未出槽通过。
+        visible = [section.patterns[i].pattern_id for section in window.sections.values()
+                   for i in section._visible_indices]
+        without_required = [pid for pid in visible if "攻击力%" not in pid]
+        assert without_required
+        assert all(pid.startswith("three:0:") and "未出" in pid for pid in without_required)
         required_box(window.weight_editor, "攻击力%").click()
         assert set(window._accepted_ids()) == set(original)
         required_box(window.weight_editor, "攻击力%").click()
@@ -1754,7 +1758,12 @@ def test_required_filter_is_task_specific_and_bulk_selection_obeys_it(qapp, tmp_
         for job in window._jobs:
             assert job.accepted == qualifying_pattern_ids(job.slot, job.mainstats, job.weights,
                                                          job.stage_require, required_substats=job.required_substats)
-            assert job.accepted and all(job.required_substats[0] in pid for pid in job.accepted)
+            required = job.required_substats[0]
+            assert job.accepted
+            # 含必带的卡片照旧保留；不含的只能是初始 3 词 @+0 靠未出槽顶上。
+            assert all(required in pid or (pid.startswith("three:0:") and "未出" in pid)
+                       for pid in job.accepted)
+            assert any(required not in pid for pid in job.accepted)
         window.chain_list.setCurrentRow(1)
         assert required_box(window.weight_editor, "攻击力%").isChecked()
         assert not required_box(window.weight_editor, "暴击率").isChecked()
@@ -1813,15 +1822,18 @@ def test_required_filter_respects_current_bulk_selection_and_ungenerated_state(q
         window._check_visible(True)
         expected = {section._ids[i] for section in window.sections.values() for i in section._visible_indices}
         assert expected and set(window.collect_preset().task_chain[0].accepted) == expected
-        assert all("暴击率" in pid for pid in expected)
+        assert all("暴击率" in pid or (pid.startswith("three:0:") and "未出" in pid) for pid in expected)
+        assert any("暴击率" not in pid for pid in expected)
         window.sections[("four", 0)].require.setValue(2)
         assert all("暴击伤害" in pid for pid in window.sections[("four", 0)].visible_accepted())
         required_box(window.weight_editor, "暴击伤害").click()
         spin = next(spin for combo, spin, _ in window.weight_editor._rows if combo.currentText() == "暴击伤害")
         spin.setValue(0)
-        assert window.collect_preset().task_chain[0].accepted == ()
+        # 暴击伤害 单价 0 后不会以该名字出现在任何卡片上：已出满 4 条的档位全部落空，
+        # 只留下初始 3 词 @+0 那张「已出含暴击率、另一个必带由未出槽顶上」的卡片。
+        assert window.collect_preset().task_chain[0].accepted == ("three:0:暴击率|废词条|废词条|未出",)
         refresh_cards(window, qapp)
-        assert all(not section._visible_indices for section in window.sections.values())
+        assert {key for key, section in window.sections.items() if section._visible_indices} == {("three", 0)}
     finally:
         close_count_window(window, qapp)
 
