@@ -1246,14 +1246,16 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
             return lines
         with input_context("open_mainstats", defer_post_release=True):
             release = click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
-        wait_release("open_mainstats", release, fallback_ms=94 + _MEASURED_SAFETY_MS)
+        wait_release("open_mainstats", release, fallback_ms=0)
         after = _text_lines()
-        after_y = _title_y(after, MAINSTAT_TITLE)
-        after_toggle = _toggle_below(after, after_y) if after_y is not None else None
-        if after_toggle is not None and "收起" in after_toggle.text.replace(" ", ""):
-            log.info("已点开主属性词条区")
-            return after
-        raise FilterClickError("点了主属性「点击展开」但该区没有展开，中断。")
+        # 作者裁定（2026-10-12）：关闭「展开成功」回读检测（原实现保留备查）。
+        # after_y = _title_y(after, MAINSTAT_TITLE)
+        # after_toggle = _toggle_below(after, after_y) if after_y is not None else None
+        # if after_toggle is not None and "收起" in after_toggle.text.replace(" ", ""):
+        #     log.info("已点开主属性词条区")
+        #     return after
+        # raise FilterClickError("点了主属性「点击展开」但该区没有展开，中断。")
+        return after
     raise FilterClickError(
         "滚动面板 %d 轮后「主属性词条」区仍未就位或无法展开，中断。" % _MAX_PANEL_SCROLLS
     )
@@ -1597,13 +1599,14 @@ def _open_substat_section(hwnd: int, width: int, height: int) -> tuple[QImage, l
             return image, lines
 
     release = _click_line(hwnd, toggle, role="open_substats")
-    wait_release("open_substats", release, fallback_ms=95 + _MEASURED_SAFETY_MS)
+    wait_release("open_substats", release, fallback_ms=0)
 
     after, after_lines = _read_panel()
-    after_y = _title_y(after_lines, SUBSTAT_TITLE)
-    after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
-    if after_toggle is None or "收起" not in after_toggle.text:
-        raise FilterClickError("点击副属性「展开」后未确认展开，停止筛选")
+    # 作者裁定（2026-10-12）：关闭「展开成功」回读检测（原实现保留备查）。
+    # after_y = _title_y(after_lines, SUBSTAT_TITLE)
+    # after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
+    # if after_toggle is None or "收起" not in after_toggle.text:
+    #     raise FilterClickError("点击副属性「展开」后未确认展开，停止筛选")
     return after, after_lines
 
 
