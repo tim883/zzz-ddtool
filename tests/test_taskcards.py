@@ -70,23 +70,53 @@ def test_has_required_substats_counts_each_unrevealed_slot_as_one_required_subst
     assert has_required_substats(_card("废词条", "废词条", "废词条", "废词条"), ())
 
 
-def test_required_substat_zero_or_blocked_by_mainstat_only_passes_via_unrevealed_slot():
-    """零单价或被主属性屏蔽的词条永远不会以该名字出现在卡片上。
+def test_required_substat_zero_weight_only_passes_via_unrevealed_slot():
+    """零单价词条永远不会以该名字出现在卡片上，仍按「未出槽顶一个」判。
 
     已出满 4 条的档位（初始 4 词、+3 及以上）没有未出槽，必带它恒不通过；
     只有初始 3 词 @+0 能靠那 1 个未出槽顶上，等强化出第 4 词再按严格条件判。
     """
     from zzz_ddtool.gui import qualifying_pattern_ids
 
-    for mainstats, weights in (((), {"攻击力%": 0, "暴击率": 1}),
-                              (("攻击力%",), {"攻击力%": 1, "暴击率": 1})):
-        job = TaskJob(slot=4, mainstats=mainstats, weights=weights,
-                      required_substats=("攻击力%",), accepted=("four:0:暴击率|废词条|废词条|废词条",))
-        assert rebase_selection(job) == ()
-        accepted = qualifying_pattern_ids(4, mainstats, weights, required_substats=job.required_substats)
-        assert accepted
-        assert all(pid.startswith("three:0:") and "未出" in pid for pid in accepted)
-        assert all("攻击力%" not in pid for pid in accepted)
+    job = TaskJob(slot=4, weights={"攻击力%": 0, "暴击率": 1},
+                  required_substats=("攻击力%",), accepted=("four:0:暴击率|废词条|废词条|废词条",))
+    assert rebase_selection(job) == ()
+    accepted = qualifying_pattern_ids(4, (), job.weights, required_substats=job.required_substats)
+    assert accepted
+    assert all(pid.startswith("three:0:") and "未出" in pid for pid in accepted)
+    assert all("攻击力%" not in pid for pid in accepted)
+
+
+def test_required_substat_equal_to_mainstat_is_dropped_everywhere():
+    """必带与所主词条同名时整条剔除：该名字在盘子副词条里永远不会出现。
+
+    判据与权重侧共用 blocked_substats——1/2/3 号位按固定主属性，4/5/6 号位只在
+    主词条唯一确定时屏蔽；多选主词条时某主属性在别的盘上仍能当副词条，不剔。
+    """
+    from zzz_ddtool.gamedata import blocked_substats
+    from zzz_ddtool.gui import qualifying_pattern_ids
+    from zzz_ddtool.taskcards import effective_required_substats
+
+    # 4/5/6 号位：唯一主词条时才屏蔽；勾多个主词条时不屏蔽。
+    assert effective_required_substats(("异常精通",), blocked_substats(4, ("异常精通",))) == ()
+    assert effective_required_substats(("攻击力%", "暴击率"),
+                                       blocked_substats(6, ("攻击力%",))) == ("暴击率",)
+    assert effective_required_substats(("攻击力%", "暴击率"),
+                                       blocked_substats(4, ("攻击力%", "暴击率"))) == ("攻击力%", "暴击率")
+    # 1/2/3 号位主属性固定，与它同名的必带同样无效。
+    assert effective_required_substats(("攻击力", "暴击率"), blocked_substats(2, ())) == ("暴击率",)
+
+    # 端到端：主词条「异常精通」的 4 号位，必带「异常精通」等于没勾必带。
+    weights = {"异常精通": 1, "暴击率": 1, "攻击力%": 1}
+    dropped = qualifying_pattern_ids(4, ("异常精通",), weights, required_substats=("异常精通",))
+    assert dropped and dropped == qualifying_pattern_ids(4, ("异常精通",), weights)
+    # 出满 4 条的档位也一起放行——旧逻辑下这些卡会被死条件全部淘汰。
+    assert any(pid.startswith("four:0:") for pid in dropped)
+    # 与主词条不同名的必带照旧生效，只剩它一条。
+    both = qualifying_pattern_ids(4, ("异常精通",), weights, required_substats=("异常精通", "暴击率"))
+    only_crit = qualifying_pattern_ids(4, ("异常精通",), weights, required_substats=("暴击率",))
+    assert both == only_crit
+    assert all("暴击率" in pid or (pid.startswith("three:0:") and "未出" in pid) for pid in both)
 
 
 def test_four_required_substats_pass_initial_three_only_by_one_unrevealed_slot():

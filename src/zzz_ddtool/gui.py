@@ -67,7 +67,7 @@ from zzz_ddtool.seticons import paint_set_icon
 from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
-from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_weights, has_required_substats, rebase_selection, task_counts
+from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_required_substats, effective_weights, has_required_substats, rebase_selection, task_counts
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern,
@@ -729,6 +729,9 @@ class StageSection(QWidget):
         self._checked: set[str] = set()
         self._visible_indices: list[int] = []
         self.required_substats: tuple[str, ...] = ()
+        # 当前号位主词条屏蔽掉的副词条名（gamedata.blocked_substats）。apply_filter 里
+        # 先把与主词条同名的必带剔掉——它在盘子副词条里永远不会出现，不该再参与筛卡。
+        self.blocked: set[str] = set()
         self._page = 0
 
         self.require = NoWheelDoubleSpinBox()
@@ -862,9 +865,10 @@ class StageSection(QWidget):
 
     def apply_filter(self) -> None:
         need = self.require.value()
+        required = effective_required_substats(self.required_substats, self.blocked)
         self._visible_indices = [
             i for i, pattern in enumerate(self.patterns)
-            if pattern.score + 1e-9 >= need and has_required_substats(pattern, self.required_substats)
+            if pattern.score + 1e-9 >= need and has_required_substats(pattern, required)
         ]
         self._page = 0
         self.count_label.setText(f"{len(self._visible_indices)} / {len(self.patterns)} 张")
@@ -1014,7 +1018,7 @@ class WeightEditor(QWidget):
         required_box = QCheckBox("必带")
         required_box.setToolTip(
             "卡片必须同时包含全部勾选词条，并满足本档分数要求；保存时仅保留符合条件的已勾选卡片。"
-            "单价为 0 或词条被主属性排除时，没有符合该必带条件的卡片。"
+            "“未出”位置可顶一个必带。与所主词条同名的必带无效（该名字永不作为副词条出现）。"
         )
         required_box.setChecked(required)
         required_box.toggled.connect(lambda *_: self._notify_changed())
@@ -1353,17 +1357,19 @@ def qualifying_pattern_ids(
     effective = {name: value for name, value in weights.items() if name not in blocked}
     if not useful_ordered(effective):
         return ()
+    # 与主词条同名的必带整条剔除：该名字在盘子副词条里永远不会出现，留着就是死条件。
+    required = effective_required_substats(required_substats, blocked)
     if catalog is not None:
         grouped = catalog.get(effective, lambda: False)
         return tuple(pattern.pattern_id for (origin, level), patterns in grouped.items()
                      for pattern in patterns
-                     if has_required_substats(pattern, required_substats)
+                     if has_required_substats(pattern, required)
                      if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
                      if pattern.score + 1e-9 >= float(((stage_require or {}).get(origin) or {}).get(level, 0)))
     return tuple(
         pattern.pattern_id
         for pattern in enumerate_filtered(effective, stage_require=stage_require)
-        if has_required_substats(pattern, required_substats)
+        if has_required_substats(pattern, required)
         if possible_substats(slot, mainstats, (item.name for item in pattern.slots))
     )
 
@@ -3238,8 +3244,10 @@ class MainWindow(QMainWindow):
         if self._loading:
             return
         required = self.weight_editor.required_substats()
+        blocked = self._blocked_substats()
         for section in self.sections.values():
             section.required_substats = required
+            section.blocked = blocked
             if not self._preview_dirty:
                 section.apply_filter()
         self._mark_unsaved()
@@ -3320,6 +3328,7 @@ class MainWindow(QMainWindow):
         )]
         section = self.sections[key]
         section.required_substats = self.weight_editor.required_substats()
+        section.blocked = self._blocked_substats()
         if section.can_reuse(patterns):
             section.reuse_cards(patterns, self._preview_policy)
         else:

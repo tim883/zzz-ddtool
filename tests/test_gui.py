@@ -1742,6 +1742,38 @@ def test_required_filter_reduces_existing_selection_without_enumeration_and_save
         close_count_window(window, qapp)
 
 
+def test_required_equal_to_selected_mainstat_is_ignored(qapp, tmp_path):
+    """必带与所主词条同名时整条剔除：界面上勾了也不参与筛卡，但原样保存。"""
+    from zzz_ddtool.config import load_preset
+
+    window = MainWindow(config_path=tmp_path / "required-mainstat.yaml")
+    try:
+        window._add_job()
+        window._on_slot_clicked(4)
+        window.filter_main_boxes["异常精通"].click()
+        assert window._blocked_substats() == {"异常精通"}
+        window.weight_editor.set_weights({"异常精通": 1, "暴击率": 1})
+        refresh_cards(window, qapp)
+        plain = {section._ids[i] for section in window.sections.values()
+                 for i in section._visible_indices}
+        assert plain
+        required_box(window.weight_editor, "异常精通").click()
+        assert window.weight_editor.required_substats() == ("异常精通",)
+        assert {section._ids[i] for section in window.sections.values()
+                for i in section._visible_indices} == plain
+        # 与主词条不同名的必带照旧生效，只有它把卡片筛小。
+        required_box(window.weight_editor, "暴击率").click()
+        narrowed = {section._ids[i] for section in window.sections.values()
+                    for i in section._visible_indices}
+        assert narrowed and narrowed < plain
+        assert all("暴击率" in pid or (pid.startswith("three:0:") and "未出" in pid)
+                   for pid in narrowed)
+        window.save_current()
+        assert load_preset(window._path).task_chain[0].required_substats == ("异常精通", "暴击率")
+    finally:
+        close_count_window(window, qapp)
+
+
 def test_required_filter_is_task_specific_and_bulk_selection_obeys_it(qapp, tmp_path):
     from zzz_ddtool.config import preset_from_dict, load_preset
     from zzz_ddtool.gui import qualifying_pattern_ids

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from threading import Lock
 
 from zzz_ddtool.chain import TaskJob
@@ -18,6 +18,20 @@ from zzz_ddtool.patterns import (
 def effective_weights(job: TaskJob) -> dict[str, float]:
     blocked = blocked_substats(job.slot, job.mainstats)
     return {name: value for name, value in job.weights.items() if name not in blocked}
+
+
+def effective_required_substats(required_substats: Iterable[str],
+                               blocked: Iterable[str]) -> tuple[str, ...]:
+    """必带里被该号位主词条屏蔽的名字整条剔除（屏蔽集合见 `gamedata.blocked_substats`）。
+
+    主词条占了这个名字，副词条永远不会出现它，拿它当必带是永远命中不了的死条件：
+    初始 3 词会靠未出槽误放行，强化出第 4 词后又必然淘汰。剔掉之后剩下的必带照旧
+    按「命中数 + 未出槽数 >= 必带数」判，剔空即不再按必带筛。判据与权重侧同一把尺子。
+
+    只影响判定，不改保存的必带——主词条随时可改，界面里那一行照旧保留。
+    """
+    excluded = set(blocked)
+    return tuple(name for name in required_substats if name not in excluded)
 
 
 def has_required_substats(pattern: Pattern, required_substats: tuple[str, ...]) -> bool:
@@ -53,6 +67,7 @@ def rebase_selection(job: TaskJob, *, filtered: bool = True,
     if not useful:
         return ()
     blocked = blocked_substats(job.slot, job.mainstats)
+    required = effective_required_substats(job.required_substats, blocked)
     out = set()
     for i, pid in enumerate(job.accepted):
         if i % 128 == 0 and cancelled is not None and cancelled():
@@ -74,7 +89,7 @@ def rebase_selection(job: TaskJob, *, filtered: bool = True,
         if not possible_substats(job.slot, job.mainstats, (token.split("+", 1)[0] for token in body.split("|"))):
             continue
         if filtered:
-            if not has_required_substats(pattern, job.required_substats):
+            if not has_required_substats(pattern, required):
                 continue
             if pattern.checkpoint not in CHECKPOINTS:
                 continue
@@ -161,6 +176,8 @@ def task_counts(job: TaskJob, grouped: Mapping[tuple[str, int], tuple[Pattern, .
         return None
     accepted = rebase_selection(job, cancelled=cancelled)
     keep = frozenset(accepted)
+    blocked = blocked_substats(job.slot, job.mainstats)
+    required = effective_required_substats(job.required_substats, blocked)
     result = {}
     for origin in Origin:
         picked = qualified = 0
@@ -169,7 +186,7 @@ def task_counts(job: TaskJob, grouped: Mapping[tuple[str, int], tuple[Pattern, .
             for i, pattern in enumerate(grouped[(origin.value, level)]):
                 if i % 128 == 0 and cancelled():
                     return None
-                if has_required_substats(pattern, job.required_substats) and pattern.score + 1e-9 >= need and possible_substats(
+                if has_required_substats(pattern, required) and pattern.score + 1e-9 >= need and possible_substats(
                     job.slot, job.mainstats, (slot.name for slot in pattern.slots)
                 ):
                     qualified += 1
