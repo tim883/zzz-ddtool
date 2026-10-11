@@ -27,7 +27,11 @@ from zzz_ddtool.actionwait import InputRelease, wait_release
 from zzz_ddtool.control import controlled_inputs, validated_inputs
 from zzz_ddtool.decide import decide
 from zzz_ddtool.filter_replay import FilterReplaySession
-from zzz_ddtool.gamefilter import apply_game_filter, reset_game_filter
+from zzz_ddtool.gamefilter import (
+    _MEASURED_SAFETY_MS,
+    apply_game_filter,
+    reset_game_filter,
+)
 from zzz_ddtool.substatfilter import plan_substat_filter
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 from zzz_ddtool.layout import (
@@ -120,19 +124,22 @@ _READY_TIMEOUT_MS: dict[str, int] = {
     "return_warehouse": 3580,
 }
 #: 无测量时的总下限（ms）；有实测档案时由 actionwait 提供。
+#: 2026-10-12 作者裁定：与 §4.2 同规矩 = 真机实测（取有效样本最大值，见《等待时间表》）
+#: + _MEASURED_SAFETY_MS；不准再手写 +200。
 _READY_FLOOR_MS: dict[str, int] = {
-    "select_disc": 680,
-    "open_preview": 1080,
-    "open_upgrade": 1680,
-    "material_ready": 780,
-    "upgrade_result": 1680,
-    "refund_confirm": 1680,
-    "return_warehouse": 1180,
+    "select_disc": 320 + _MEASURED_SAFETY_MS,
+    "open_preview": 600 + _MEASURED_SAFETY_MS,
+    "open_upgrade": 327 + _MEASURED_SAFETY_MS,
+    "material_ready": 747 + _MEASURED_SAFETY_MS,
+    "upgrade_result": 350 + _MEASURED_SAFETY_MS,
+    "refund_confirm": 1277 + _MEASURED_SAFETY_MS,
+    "return_warehouse": 1411 + _MEASURED_SAFETY_MS,
 }
-#: 标签动作（§4.3）：R/T 单次按键后的总下限；沿用有限次数复核。
-_LABEL_FLOOR_MS = 630
-#: 返还弹窗未接续结果等待时的收尾预算（§4.3 refund_dismiss：180+500）。
-_REFUND_DISMISS_FLOOR_MS = 680
+#: 标签动作（§4.3）：R/T 单次按键后的总下限；四项共用一个常量，取四项实测最大值
+#: （label_save 127 / label_discard 87 / clear_discard 135 / label_unlock_before_discard 125）。
+_LABEL_FLOOR_MS = 135 + _MEASURED_SAFETY_MS
+#: 返还弹窗未接续结果等待时的收尾预算（§4.3 refund_dismiss；与 refund_confirm 共用实测 1277）。
+_REFUND_DISMISS_FLOOR_MS = 1277 + _MEASURED_SAFETY_MS
 
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
 # 描述子＝经验/预计等级条 ROI 的「饱和度」（max(R,G,B)-min(R,G,B)）再按各帧自身 p85 归一化。
@@ -791,12 +798,21 @@ class Runner:
     def _probe_material_ready(self, before: Disc, before_frame):
         baseline = self._material_bar_crop(before_frame)
         state: dict = {"candidate": None}
+        # 提速（2026-10-12 实测）：_has_stage_add 单次识别 ~1.0 s，而本等待需要连续两帧
+        # 稳定才能在 3.18 s 预算内就绪；同一页面里按钮不会中途消失，看到过一次就锁住。
+        fixed: dict = {"has_add": False, "has_upgrade": False}
 
         def probe() -> readiness.WaitSample:
             frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
             captured = time.monotonic()
-            has_add = self._has_stage_add(frame)
-            has_upgrade = self._has_upgrade_button(frame)
+            has_add = fixed["has_add"]
+            if not has_add:
+                has_add = bool(self._has_stage_add(frame))
+                fixed["has_add"] = has_add
+            has_upgrade = fixed["has_upgrade"]
+            if not has_upgrade:
+                has_upgrade = bool(self._has_upgrade_button(frame))
+                fixed["has_upgrade"] = has_upgrade
             crop = self._material_bar_crop(frame)
             delta = self._mean_abs_diff(baseline, crop)
             changed = delta is not None and delta >= _MATERIAL_BAR_CHANGE_THRESHOLD
