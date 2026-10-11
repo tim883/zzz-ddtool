@@ -60,8 +60,8 @@ def test_page_learning_then_replay_uses_real_identity_and_no_name_ocr(page, monk
     monkeypatch.setattr(gf, "_picker_popup_closed", lambda _: not popup[0])
     monkeypatch.setattr(gf, "_panel_present", lambda _: not popup[0])
 
-    def name_of_box(box, tol=8):
-        """按名称框认名字；模板命中的框与 OCR 框可能差几像素，用容差匹配。"""
+    def name_of_box(box, tol=12):
+        """按名称框认名字；底图为同字数固定宽的“字区”框，与 OCR 框可差十几像素内（格距 164px，无歧义）。"""
         left, top, right, bottom = box
         return next((n for n, line in by_name.items()
                      if abs(line.left - left) <= tol and abs(line.top - top) <= tol
