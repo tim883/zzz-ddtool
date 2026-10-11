@@ -376,7 +376,10 @@ class PerfSession:
     def end_span(self, span: PerfSpan, *, failed: bool, exc: BaseException | None = None) -> None:
         if span.event_id is None:
             return
-        elapsed_ms = (self._clock() - span._started) * 1000.0
+        ended = self._clock()
+        elapsed_ms = (ended - span._started) * 1000.0
+        if span.component == "disc_total":
+            span.details.update(started_at=span._started, ended_at=ended)
         if elapsed_ms < 0:
             elapsed_ms = 0.0
         with self._lock:

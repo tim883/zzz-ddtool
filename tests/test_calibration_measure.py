@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "scripts" / "measure_waits.py"
+SCRIPT = ROOT / "dev-docs" / "history" / "扫描提速" / "scripts" / "measure_waits.py"
 
 
 def _load_module():
@@ -185,9 +185,32 @@ def test_observation_times_out_when_content_gets_stuck_after_a_stable_pair():
     calc = mw.recompute_observation(samples, t0=100.0, timed_out=timed_out)
     assert calc["outcome"] == "timeout"
     assert calc["t_ready_ms"] == pytest.approx(0.0)
-    assert calc["t_stable_ms"] == pytest.approx(80.0)  # 测点仍是开头那一对（每轮 30+50ms）
+    assert calc["t_stable_ms"] == pytest.approx(50.0)  # 采样间隔含读取成本，不再叠加 30+50ms
     # 反例说明：不带 timed_out 时同一条序列会被尾段/跨度判成 ok —— loop 的停止原因不可省。
     assert mw.recompute_observation(samples, t0=100.0)["outcome"] == "ok"
+
+
+def test_slow_probe_does_not_add_another_full_poll_sleep():
+    clock = FakeClock()
+    samples, timed_out = mw.observe_transition(
+        make_probe(clock, cost=0.1), t0=100.0, timeout_ms=1000,
+        min_ms=0, tail_ms=0, now=clock.now, sleep=clock.sleep,
+    )
+    assert not timed_out
+    assert [s["captured_at"] for s in samples] == pytest.approx([100.0, 100.1])
+    assert clock.slept == []
+
+
+def test_probe_finishing_after_budget_cannot_complete_observation():
+    clock = FakeClock()
+    samples, timed_out = mw.observe_transition(
+        make_probe(clock, cost=0.12), t0=100.0, timeout_ms=220,
+        min_ms=0, tail_ms=0, now=clock.now, sleep=clock.sleep,
+    )
+    assert timed_out
+    assert samples[-1]["probe_ended_at"] == pytest.approx(100.24)
+    assert mw.recompute_observation(samples, t0=100.0, timed_out=timed_out,
+                                    min_ms=0, tail_ms=0)["outcome"] == "timeout"
 
 
 def test_probe_and_checkpoint_errors_propagate_unchanged():

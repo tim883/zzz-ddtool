@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool import readiness, scanperf
-from zzz_ddtool.capture import CaptureError, find_game_hwnd, grab_game_image, save_image, window_pid
+from zzz_ddtool import readiness, runevidence, scanperf
+from zzz_ddtool.capture import CaptureError, client_size, find_game_hwnd, grab_game_image, save_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
+from zzz_ddtool import actionwait
+from zzz_ddtool.actionwait import InputRelease, wait_release
 from zzz_ddtool.control import controlled_inputs, validated_inputs
 from zzz_ddtool.decide import decide
 from zzz_ddtool.filter_replay import FilterReplaySession
@@ -57,12 +60,10 @@ from zzz_ddtool.navigation import (
 from zzz_ddtool.ocr import OcrError, parse_disc, read_action_state_fast
 from zzz_ddtool.paths import stats_dir
 from zzz_ddtool.readiness import (
-    DEFAULT_FLOOR_MS,
     MATERIAL_REFUND,
     ReadinessInterrupted,
     ReadinessTimeout,
     WaitResult,
-    load_wait_policies,
 )
 from zzz_ddtool.screen import DRIVE_DISC, classify_image, is_disc_modal, is_disc_preview, is_page
 from zzz_ddtool.stats import (
@@ -106,6 +107,32 @@ _MAX_STAGE_UPGRADES = 6
 _FORWARD_ROWS = 2
 # 恢复批量滚动后的兜底稳定等待；标定给出 settle_wait_ms 时优先用它
 _SETTLE_FALLBACK_MS = 500
+
+# ---- §4.3 执行器动作的就绪参数（本轮固定表值，不从旧等待档案读取）----
+#: 从真实释放点计的就绪超时（ms）。
+_READY_TIMEOUT_MS: dict[str, int] = {
+    "select_disc": 3180,
+    "open_preview": 5180,
+    "open_upgrade": 8180,
+    "material_ready": 3180,
+    "upgrade_result": 8180,
+    "refund_confirm": 8180,
+    "return_warehouse": 3580,
+}
+#: 无测量时的总下限（ms）；有实测档案时由 actionwait 提供。
+_READY_FLOOR_MS: dict[str, int] = {
+    "select_disc": 680,
+    "open_preview": 1080,
+    "open_upgrade": 1680,
+    "material_ready": 780,
+    "upgrade_result": 1680,
+    "refund_confirm": 1680,
+    "return_warehouse": 1180,
+}
+#: 标签动作（§4.3）：R/T 单次按键后的总下限；沿用有限次数复核。
+_LABEL_FLOOR_MS = 630
+#: 返还弹窗未接续结果等待时的收尾预算（§4.3 refund_dismiss：180+500）。
+_REFUND_DISMISS_FLOOR_MS = 680
 
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
 # 描述子＝经验/预计等级条 ROI 的「饱和度」（max(R,G,B)-min(R,G,B)）再按各帧自身 p85 归一化。
@@ -239,16 +266,21 @@ class Runner:
         self.termination_kind = ""
         self._detail_disc = None
         # ---- 就绪等待基础（§6.1、§6.2）----
-        #: 本任务绑定的环境身份（供等待档案匹配），由 _ensure_profile 填入。
+        #: 本任务绑定的环境身份（供等待作用域使用），由 _bind_instance 填入（§3.4）。
         self._env = None
-        #: 已加载的等待策略缓存（每次 run 重建）。
-        self._wait_policies: dict | None = None
+        #: 本轮 release_waits 作用域句柄与身份（同环境复用，变更先退出旧作用域）。
+        self._release_scope_cm = None
+        self._release_scope_key: tuple | None = None
+        #: 本轮 run 的退出栈（统一撤销 release_waits 等作用域）。
+        self._scope_stack = None
+        #: 本轮 §7.1 等待明细收集器（run() 建立，收尾并入执行输入记录）。
+        self._wait_receipts: list = []
+        #: 各动作的真实释放回执（§3.1：截自 click_client/press_key_once 的释放时刻）。
+        self._material_release: InputRelease | None = None
+        self._upgrade_release: InputRelease | None = None
+        self._refund_release: InputRelease | None = None
         #: 生产等待共用的控制回调：暂停区间查询（未启用控制器返回空元组）。
         self._pause_intervals_fn = None
-        #: 各动作的真实输入时刻（§6.1：紧接 click_client/press_key_once 正常返回后记录）。
-        self._material_started_at: float | None = None
-        self._upgrade_started_at: float | None = None
-        self._refund_started_at: float | None = None
         #: 本档「材料返还确认」输入的事件 ID（第二次 upgrade_result 的 trigger_input_id）。
         self._refund_input_id: str | None = None
         #: 本盘 disc_total 的事件 ID（_process_cell 建立，等待事件挂它下面）。
@@ -268,6 +300,14 @@ class Runner:
         self._label_inputs: list[dict] = []
         #: §9.2 coverage：本轮实际捕获的 MaterialShortfall 证据（无则 None）。
         self._shortfall_exception: dict | None = None
+        self._input_records: list[dict] = []
+        self._input_by_call: dict = {}
+        self._last_input_id: str | None = None
+        self._input_metadata: dict = {}
+        self._latest_decision: dict | None = None
+        self._current_job_index: int | None = None
+        self._evidence_error: str | None = None
+        self._run_exception: dict | None = None
         # 本任务绑定实例与实测布局
         self._hwnd: int | None = None
         self._pid: int | None = None
@@ -367,7 +407,40 @@ class Runner:
         blocked = input_blocked_reason(self._hwnd)
         if blocked:
             raise RunnerError(blocked)
+        # §3.4：绑定与权限检查通过后、返回 hwnd 前探测环境并进入 release_waits 作用域，
+        # 使首个 _ensure_profile 的 reset_game_filter 也使用本机策略。
+        env = probe_environment(self._hwnd)
+        self._env = env
+        self._enter_release_scope(env)
         return self._hwnd
+
+    def _enter_release_scope(self, env) -> None:
+        """§3.4：进入 release_waits 作用域；同环境复用，绑定/环境变更先退出旧作用域。"""
+        key = None
+        if env is not None:
+            key = (
+                env.machine_id,
+                env.client_width,
+                env.client_height,
+                env.window_dpi,
+                env.game_exe_path,
+                env.game_build,
+            )
+        if self._release_scope_cm is not None and key == self._release_scope_key:
+            return
+        self._close_release_scope()
+        cm = actionwait.release_waits(env)
+        cm.__enter__()
+        self._release_scope_cm = cm
+        self._release_scope_key = key
+        if self._scope_stack is not None:
+            self._scope_stack.callback(self._close_release_scope)
+
+    def _close_release_scope(self) -> None:
+        """退出当前 release_waits 作用域（可重复调用）。"""
+        cm, self._release_scope_cm = self._release_scope_cm, None
+        if cm is not None:
+            cm.__exit__(None, None, None)
 
     def _grab(self, allow_esc: bool = True, need_page: bool = True):
         image, method, hwnd = grab_game_image(self._hwnd)
@@ -400,25 +473,9 @@ class Runner:
             return ()
         return self.hotkeys.pause_intervals(since, until)
 
-    def _environment_mapping(self) -> dict | None:
-        """§6.4 环境身份以普通映射传给 readiness（守 §2.2 依赖方向）。"""
-        env = self._env
-        if env is None:
-            return None
-        return {
-            "machine_id": env.machine_id,
-            "client_width": env.client_width,
-            "client_height": env.client_height,
-            "window_dpi": env.window_dpi,
-            "game_exe_path": env.game_exe_path,
-            "game_build": env.game_build,
-        }
-
-    def _wait_policy(self, kind: str):
-        """读取当前环境适用的等待策略；档案不适用时用默认（§6.2、§6.4）。"""
-        if self._wait_policies is None:
-            self._wait_policies = load_wait_policies(self._environment_mapping())
-        return self._wait_policies.get(kind) or readiness.default_policy(kind)
+    def _wait_policy(self, action_id: str) -> actionwait.ActionWaitPolicy:
+        """§4.3：就绪下限唯一来源（有效实测或该动作保守值）；timeout 见 _READY_TIMEOUT_MS。"""
+        return actionwait.policy_for(action_id, fallback_ms=_READY_FLOOR_MS[action_id])
 
     # ---------------------------------------------------------------- 层级与返还（§6.2）
 
@@ -839,29 +896,132 @@ class Runner:
 
     # ---------------------------------------------------------------- 等待包装（§6.1、§7.1.1）
 
+    @contextmanager
+    def _business_input(self, kind: str, target=None):
+        from zzz_ddtool.wininput import input_context
+
+        previous = self._input_metadata
+        self._input_metadata = {"target": target}
+        try:
+            # §3.2/§4.3：业务接管收尾等待，输入层释放即返回，业务固定等待统一用 wait_release。
+            # target 同时写入原生观察记录（§6.4：select_disc 等动作取实际输入的 target/格序号）。
+            with input_context(kind, target=target, defer_post_release=True):
+                yield
+        finally:
+            self._input_metadata = previous
+
+    def _observe_execution_input(self, raw: dict) -> None:
+        """真实 begin/end 的只读 sink；失败不能改变输入语义或丢弃已发输入。"""
+        try:
+            if raw["event"] == "begin":
+                span = self._disc_span
+                ji = span.job_index if span is not None else self._current_job_index
+                job = next((j for j in self._job_records if j["job_index"] == ji), None)
+                choice = self._latest_decision if span is not None else None
+                hwnd = raw.get("hwnd") or self._hwnd
+                size = list(client_size(hwnd)) if hwnd is not None else None
+                generation = getattr(self.hotkeys, "pause_generation", None)
+                item = {
+                    "input_id": f"input-{raw['call_id']}", "call_id": raw["call_id"],
+                    "api": raw["api"], "kind": raw.get("role") or raw["api"],
+                    "phase": "disc" if span is not None else (
+                        "preparation" if job is None or job.get("prepared_at") is None else "recovery"),
+                    "job_index": ji, "disc_index": span.disc_index if span is not None else None,
+                    "disc_event_id": span.event_id if span is not None else None,
+                    "started_at": raw["t_ns"] / 1e9, "ended_at": None,
+                    "status": "started", "exception": None, "hwnd": hwnd,
+                    "pid": window_pid(hwnd) if hwnd is not None else None,
+                    "client_size": size, "pause_generation": generation if type(generation) is int else None,
+                    "decision_id": choice["decision_id"] if choice else None,
+                    "disc": runevidence.snapshot(choice["disc"]) if choice else None,
+                    "preset_sha256": span.details.get("preset_sha256") if span else (job or {}).get("preset_sha256"),
+                    "accepted_sha256": span.details.get("accepted_sha256") if span else (job or {}).get("accepted_sha256"),
+                    "target": runevidence.snapshot(self._input_metadata.get("target", raw.get("target"))),
+                    "result": {}, "wait_ids": [],
+                    "released_at_ns": None, "release_wait": None,
+                    **{k: raw.get(k) for k in ("x", "y", "vk", "delta_units")},
+                }
+                self._input_records.append(item)
+                self._input_by_call[raw["call_id"]] = item
+                if span is not None:
+                    span.details.setdefault("inputs", []).append(item)
+                if job is not None:
+                    job["input_ids"].append(item["input_id"])
+            else:
+                item = self._input_by_call[raw["call_id"]]
+                item.update(ended_at=raw["t_ns"] / 1e9, status=raw["status"],
+                            exception={"type": raw["error"]} if raw.get("error") else None,
+                            released_at_ns=raw.get("released_at_ns"))
+                if self._disc_span is not None and raw["status"] == "completed":
+                    self._disc_span.set(input_sent=True)
+                self._last_input_id = item["input_id"]
+        except Exception as exc:
+            self._evidence_error = f"{type(exc).__name__}: {exc}"
+            self.log.warning("执行输入证据记录失败", exc_info=True)
+
+    def _input_record(self, input_id):
+        return next((i for i in reversed(self._input_records) if i["input_id"] == input_id), None)
+
+    def _note_decision(self, disc: Disc, decision: Decision, preset: Preset, accepted_ids) -> None:
+        span = self._disc_span
+        if span is None:
+            return
+        rows = span.details.setdefault("decisions", [])
+        item = dict(decision_id=f"{span.event_id}:decision-{len(rows)}", at=time.monotonic(),
+                    disc=runevidence.snapshot(disc), decision=runevidence.snapshot(decision),
+                    preset_sha256=runevidence.digest(preset),
+                    accepted_sha256=runevidence.accepted_digest(accepted_ids))
+        rows.append(item)
+        span.set(core=self._core_of(disc))
+        self._latest_decision = item
+        scanperf.set_scope(stage_level=disc.level)
+
     def _wait_ready(
-        self, kind: str, *, started_at: float, before: Disc | None = None,
+        self, kind: str, *, release: InputRelease, before: Disc | None = None,
         before_frame=None, cell: GridCell | None = None, expected_level: int | None = None,
         trigger_input_id: str | None = None, resume_from_wait_id: str | None = None,
+        action_id: str | None = None,
     ) -> WaitResult:
-        """§6.1：构造 probe → 读当前环境策略 → 交给 wait_ready；包装 wait_total/probe 事件。
+        """§6.1/§4.3：以触发输入的释放点为起点做一次就绪等待，并包装 wait_total/probe 事件。
 
+        下限取自 ActionWaitPolicy（有效实测或该动作保守值），超时取 §4.3 固定表；两者都按
+        ``release.released_at_ns`` 起的活动时间计（扣暂停），不在下限之后重开超时。
         超时/中断原样抛出（ReadinessTimeout / ReadinessInterrupted），其他异常原样传播；
         无活动性能会话时只做等待、不写事件、不改变返回值。``trigger_input_id``/
-        ``resume_from_wait_id`` 供 §6.2.1 的第二次结果等待关联首个等待与确认输入。
+        ``resume_from_wait_id`` 供 §6.2.1 的第二次结果等待关联首个等待与确认输入；
+        ``action_id`` 用于返还确认这类 readiness kind 与动作ID不同的等待。
         """
         probe = self._make_ready_probe(
             kind, before=before, before_frame=before_frame, cell=cell,
             expected_level=expected_level,
         )
-        policy = self._wait_policy(kind)
+        action_id = action_id or kind
+        policy = self._wait_policy(action_id)
+        ready_policy = readiness.WaitPolicy(
+            policy.floor_ms, _READY_TIMEOUT_MS[action_id], readiness.POLL_MS, readiness.STABLE_FRAMES
+        )
+        started_at = release.released_at_ns / 1_000_000_000
+        trigger_input_id = trigger_input_id or self._last_input_id
+        stage_level = before.level if before is not None else (
+            self._latest_decision["disc"]["level"] if self._latest_decision is not None else None)
         session = scanperf.current_session()
         if session is None:
             self._last_wait_id = None
-            return readiness.wait_ready(
-                kind=kind, policy=policy, started_at=started_at, probe=probe,
-                checkpoint=self._checkpoint, pauses=self._pause_intervals,
-            )
+            result: WaitResult | None = None
+            error: BaseException | None = None
+            try:
+                result = readiness.wait_ready(
+                    kind=kind, policy=ready_policy, started_at=started_at, probe=probe,
+                    checkpoint=self._checkpoint, pauses=self._pause_intervals,
+                )
+                return result
+            except BaseException as exc:  # noqa: BLE001 - 原样传播，仅用于记明细
+                error = exc
+                raise
+            finally:
+                self._fill_release_wait(
+                    trigger_input_id, action_id, release, policy, result, error, time.monotonic(),
+                )
 
         wait_id = session.new_event_id()
         self._last_wait_id = wait_id
@@ -890,7 +1050,7 @@ class Runner:
                 "interrupt_reason": None,
                 "evidence": None,
             }
-            with scanperf.timed("probe", parent_id=wait_id, details=details) as span:
+            with scanperf.timed("probe", parent_id=wait_id, stage_level=stage_level, details=details) as span:
                 sample = probe()
                 ended = time.monotonic()
                 span.set(
@@ -918,16 +1078,21 @@ class Runner:
             return sample
 
         error: BaseException | None = None
+        result = None
         try:
-            return readiness.wait_ready(
-                kind=kind, policy=policy, started_at=started_at, probe=wrapped_probe,
+            result = readiness.wait_ready(
+                kind=kind, policy=ready_policy, started_at=started_at, probe=wrapped_probe,
                 checkpoint=checkpoint, pauses=self._pause_intervals,
             )
+            return result
         except BaseException as exc:  # noqa: BLE001 - 原样传播，仅用于记事件
             error = exc
             raise
         finally:
             ended = time.monotonic()
+            self._fill_release_wait(
+                trigger_input_id, action_id, release, policy, result, error, ended,
+            )
             intervals = self._pause_intervals(started_at, ended)
             paused = sum(float(b) - float(a) for a, b in intervals)
             active_ms = max(0.0, (ended - started_at) - paused) * 1000.0
@@ -941,6 +1106,7 @@ class Runner:
                 outcome = "stopped"
             elif error is not None:
                 outcome = "failed"
+            t_bad, t_ready, t_stable = runevidence.wait_times(samples)
             details = {
                 "kind": kind,
                 "started_at": started_at,
@@ -950,9 +1116,9 @@ class Runner:
                     {"start": float(a), "end": float(b)} for a, b in intervals
                 ],
                 "samples": samples,
-                "t_bad": None,
-                "t_ready": None,
-                "t_stable": None,
+                "t_bad": t_bad,
+                "t_ready": t_ready,
+                "t_stable": t_stable,
                 "outcome": outcome,
                 "trigger_input_id": trigger_input_id,
                 "upgrade_input_id": self._upgrade_input_id if kind == "upgrade_result" else None,
@@ -964,6 +1130,26 @@ class Runner:
                     "type": type(error).__name__,
                     "message": str(error),
                 }
+            actual_input = self._input_record(trigger_input_id)
+            if actual_input is not None:
+                actual_input["wait_ids"].append(wait_id)
+                actual_input["result"] = dict(
+                    verified=result is not None,
+                    actual_level=result.disc.level if result is not None and result.disc else None,
+                    to_layer=(samples[-1]["evidence"] or {}).get("return_layer") if samples else None,
+                    exception=details.get("exception"),
+                )
+                if kind == "select_disc" and result is not None:
+                    actual_input["disc"] = runevidence.snapshot(result.disc)
+            if kind == "upgrade_result":
+                upgrade_input = self._input_record(self._upgrade_input_id)
+                if upgrade_input is not None and upgrade_input is not actual_input:
+                    upgrade_input["wait_ids"].append(wait_id)
+                    upgrade_input["result"] = dict(
+                        verified=result is not None,
+                        actual_level=result.disc.level if result is not None and result.disc else None,
+                        exception=details.get("exception"),
+                    )
             try:
                 session.record(
                     scanperf.PerfEvent(
@@ -972,10 +1158,70 @@ class Runner:
                         details=details,
                         event_id=wait_id,
                         parent_id=self._disc_event_id,
+                        job_index=self._disc_span.job_index if self._disc_span else self._current_job_index,
+                        disc_index=self._disc_span.disc_index if self._disc_span else None,
+                        stage_level=stage_level,
                     )
                 )
             except Exception:
                 self.log.warning("wait_total 事件写入失败", exc_info=True)
+
+    def _fill_release_wait(self, trigger_input_id, action_id, release, policy, result, error, ended):
+        """§7.1：等待消费者完成后把六字段明细写进对应执行输入记录（故障也保留截至当下）。"""
+        item = self._input_record(trigger_input_id)
+        if item is None:
+            return
+        requested = None
+        if result is not None:
+            requested = getattr(result, "requested_sleep_ms", None)
+        if requested is None and error is not None:
+            requested = getattr(error, "requested_sleep_ms", None)
+        requested = float(requested or 0.0)
+        release_s = release.released_at_ns / 1_000_000_000
+        paused = sum(float(b) - float(a) for a, b in self._pause_intervals(release_s, ended))
+        item["released_at_ns"] = release.released_at_ns
+        item["release_wait"] = {
+            "action_id": action_id,
+            "released_at_ns": release.released_at_ns,
+            "floor_ms": policy.floor_ms,
+            "policy_source": policy.source,
+            "requested_sleep_ms": requested,
+            "active_elapsed_ms": max(0.0, (ended - release_s) - paused) * 1000.0,
+        }
+
+    def _merge_wait_receipts(self) -> None:
+        """§7.1：把等待消费者登记的释放明细按释放点并入执行输入记录。
+
+        未被任何消费者接管的已释放输入（如 substat_scroll 的前 7 条原始滚轮）按
+        action_id=null / floor_ms=0 / requested_sleep_ms=0 如实记录，不冒充等待。
+        """
+        by_ns = {receipt.released_at_ns: receipt for receipt in self._wait_receipts}
+        for item in self._input_records:
+            ns = item.get("released_at_ns")
+            if ns is None or item.get("release_wait") is not None:
+                continue
+            receipt = by_ns.get(ns)
+            if receipt is None:
+                continue
+            item["release_wait"] = {
+                "action_id": receipt.action_id,
+                "released_at_ns": receipt.released_at_ns,
+                "floor_ms": receipt.floor_ms,
+                "policy_source": receipt.policy_source,
+                "requested_sleep_ms": receipt.requested_sleep_ms,
+                "active_elapsed_ms": receipt.active_elapsed_ms,
+            }
+        for item in self._input_records:
+            if item.get("released_at_ns") is None or item.get("release_wait") is not None:
+                continue
+            item["release_wait"] = {
+                "action_id": None,
+                "released_at_ns": item["released_at_ns"],
+                "floor_ms": 0,
+                "policy_source": "default",
+                "requested_sleep_ms": 0.0,
+                "active_elapsed_ms": 0.0,
+            }
 
     # ---------------------------------------------------------------- 任务与预设
 
@@ -1041,6 +1287,17 @@ class Runner:
         # §9.2：入口清空终止类型，避免上一轮的 completed/user_stopped 残留到本轮，
         # 尤其是 _run 在主 try/finally 之前直接返回 [] 的分支。
         self.termination_kind = ""
+        self._input_records = []
+        self._input_by_call = {}
+        self._last_input_id = None
+        self._current_job_index = None
+        self._latest_decision = None
+        self._input_metadata = {}
+        self._evidence_error = None
+        self._run_exception = None
+        self._job_records = []
+        self._label_inputs = []
+        self._shortfall_exception = None
         tag = getattr(self.trace, "tag", None)
         if not isinstance(tag, str) or not tag:
             tag = "run"
@@ -1057,10 +1314,25 @@ class Runner:
         try:
             # 导航、标定、筛选与强化共享此任务的控制器。只在一次完整输入前检查，
             # 不在 mouse/key down 与 up 之间抛出停止，避免留下按住的键。
-            with controlled_inputs(self._checkpoint):
-                return self._run()
+            from contextlib import ExitStack
+
+            from zzz_ddtool.wininput import capture_inputs
+
+            with ExitStack() as stack:
+                self._scope_stack = stack
+                with (
+                    controlled_inputs(self._checkpoint, pauses=self._pause_intervals),
+                    capture_inputs(self._observe_execution_input),
+                    actionwait.collect_wait_receipts() as receipts,
+                ):
+                    self._wait_receipts = receipts
+                    return self._run()
         finally:
+            self._scope_stack = None
+            self._close_release_scope()
             ended = time.monotonic()
+            # §7.1：等待明细（含输入层自己拥有的收尾）并入执行输入记录后再记 run_total。
+            self._merge_wait_receipts()
             scanperf.record_event(
                 scanperf.PerfEvent(
                     component="run_total",
@@ -1071,6 +1343,10 @@ class Runner:
                         "end_reason": self.end_reason,
                         "capture_dir": (str(capture_dir) if capture_dir is not None else None),
                         "stats_path": str(stats_target),
+                        "started_at": run_started, "ended_at": ended,
+                        "jobs": self._job_records, "inputs": self._input_records,
+                        "evidence_error": self._evidence_error,
+                        "exception": self._shortfall_exception or self._run_exception,
                     },
                 )
             )
@@ -1095,8 +1371,12 @@ class Runner:
         self._last_empties = set()
         self._last_unclear = {}
         self._last_count = None
-        # 每轮重新读取本机等待档案（环境未变时结果一致；换机/换档案则自然失效）。
-        self._wait_policies = None
+        # 每轮重建释放回执与明细收集（run() 建立收集器；环境未变时作用域复用同一档案）。
+        self._material_release = None
+        self._upgrade_release = None
+        self._refund_release = None
+        self._refund_input_id = None
+        self._wait_receipts = []
         self._disc_event_id = None
         self._upgrade_input_id = None
         self._upgrade_entry_generation = None
@@ -1125,12 +1405,26 @@ class Runner:
                 self._checkpoint()
                 # §7.1：本轮事件的任务归属用 0 起 job_index；盘/档作用域在更内层建立。
                 scanperf.set_scope(job_index=index - 1, disc_index=None, stage_level=None)
+                self._current_job_index = index - 1
+                self._latest_decision = None
+                sub_preset = self._sub_preset(job)
                 job_record = {
                     "job_index": index - 1,
                     "job_id": job.job_id,
                     "skipped": job.accepted is None,
                     "processed": 0,
                     "end_reason": None,
+                    "slot": job.slot, "sets": list(job.sets), "mainstats": list(job.mainstats),
+                    "accepted": None if job.accepted is None else list(job.accepted),
+                    "max_discs": job.max_discs,
+                    "quota_raw": job.max_discs if job.max_discs is not None else self.preset.max_discs,
+                    "quota_effective": 0 if job.accepted is None else self._job_limit(job),
+                    "labels": runevidence.snapshot(self.preset.labels),
+                    "preset": runevidence.snapshot(sub_preset),
+                    "preset_sha256": runevidence.digest(sub_preset),
+                    "accepted_sha256": runevidence.accepted_digest(job.accepted),
+                    "started_at": time.monotonic(), "prepared_at": None, "ended_at": None,
+                    "input_ids": [],
                 }
                 self._job_records.append(job_record)
                 self.stats.job_begin(
@@ -1150,6 +1444,7 @@ class Runner:
                     self._set_status("job_skipped", message)
                     self.stats.job_end(0.0, 0)
                     job_record["end_reason"] = "skipped"
+                    job_record["ended_at"] = time.monotonic()
                     continue
                 job_started = time.monotonic()
                 try:
@@ -1171,6 +1466,7 @@ class Runner:
                         time.monotonic() - job_started,
                         self._processed - self._job_started_at,
                     )
+                    job_record["ended_at"] = time.monotonic()
             self.outcome = "completed"
             self.termination_kind = "completed"
             self.end_reason = f"已处理 {self._processed} 个盘"
@@ -1201,6 +1497,7 @@ class Runner:
             self.outcome = "failed"
             self.termination_kind = "error"
             self.end_reason = str(exc)
+            self._run_exception = {"type": type(exc).__name__, "message": str(exc)}
             self.log.exception("run failed")
             self.trace.fail("unknown", "run", self.end_reason)
         finally:
@@ -1334,6 +1631,8 @@ class Runner:
 
         with self.stats.timed("导航", "筛选后准备"):
             prep = self._prepare_navigation(hwnd, state)
+        if self._job_records:
+            self._job_records[-1]["prepared_at"] = time.monotonic()
         if prep is None:
             self._set_status("job_empty", "筛选结果为空，继续下一任务")
             return
@@ -1520,8 +1819,10 @@ class Runner:
         image, _method, _hwnd = grab_game_image(hwnd)
         reset_game_filter(hwnd, image.width(), image.height())
         self.trace.ok("drive_disc", "filter", "标定前重置筛选")
-        env = probe_environment(hwnd)
-        self._env = env
+        # §3.4：环境探测已移到 _bind_instance（绑定后、reset 之前），此处沿用 self._env，
+        # 导航仍按「重置筛选 → 测量布局 → 加载/标定导航」的原顺序执行；
+        # 未绑定直接调用（测试/单步）时退回一次只读探测。
+        env = self._env if self._env is not None else probe_environment(hwnd)
         # 不在这里置顶：calibrate 内部每个候选都会自己 reset_to_top，而 measure_layout
         # 只看网格几何、与列表滚到哪无关。
         image, _method, _hwnd = grab_game_image(hwnd)
@@ -1959,11 +2260,14 @@ class Runner:
             return self._process_cell_inner(
                 hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
             )
-        details = {"input_sent": False, "result": None}
+        details = {"input_sent": False, "result": None, "processed": False,
+                   "inputs": [], "decisions": [], "preset_sha256": runevidence.digest(sub_preset),
+                   "accepted_sha256": runevidence.accepted_digest(accepted_ids)}
         previous = self._disc_event_id
         with scanperf.timed("disc_total", details=details, disc_index=cell.global_index) as span:
             self._disc_span = span
             self._disc_event_id = span.event_id
+            self._latest_decision = None
             try:
                 result = self._process_cell_inner(
                     hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
@@ -1971,8 +2275,12 @@ class Runner:
                 span.set(result=result)
                 return result
             finally:
+                # §7.1：先把等待明细并入本盘输入记录，再让 disc_total 落盘，两份副本保持一致。
+                self._merge_wait_receipts()
                 self._disc_span = None
                 self._disc_event_id = previous
+                self._latest_decision = None
+                scanperf.set_scope(stage_level=None)
 
     def _process_cell_inner(
         self,
@@ -1989,13 +2297,14 @@ class Runner:
         cell_tag = self._cell_tag(cell)
         where = f"全局第{row}行第{col}列（序号 {cell.global_index}）"
         self.trace.new_disc()
-        click_client(hwnd, cell.center_x, cell.center_y)
-        # §6.1：紧接 click_client 正常返回记录 select_disc 的 started_at，早于随后日志/截图。
-        select_started = time.monotonic()
+        with self._business_input("select_disc", target={
+            "global_index": cell.global_index, "x": cell.center_x, "y": cell.center_y,
+        }):
+            select_release = click_client(hwnd, cell.center_x, cell.center_y)
         if self._disc_span is not None:
             self._disc_span.set(input_sent=True)
         try:
-            selection = self._wait_ready("select_disc", started_at=select_started, cell=cell)
+            selection = self._wait_ready("select_disc", release=select_release, cell=cell)
         except ReadinessTimeout as timeout_exc:
             # §6.3：超时后补拍一张新帧，只有仍是已知错页才走原一次 Esc 恢复。
             if self._select_timeout_recheck(hwnd, timeout_exc, where, cell_tag, cell) == "rescan":
@@ -2011,7 +2320,7 @@ class Runner:
         self._detail_disc = disc
         if self._disc_span is not None:
             # §9.2：本盘最新已验证 Disc 的核心盘面随 disc_total 事件保存。
-            self._disc_span.set(core=self._core_of(disc))
+            self._disc_span.set(core=self._core_of(disc), processed=True)
         # 统计：从认出盘面这一刻起算这件盘的耗时（含进强化页、逐档升级、收尾）。
         # slot/sets 取所属任务的过滤值（每个任务按固定号位+套装过滤），
         # line_count 取副词条条数——这些只用于「升满成功明细」，不影响统计口径。
@@ -2029,6 +2338,7 @@ class Runner:
         )
 
         decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
+        self._note_decision(disc, decision, sub_preset, accepted_ids)
         if decision.action == Action.STOP:
             self._record(job, disc, decision)
             self.log.warning("cell %s decision STOP (%s), stop chain", cell_tag, decision.reason)
@@ -2647,11 +2957,13 @@ class Runner:
     # 注意游戏文案是「返还」不是「退还」，标题 OCR 实测 (898,404,1021,442) score=1.00。
     MATERIAL_REFUND_TITLE = "材料返还"
 
-    def _dismiss_material_refund(self, hwnd: int, image: QImage) -> bool:
+    def _dismiss_material_refund(self, hwnd: int, image: QImage, *, resume_result: bool = False) -> bool:
         """识别「材料返还」确认弹窗并点「确认」；没这个弹窗就返回 False。
 
         只在盘面识别失败之后调用——全窗口 OCR 约 1.5s，正常路径不付这个代价。
         「确认」按钮靠 OCR 找字点中心，不硬编坐标：弹窗高度随退还材料行数变。
+        §4.3：resume_result=False 只消费 refund_dismiss 的收尾预算再交回已有识别重试；
+        True 时不在本函数内睡固定值，确认释放点由调用方接续 refund_confirm 完整等待。
         """
         from zzz_ddtool import ocr as _ocr
 
@@ -2660,12 +2972,19 @@ class Runner:
             return False
         for line in lines:
             if "确认" in line.text.replace(" ", ""):
-                click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-                # §6.1：紧接确认 click_client 正常返回取时刻，早于此后日志/Trace 与 0.5 秒等待。
-                self._refund_started_at = time.monotonic()
+                role = "refund_confirm" if resume_result else "refund_dismiss"
+                with self._business_input(role):
+                    self._refund_release = click_client(
+                        hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2
+                    )
+                self._refund_input_id = self._last_input_id
                 self.log.info("材料返还弹窗：已点「确认」")
                 self.trace.ok("upgrade", "refund", "材料返还弹窗已确认")
-                time.sleep(0.5)
+                if not resume_result:
+                    # refund_dismiss：只消费原 180+500 的收尾预算，再交回已有有限识别重试。
+                    wait_release(
+                        "refund_dismiss", self._refund_release, fallback_ms=_REFUND_DISMISS_FLOOR_MS
+                    )
                 return True
         self.log.warning("检测到「材料返还」但没找到「确认」按钮，交回调用方报错")
         return False
@@ -2730,15 +3049,30 @@ class Runner:
                       context: _LabelContext) -> QImage:
         """R/T 共用快速复核；轮询只读，不补发任何标签输入。"""
         other = "discarded" if key == "locked" else "locked"
-        for _attempt in range(max(1, self.preset.ocr_retry) * 4):
-            self._checkpoint()
-            time.sleep(0.05)
-            state, image = self._read_label_state(hwnd, context)
-            if state[other] is not None and state[other] != other_value:
-                raise RunnerError("按键后另一标签状态意外变化，不重复按键，停止任务链")
-            if state[key] is value and state[other] is other_value:
-                return image
-        raise RunnerError("按键后标签状态无法确认，不重复按键，停止任务链")
+        actual_input = self._input_record(self._last_input_id)
+        state = {}
+        verified = False
+        error = None
+        try:
+            for attempt in range(max(1, self.preset.ocr_retry) * 4):
+                self._checkpoint()
+                if attempt:
+                    # §4.3：第一次快速复核由释放总下限覆盖（不叠加 50 ms）；后续观察仍间隔 50 ms。
+                    time.sleep(0.05)
+                state, image = self._read_label_state(hwnd, context)
+                if state[other] is not None and state[other] != other_value:
+                    raise RunnerError("按键后另一标签状态意外变化，不重复按键，停止任务链")
+                if state[key] is value and state[other] is other_value:
+                    verified = True
+                    return image
+            raise RunnerError("按键后标签状态无法确认，不重复按键，停止任务链")
+        except BaseException as exc:
+            error = {"type": type(exc).__name__, "message": str(exc)}
+            raise
+        finally:
+            if actual_input is not None:
+                actual_input["result"] = dict(verified=verified, actual=state.get(key),
+                                              other_actual=state.get(other), exception=error)
 
     def _set_discard_label(self, hwnd: int, *, discarded: bool, value: bool,
                            before: Disc | None = None) -> bool:
@@ -2760,23 +3094,27 @@ class Runner:
         if state is None or state["locked"] is None or state["discarded"] is None:
             raise RunnerError("标签输入前状态无法确认，停止任务链")
 
-        def send(vk: int, expected: dict) -> None:
+        def send(vk: int, expected: dict, kind: str, key: str, target: bool) -> None:
             def validate() -> None:
                 actual, _image = self._read_label_state(hwnd, context)
                 if actual != expected:
                     raise RunnerError("标签输入前状态改变或未知，停止任务链")
-            with validated_inputs(validate, reuse_unchanged=True):
-                press_key_once(hwnd, vk)
+            with validated_inputs(validate, reuse_unchanged=True), self._business_input(
+                kind, target={"key": key, "before": expected[key], "value": target},
+            ):
+                release = press_key_once(hwnd, vk)
+            # §4.3：标签总下限 630 从按键释放点计。
+            wait_release(kind, release, fallback_ms=_LABEL_FLOOR_MS)
 
         if value and state["locked"]:
             # G07：先解锁再弃置，避免直接 R 产生确认弹窗。
-            send(VK_T, state)
+            send(VK_T, state, "label_unlock_before_discard", "locked", False)
             self._verify_label(hwnd, key="locked", value=False,
                                other_value=state["discarded"], context=context)
             state = {"locked": False, "discarded": state["discarded"]}
             self._note_label_input("label_unlock_before_discard", "T")
             self.log.info("弃置前已确认解锁 (T)")
-        send(VK_R, state)
+        send(VK_R, state, "label_discard" if value else "clear_discard", "discarded", value)
         self._verify_label(hwnd, key="discarded", value=value,
                            other_value=state["locked"], context=context)
         self.log.info("discard label=%s (R)", value)
@@ -2825,8 +3163,11 @@ class Runner:
                 raise RunnerError("锁定输入前标签状态改变或未知，停止任务链")
 
         context = _LabelContext(disc, self._checkpoint(), (image.width(), image.height()))
-        with validated_inputs(validate_unlocked):
-            press_key_once(hwnd, VK_T)
+        with validated_inputs(validate_unlocked), self._business_input(
+            "label_save", target={"key": "locked", "before": False, "value": True},
+        ):
+            save_release = press_key_once(hwnd, VK_T)
+        wait_release("label_save", save_release, fallback_ms=_LABEL_FLOOR_MS)
         image = self._verify_label(hwnd, key="locked", value=True,
                                    other_value=False, context=context)
         self._note_label_input("label_save", "T")
@@ -2883,13 +3224,12 @@ class Runner:
                 raise RunnerError(reason)
             # 通用 press_key 会通过多个输入通道发键，回退必须只发一次。
             before_frame = image
-            press_key_once(hwnd, VK_ESCAPE)
+            with self._business_input("return_warehouse", target={"from_layer": layer}):
+                esc_release = press_key_once(hwnd, VK_ESCAPE)
             esc_count += 1
-            # §6.1：紧接 Esc 输入正常返回记录 return_warehouse 的 started_at。
-            esc_started = time.monotonic()
             try:
                 result = self._wait_ready(
-                    "return_warehouse", started_at=esc_started, before_frame=before_frame
+                    "return_warehouse", release=esc_release, before_frame=before_frame
                 )
             except ReadinessTimeout as exc:
                 reason = f"返回驱动盘仓库失败：Esc 后未稳定进入更浅层（{exc}），停止任务链"
@@ -2897,15 +3237,14 @@ class Runner:
                 raise RunnerError(reason)
             image = result.frame
 
-    def _click_text(self, hwnd: int, lines, needle: str, region_desc: str, tag: str, image=None) -> bool:
-        """在 OCR 结果里找含 needle 的行并点中心，找不到存图返回 False。"""
+    def _click_text(self, hwnd: int, lines, needle: str, region_desc: str, tag: str, image=None):
+        """在 OCR 结果里找含 needle 的行并点中心；命中返回释放回执，落空存图返回 None。"""
         for line in lines:
             if needle in line.text.replace(" ", ""):
-                click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-                return True
+                return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
         self.log.warning("UPGRADE: 没找到%s，中断回退", region_desc)
         self.trace.fail("upgrade", "click_cell", f"在{region_desc}没找到「{needle}」", image=image)
-        return False
+        return None
 
     def _read_zoom_level_line(self, hwnd: int):
         """读缩放页「等级xx」那一行（用它的右缘 +110px 算 >> 箭头位置）。
@@ -2952,10 +3291,10 @@ class Runner:
             self.trace.fail("detail", "enter_upgrade", "没找到「查看/强化」大按钮", image=image)
             self._esc_back_to_grid(hwnd)
             return False
-        click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
-        preview_started = time.monotonic()
+        with self._business_input("open_preview"):
+            preview_release = click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
         try:
-            preview = self._wait_ready("open_preview", started_at=preview_started, before=before)
+            preview = self._wait_ready("open_preview", release=preview_release, before=before)
         except ReadinessTimeout as exc:
             # §6.3：open_preview 超时不重发详情按钮、不点箭头，清理后返回 False。
             self.log.warning("UPGRADE: open_preview 超时（%s）", exc)
@@ -2975,10 +3314,10 @@ class Runner:
 
         # 3) 点箭头进强化页；首次超时最多保留一次第二箭头输入（须重新确认同对象预览）。
         for attempt in (1, 2):
-            click_client(hwnd, ax, ay)
-            upgrade_started = time.monotonic()
+            with self._business_input("open_upgrade"):
+                upgrade_release = click_client(hwnd, ax, ay)
             try:
-                entered = self._wait_ready("open_upgrade", started_at=upgrade_started, before=before)
+                entered = self._wait_ready("open_upgrade", release=upgrade_release, before=before)
                 # §6.2 首档接续证据：记录进入强化页确认时刻的暂停代次，供首档 seed 校验。
                 self._upgrade_entry_generation = entered.pause_generation
                 self.trace.ok("upgrade", "enter_upgrade", "已进强化页")
@@ -3018,9 +3357,8 @@ class Runner:
         image, *_ = self._grab(allow_esc=False, need_page=False)
         index = min(max(1, material_slot), len(UPGRADE_MATERIAL_SLOTS))
         mx, my = scale_point(*UPGRADE_MATERIAL_SLOTS[index - 1], image.width(), image.height())
-        click_client(hwnd, mx, my)
-        # §6.2：素材槽时刻由实际发出点写入，紧接 click_client 正常返回，早于日志/Trace。
-        self._material_started_at = time.monotonic()
+        with self._business_input("material_ready"):
+            self._material_release = click_client(hwnd, mx, my)
         self.log.info("action=UPGRADE 测试入口：点第 %d 个材料槽 (%d,%d)", index, mx, my)
         self.trace.ok("upgrade", "step-material", f"测试入口：点第 {index} 个材料槽", image=image)
         return True
@@ -3028,45 +3366,48 @@ class Runner:
     def _upgrade_once(self, hwnd: int, material_slot: int = 0, *, before: Disc) -> bool:
         """强化页选好素材 →「升级」，升一阶。返回两步是否都走完。
 
-        §6.2：调用开始清空素材/升级时刻；素材输入前取得 before_frame，素材输入后按 §6.1
-        记录 ``_material_started_at`` 并执行 material_ready；随后定位并点击一次「升级」，
-        紧接其返回记录 ``_upgrade_started_at`` 供 ``_upgrade_loop`` 的 upgrade_result 使用。
-        不保留原 1.5 秒等待。material_slot>0 是测试入口，走 _pick_material。
+        §6.2/§4.3：调用开始清空素材/升级释放回执；素材输入前取得 before_frame，素材输入后
+        按释放点执行 material_ready；随后定位并点击一次「升级」，其释放点供
+        ``_upgrade_loop`` 的 upgrade_result 使用。不保留原 1.5 秒等待。
+        material_slot>0 是测试入口，走 _pick_material。
         """
         from zzz_ddtool.ocr import read_rect
 
-        self._material_started_at = None
-        self._upgrade_started_at = None
+        self._material_release = None
+        self._upgrade_release = None
         before_frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
         if material_slot:
             if not self._pick_material(hwnd, material_slot):
                 return False
         else:
-            if not self._click_text(
-                hwnd, read_rect(before_frame, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」",
-                "step-stage-add", image=before_frame,
-            ):
+            with self._business_input("material_ready"):
+                self._material_release = self._click_text(
+                    hwnd, read_rect(before_frame, self.STAGE_ADD_AREA), "阶段添加", "「阶段添加」",
+                    "step-stage-add", image=before_frame,
+                )
+            if self._material_release is None:
                 return False
-            self._material_started_at = time.monotonic()
-        if self._material_started_at is None:
+        if self._material_release is None:
             raise RunnerError("素材输入未成功发出，无法确认素材准备就绪，停止任务链")
         try:
             self._wait_ready(
-                "material_ready", started_at=self._material_started_at,
+                "material_ready", release=self._material_release,
                 before=before, before_frame=before_frame,
             )
         except ReadinessTimeout as exc:
             raise RunnerError(f"素材准备就绪超时：{exc}，停止任务链")
         # material_ready 完成后才定位并点击一次「升级」。
         image, *_ = self._grab(allow_esc=False, need_page=False)
-        if not self._click_text(
-            hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」",
-            "step-upgrade-confirm", image=image,
-        ):
+        with self._business_input("upgrade_result", target={
+            "before_level": before.level, "expected_level": next_stage_level(before.level),
+        }):
+            self._upgrade_release = self._click_text(
+                hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」",
+                "step-upgrade-confirm", image=image,
+            )
+        if self._upgrade_release is None:
             return False
-        self._upgrade_started_at = time.monotonic()
-        session = scanperf.current_session()
-        self._upgrade_input_id = session.new_event_id() if session is not None else None
+        self._upgrade_input_id = self._last_input_id
         self.log.info("action=UPGRADE 已发出升级输入（%s）", "材料槽" if material_slot else "阶段添加")
         self.trace.ok("upgrade", "upgrade", "已发出升级输入")
         return True
@@ -3168,6 +3509,7 @@ class Runner:
                     discarded=self._detail_disc.discarded and not self.preset.labels.discard,
                 )
             decision = decide(disc, sub_preset, accepted_ids=accepted_ids)
+            self._note_decision(disc, decision, sub_preset, accepted_ids)
             if decision.action == Action.STOP:
                 self._record(job, disc, decision)
                 self.log.warning("cell %s 强化页判断不确定 (%s)，停止任务链", cell_tag, decision.reason)
@@ -3263,12 +3605,12 @@ class Runner:
         成功消费返回帧/盘面后清空升级时刻；超时走有限诊断/素材不足出口；已确认返还抛
         ReadinessInterrupted 时按 §6.2.1 接续（首个 wait_total 仍按真实出口记 interrupted）。
         """
-        started = self._upgrade_started_at
-        if started is None:
-            raise RunnerError(f"{cell_tag} 未记录升级输入时刻，停止任务链")
+        release = self._upgrade_release
+        if release is None:
+            raise RunnerError(f"{cell_tag} 未记录升级输入释放点，停止任务链")
         try:
             result = self._wait_ready(
-                "upgrade_result", started_at=started, before=before,
+                "upgrade_result", release=release, before=before,
                 expected_level=expected_level, trigger_input_id=self._upgrade_input_id,
             )
         except ReadinessInterrupted as interrupted:
@@ -3281,8 +3623,8 @@ class Runner:
                 hwnd, cell_tag, timeout_exc, before=before, expected_level=expected_level,
                 disc_slot=disc_slot, stage_started=stage_started,
             )
-        # §6.3：成功消费返回的新帧/盘面后清空升级时刻，普通成功路径不再附加固定等待。
-        self._upgrade_started_at = None
+        # §6.3：成功消费返回的新帧/盘面后清空升级释放回执，普通成功路径不再附加固定等待。
+        self._upgrade_release = None
         disc = result.disc
         if disc is None:
             raise RunnerError(f"{cell_tag} 升级结果未读出真实盘面，停止任务链")
@@ -3353,10 +3695,9 @@ class Runner:
             self.log.warning("材料返还确认帧尺寸 %dx%d 与绑定客户区 %dx%d 不符，拒绝按旧坐标确认",
                              frame.width(), frame.height(), env.client_width, env.client_height)
             return False
-        self._refund_started_at = None
-        session = scanperf.current_session()
-        self._refund_input_id = session.new_event_id() if session is not None else None
-        return self._dismiss_material_refund(hwnd, frame)
+        self._refund_release = None
+        self._refund_input_id = None
+        return self._dismiss_material_refund(hwnd, frame, resume_result=True)
 
     def _resume_after_refund(
         self, hwnd: int, cell_tag: str, interrupted, *, refund_line=None,
@@ -3382,17 +3723,44 @@ class Runner:
             frame = interrupted.last_sample.frame
             resume_from = getattr(interrupted, "wait_id", None) or self._last_wait_id
         else:
+            generation = self._checkpoint()
             frame, _page, *_ = self._grab(allow_esc=False, need_page=False)
             resume_from = self._last_wait_id
-        if not self._confirm_material_refund(hwnd, frame):
-            raise RunnerError(f"{cell_tag} 材料返还确认失败，停止任务链")
-        if self._refund_started_at is None:
-            raise RunnerError(f"{cell_tag} 未记录返还确认输入时刻，停止任务链")
+            interrupted_generation = generation
+        binding = (self._hwnd, self._pid, self._env)
+        state = self._state
+        position = None if state is None else (state.job_id, state.next_index)
+        scope = (self._disc_event_id, self._upgrade_input_id)
+        size = (frame.width(), frame.height()) if frame is not None else None
+
+        def validate_refund() -> None:
+            # 入口、OCR 后的 click 检查点及其 focus 检查点都必须仍属于中断帧。
+            # 不重拍/重做全窗 OCR；暂停使旧帧失效，直接停止而非确认另一个弹窗。
+            current = self._checkpoint()
+            current_position = None if self._state is None else (self._state.job_id, self._state.next_index)
+            invalid = (
+                (interrupted_generation is not None and current != interrupted_generation)
+                or binding != (self._hwnd, self._pid, self._env)
+                or position != current_position
+                or scope != (self._disc_event_id, self._upgrade_input_id)
+                or (self._hwnd is not None and self._hwnd != hwnd)
+            )
+            if self._pid is not None:
+                invalid = invalid or window_pid(hwnd) != self._pid or client_size(hwnd) != size
+            if invalid:
+                raise RunnerError(f"{cell_tag} 材料返还接续失效，不使用旧帧确认，停止任务链")
+
+        validate_refund()
+        with validated_inputs(validate_refund):
+            if not self._confirm_material_refund(hwnd, frame):
+                raise RunnerError(f"{cell_tag} 材料返还确认失败，停止任务链")
+        if self._refund_release is None:
+            raise RunnerError(f"{cell_tag} 未记录返还确认输入释放点，停止任务链")
         try:
             result = self._wait_ready(
-                "upgrade_result", started_at=self._refund_started_at, before=before,
+                "upgrade_result", release=self._refund_release, before=before,
                 expected_level=expected_level, trigger_input_id=self._refund_input_id,
-                resume_from_wait_id=resume_from,
+                resume_from_wait_id=resume_from, action_id="refund_confirm",
             )
         except (ReadinessTimeout, ReadinessInterrupted) as exc:
             raise RunnerError(f"{cell_tag} 返还确认后升级结果仍未确认：{exc}，停止任务链")
@@ -3413,15 +3781,3 @@ class Runner:
                 level=disc.level,
             )
         )
-        # §9.2：每次决策同时落进本盘 disc_total 事件（真实执行点，不在报告端重演）。
-        span = self._disc_span
-        if span is not None:
-            span.details.setdefault("decisions", []).append(
-                {
-                    "job_id": job.job_id,
-                    "action": decision.action.value,
-                    "reason": decision.reason,
-                    "score": decision.score,
-                    "level": disc.level,
-                }
-            )

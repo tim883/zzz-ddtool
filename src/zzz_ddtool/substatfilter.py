@@ -1,7 +1,8 @@
 """从任务的组合选择推导单轮游戏筛选；不依赖截屏或输入。
 
-游戏统计所选属性的命中种类数。始终选择 minimum..4，保证新增第四词
-不会让盘子离开列表。枚举真实的 3/4 词组合评估范围，废词条不当成游戏属性。
+游戏统计所选属性的命中种类数。始终选择 minimum..已选词条数（不超过 4），
+保证新增第四词不会让盘子离开列表；超过词条数的数量按钮在游戏里是禁用态
+（2026-10-11 真机确认），不能去点。枚举真实的 3/4 词组合评估范围，废词条不当成游戏属性。
 """
 
 from __future__ import annotations
@@ -26,7 +27,14 @@ class SubstatFilter:
 
     @property
     def counts(self) -> tuple[int, ...]:
-        return tuple(range(self.minimum, 5)) if self.names else ()
+        if not self.names:
+            return ()
+        # 2026-10-11 真机（S5）：游戏只允许「命中数量 ≤ 已选词条数」，
+        # 超过词条数的数量按钮是禁用态、点不动；minimum..上限 与 ≥minimum 等价。
+        upper = min(4, len(self.names))
+        if self.minimum > upper:
+            return ()
+        return tuple(range(self.minimum, upper + 1))
 
     def matches(self, names) -> bool:
         return not self.names or len(set(names) & set(self.names)) >= self.minimum

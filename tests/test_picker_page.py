@@ -88,6 +88,8 @@ def test_page_learning_then_replay_uses_real_identity_and_no_name_ocr(page, monk
     monkeypatch.setattr(gf, "_picker_selected", state)
     monkeypatch.setattr(gf, "click_client", click)
     monkeypatch.setattr(gf, "wheel_client", Mock(side_effect=AssertionError("本帧全部目标已可见")))
+    # §4.2 释放预算在 gamefilter 内由 wait_release 消费；本组用例只验名称/点击，替换掉计时。
+    monkeypatch.setattr(gf, "wait_release", lambda *args, **kwargs: None)
     session = FilterReplaySession()
     with controlled_inputs(lambda: 0):
         gf._select_sets_with_replay(1, targets, width=1920, height=1080, replay_session=session)

@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "scripts" / "verify_spec.py"
-MAPPING = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "验收用例映射.json"
+SCRIPT = ROOT / "dev-docs" / "history" / "扫描提速" / "scripts" / "verify_spec.py"
+MAPPING = ROOT / "dev-docs" / "history" / "扫描提速" / "验收用例映射.json"
 
 
 def _load_verify_spec():

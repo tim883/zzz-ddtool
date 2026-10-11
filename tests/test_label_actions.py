@@ -44,6 +44,8 @@ def labels(monkeypatch):
         state[0] = replace(state[0], **{key: not getattr(state[0], key)})
 
     monkeypatch.setattr(rm, "press_key_once", press)
+    # §4.3 标签释放下限由 wait_release 消费；本组用例验按键/复核语义，替换掉计时。
+    monkeypatch.setattr(rm, "wait_release", lambda *args, **kwargs: None)
     return runner, state, generation, stopped, keys, reader, parser, press
 
 
@@ -183,5 +185,6 @@ def test_both_keys_complete_on_first_known_target_without_full_read(labels, monk
     context = rm._LabelContext(state[0], 0)
     runner._verify_label(1, key=key, value=True, other_value=False, context=context)
     assert reader.call_count == 2 and keys == []
-    assert [call.args[0] for call in sleep.call_args_list] == [0.05, 0.05]
+    # §4.3：第一次复核由释放总下限覆盖（不叠加 50 ms），第二次才是 50 ms 间隔观察。
+    assert [call.args[0] for call in sleep.call_args_list] == [0.05]
     parser.assert_not_called()

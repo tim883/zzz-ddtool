@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from copy import deepcopy
+from final_evidence_fixture import minimal_events
 from pathlib import Path
 
 import pytest
@@ -15,7 +17,7 @@ import pytest
 import zzz_ddtool.ocr as ocr_module
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "scripts" / "measure_waits.py"
+SCRIPT = ROOT / "dev-docs" / "history" / "扫描提速" / "scripts" / "measure_waits.py"
 
 
 def _load_module():
@@ -262,27 +264,16 @@ def _fevent(event_id, component, *, job_index=None, disc_index=None, details=Non
 
 
 def _final_events():
-    return [
-        _fevent("e1", "disc_total", job_index=0, disc_index=3,
-                details={"input_sent": True, "outcome": "succeeded", "result": "done",
-                         "core": {"level": 0, "rarity": "S", "substats": []},
-                         "decisions": [{"action": "skip", "reason": "r", "score": 1.0,
-                                        "level": 0, "job_id": "j1"}]}),
-        _fevent("e2", "probe", job_index=0, disc_index=3, details={"kind": "select_disc"}),
-        _fevent("e3", "wait_total", job_index=0, disc_index=3,
-                details={"kind": "select_disc", "outcome": "succeeded"}),
-        _fevent("e4", "run_total", details={"runner_outcome": "completed",
-                                            "termination_kind": "completed"}),
-    ]
+    return minimal_events("run-x", short=True)
 
 
 def test_final_processed_counts_by_job_identity_not_bare_index():
     """跨任务全局索引可重复：job 0 与 job 1 的 disc_index=3 是两盘（§9.2）。"""
     events = _final_events()
     events.insert(1, _fevent("e5", "disc_total", job_index=1, disc_index=3,
-                             details={"input_sent": True, "outcome": "succeeded"}))
+                             details={"input_sent": True, "processed": True, "outcome": "succeeded"}))
     events.insert(2, _fevent("e6", "disc_total", job_index=1, disc_index=3,
-                             details={"input_sent": True, "outcome": "failed"}))
+                             details={"input_sent": True, "processed": True, "outcome": "failed"}))
     # 同一 (job, disc) 的多条 disc_total 只算一盘（异常重入不会产生第二条，容错去重）。
     assert mw._final_processed(events) == 2
     # 缺 job_index（旧版事件 null）只能按 (None, disc) 合并，如实反映为 1。
@@ -294,12 +285,12 @@ def test_final_discs_and_timing_reference_real_events():
     events = _final_events()
     discs = mw._final_discs(events)
     assert [d["event_id"] for d in discs] == ["e1"]
-    assert discs[0]["decisions"][0]["action"] == "skip"
+    assert discs[0]["decisions"][0]["decision"]["action"] == "skip"
     timing = mw._final_timing(events, {"capture": 2, "png_save": 1, "parse_total": 0},
                               events[-1])
     assert timing["run_total_event_id"] == "e4"
     assert timing["waits"][0]["event_id"] == "e3"
-    assert timing["capture_count"] == 2
+    assert timing["capture_count"] == 1
 
 
 def test_final_coverage_upgrade_groups_by_input_id():
@@ -316,6 +307,10 @@ def test_final_coverage_upgrade_groups_by_input_id():
                              details={"kind": "upgrade_result", "outcome": "succeeded",
                                       "upgrade_input_id": "u2", "trigger_input_id": "r1",
                                       "resume_from_wait_id": "e8"}))
+    for input_id in ("u1", "u2"):
+        actual = deepcopy(events[-1]["details"]["inputs"][0])
+        actual.update(input_id=input_id, kind="upgrade_result")
+        events[-1]["details"]["inputs"].append(actual)
     coverage = mw._final_coverage(events, "run-x", [], None, "e4")
     # 两次升级输入：u1 一档成功，u2 一档先返还再成功（同一输入 ID 不重复计）。
     assert coverage["upgrade"]["status"] == "measured"
@@ -340,6 +335,11 @@ def test_final_coverage_labels_and_shortfall_use_real_records():
     ]
     shortfall = {"type": "zzz_ddtool.runner.MaterialShortfall", "message": "m",
                  "attributes": {"from_level": 0, "expected_level": 3, "actual_level": 1}}
+    for index, label in enumerate(labels, 2):
+        actual = deepcopy(events[-1]["details"]["inputs"][0])
+        actual.update(input_id=f"label-{index}", kind=label["kind"], result={"verified": False, "exception": shortfall})
+        events[-1]["details"]["inputs"].append(actual)
+    events[-1]["details"].update(termination_kind="material_shortfall", exception=shortfall)
     coverage = mw._final_coverage(events, "run-x", labels, shortfall, "e4")
     assert coverage["label_unlock_before_discard"]["count"] == 1
     assert coverage["label_discard"]["count"] == 1

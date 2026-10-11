@@ -61,7 +61,7 @@ __all__ = [
 ]
 
 SCHEMA_VERSION = 1
-PREDICATE_VERSION = 1
+PREDICATE_VERSION = 2
 POLL_MS = 50
 STABLE_FRAMES = 2
 MATERIAL_REFUND = "material_refund"
@@ -248,6 +248,8 @@ class WaitResult:
     active_ms: float
     samples: int
     pause_generation: int | None
+    #: 下限达成前实际请求的睡眠总和（ms，§7.1 requested_sleep_ms 的来源）。
+    requested_sleep_ms: float = 0.0
 
 
 class ReadinessTimeout(RuntimeError):
@@ -259,12 +261,14 @@ class ReadinessTimeout(RuntimeError):
         active_ms: float,
         samples: int,
         pause_generation: int | None,
+        requested_sleep_ms: float = 0.0,
     ) -> None:
         super().__init__(message)
         self.last_sample = last_sample
         self.active_ms = active_ms
         self.samples = samples
         self.pause_generation = pause_generation
+        self.requested_sleep_ms = requested_sleep_ms
 
 
 class ReadinessInterrupted(RuntimeError):
@@ -276,6 +280,7 @@ class ReadinessInterrupted(RuntimeError):
         active_ms: float,
         samples: int,
         pause_generation: int | None,
+        requested_sleep_ms: float = 0.0,
     ) -> None:
         super().__init__(f"等待被受控中断：{reason}")
         self.reason = reason
@@ -283,6 +288,7 @@ class ReadinessInterrupted(RuntimeError):
         self.active_ms = active_ms
         self.samples = samples
         self.pause_generation = pause_generation
+        self.requested_sleep_ms = requested_sleep_ms
 
 
 # --------------------------------------------------------------------------
@@ -301,7 +307,11 @@ def wait_ready(
 
     - 只做调度/判定/返回或抛错；不写性能事件。
     - ``probe``/``checkpoint`` 抛出的异常原样向上传播（§6.1.1）。
-    - 暂停阻塞不计入 ``active_ms``/超时；代次改变丢弃旧帧、候选与最后样本，下限从恢复时刻重算。
+    - 下限与超时都按 ``started_at`` 起的活动时间计（扣暂停）；暂停阻塞不计入
+      ``active_ms``/超时。代次改变丢弃旧帧、候选与最后样本（恢复后仍须两帧新证据），
+      但**不**重开下限预算（§2.1、§3.2）。
+    - 下限达成前的睡眠请求不超过剩余下限，并计入 ``requested_sleep_ms``；
+      超过下限后的轮询请求不计入（§7.1）。
     - ``material_refund`` 需两个独立稳定候选，满足后抛 ``ReadinessInterrupted``。
     """
     if kind not in KINDS:
@@ -332,19 +342,21 @@ def wait_ready(
 
     state: dict[str, Any] = {
         "gen": None,
-        "gen_start_active": 0.0,
         "mode": None,
         "key": None,
         "times": [],
         "last": None,
         "count": 0,
     }
+    #: §7.1：下限达成前实际请求的睡眠总和（ms）。
+    sleep_stats: dict[str, float] = {"requested_sleep_ms": 0.0}
 
     def _on_checkpoint() -> bool:
         """检查暂停代次；返回本次检查是否发生了代次改变。
 
         代次改变时丢弃旧帧、连续计数、返回候选与最后样本（§6.1、§8 W5/W6b）：
         旧代次证据既不能完成等待，也不能作为超时诊断的 last_sample。
+        下限与超时仍按 started_at 的活动时间计，不因代次改变重开（§2.1、§3.2）。
         """
         gen = checkpoint()
         if gen is None:
@@ -356,7 +368,6 @@ def wait_ready(
             state["key"] = None
             state["times"] = []
             state["last"] = None
-            state["gen_start_active"] = _active_at(_now())
             state["gen"] = gen
             return True
         state["gen"] = gen
@@ -369,6 +380,7 @@ def wait_ready(
             active_ms=_active_ms(moment),
             samples=state["count"],
             pause_generation=state["gen"],
+            requested_sleep_ms=sleep_stats["requested_sleep_ms"],
         )
 
     def _finish(sample: WaitSample, moment: float):
@@ -381,6 +393,7 @@ def wait_ready(
                 active_ms=_active_ms(moment),
                 samples=state["count"],
                 pause_generation=state["gen"],
+                requested_sleep_ms=sleep_stats["requested_sleep_ms"],
             )
         return WaitResult(
             frame=sample.frame,
@@ -388,6 +401,7 @@ def wait_ready(
             active_ms=_active_ms(moment),
             samples=state["count"],
             pause_generation=state["gen"],
+            requested_sleep_ms=sleep_stats["requested_sleep_ms"],
         )
 
     while True:
@@ -419,7 +433,7 @@ def wait_ready(
                 mode, key = "interrupt", (sample.interrupt_reason, sample.state_key)
             else:
                 mode, key = "ready", (sample.state_key,)
-            if _active_at(sample.captured_at) - state["gen_start_active"] >= min_wait_s - _EPS:
+            if _active_at(sample.captured_at) >= min_wait_s - _EPS:
                 if state["mode"] != mode or state["key"] != key:
                     state["mode"], state["key"] = mode, key
                     state["times"] = [sample.captured_at]
@@ -430,6 +444,8 @@ def wait_ready(
 
         # 调度下一帧：按本帧采集时刻 + poll 间隔（§6.1）；probe 耗时达到 poll 时立即继续，
         # 不在慢 probe 后机械再睡足一个 poll（那会把本可在预算内完成的等待拖成超时）。
+        # §7.1：下限达成前的睡眠请求不超过剩余下限并计入 requested_sleep_ms；
+        # 超过下限后的轮询请求照常调度、不计入。
         target = sample.captured_at + poll_s
         while True:
             moment = _now()
@@ -439,6 +455,10 @@ def wait_ready(
             if _active_at(moment) > timeout_s:
                 _raise_timeout(moment)
             gap = min(poll_s, target - moment)
+            floor_left = min_wait_s - _active_at(moment)
+            if floor_left > 0:
+                gap = min(gap, floor_left)
+                sleep_stats["requested_sleep_ms"] += gap * 1000.0
             if gap > 0:
                 _sleep(gap)
 

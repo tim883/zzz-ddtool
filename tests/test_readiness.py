@@ -480,7 +480,7 @@ def _policy_json(min_wait=800, timeout=3000, poll=50, stable=2):
 def _document(**overrides):
     doc = {
         "schema_version": 1,
-        "predicate_version": 1,
+        "predicate_version": readiness.PREDICATE_VERSION,
         "environment": dict(ENV),
         "policies": {"select_disc": _policy_json()},
         "measurements": {"select_disc": {"count": 20, "max_stable_ms": 120.0, "floor_ms": 800, "report_sha256": "ab"}},
@@ -519,7 +519,13 @@ def test_c1_corrupt_json_invalidates(tmp_path):
 
 
 def test_c1_predicate_version_change_invalidates(tmp_path):
-    assert readiness.load_wait_policies(ENV, path=_write_doc(tmp_path, _document(predicate_version=2))) == _defaults()
+    # 旧版（v1）档案与未知更高版本都整档失效；当前版本由 readiness.PREDICATE_VERSION 给出。
+    assert readiness.load_wait_policies(
+        ENV, path=_write_doc(tmp_path, _document(predicate_version=1))
+    ) == _defaults()
+    assert readiness.load_wait_policies(
+        ENV, path=_write_doc(tmp_path, _document(predicate_version=readiness.PREDICATE_VERSION + 1))
+    ) == _defaults()
 
 
 def test_c1_poll_ms_fixed_value_invalidates(tmp_path):

@@ -146,3 +146,11 @@ def test_decide_step_also_records_a_span(tmp_path: Path) -> None:
     assert len(trace.spans) == 1
     assert trace.spans[0].action == "判断"
     assert trace._shots == []
+
+
+def test_trace_accepts_explicit_dir(tmp_path: Path) -> None:
+    """§2.1：final 测量脚本可用显式目录把 Runner 的 Trace 指向本次证据目录。"""
+    target = tmp_path / "evidence" / "run-1"
+    trace = Trace(tag="evidence-run", dir=target)
+    assert trace.dir == target
+    assert target.is_dir()

@@ -37,6 +37,7 @@ from zzz_ddtool.layout import (
 from zzz_ddtool.logutil import get_logger
 from zzz_ddtool.ocr import OcrLine, read_name_bands, read_name_span, read_rect
 from zzz_ddtool import picker_names
+from zzz_ddtool.actionwait import InputRelease, wait_release
 from zzz_ddtool.wininput import (
     VK_ESCAPE,
     click_client,
@@ -75,6 +76,13 @@ _PANEL_CLICK_BOTTOM_GAP = 160
 # 面板一次滑到底连发的滚轮事件条数。真机实测一格约 41px、内容比视口高出约 300px，
 # 8 条足够到底（到顶后会停住，多发无害）。宁可一次发到位，也不要「滚一格→抓图→再滚」。
 _PANEL_SCROLL_NOTCHES = 8
+
+#: 2026-10-12 作者裁定（**勿重复叠加**）：最终等待 = 真机实测值（见《等待时间表》第 14 轮）
+#: + 本保底。调用点一律写成「实测值 + _MEASURED_SAFETY_MS」；日后调保底只改这里，
+#: 不准再往任何数值里手写 +200。
+_MEASURED_SAFETY_MS = 200
+#: 组动作（同一动作连续点击）的组后等待：组内 0、组后 50；这四项**不加** _MEASURED_SAFETY_MS。
+_GROUP_TAIL_WAIT_MS = 50
 # 主属性名与词条名的相似度下限，低于它宁可中断也不猜（手册 01 底线）
 _MATCH_CUTOFF = 0.75
 
@@ -92,13 +100,15 @@ _PICKER_SCROLL_DELTA = -8
 _PICKER_MATCH_CUTOFF = 0.75
 _PICKER_MAX_ROUNDS = 8
 _PICKER_OBSERVE_FRAMES = 3
-_PICKER_OBSERVE_INTERVAL_S = 0.1
+# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+_PICKER_OBSERVE_INTERVAL_S = 0.05
 _PICKER_CONFIRM_TEXT = "确认筛选"
 # 名称带近似命中但未能精确隔离时的重拍重读上限（用户决定 2026-10-11）：
 # 识别错误不点击，重拍新帧再认，认对一次即用；上限内仍无法精确隔离才按 R21 停止。
 _PICKER_NAME_READ_ATTEMPTS = 5
 # 重拍前的短暂等待：给游戏一帧新的呈现，不改变任何点击/滚动时序。
-_PICKER_NAME_RETRY_DELAY_S = 0.1
+# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+_PICKER_NAME_RETRY_DELAY_S = 0.05
 
 
 class _PickerMetrics:
@@ -529,10 +539,13 @@ def _select_sets_learn(
                 metrics, layout, key,
                 lambda img, ref=ref, identity=click.identity: _pre_click_state(img, ref, identity),
                 f"套装 {name!r} 输入前状态不符",
-            ), input_context("set_option", target=name, stage_index=stage_index + 1, selected=True):
-                click_client(hwnd, click.x, click.y)
+            ), input_context("set_option", target=name, stage_index=stage_index + 1, selected=True,
+                             defer_post_release=True):
+                release = click_client(hwnd, click.x, click.y)
             metrics.selection_clicks += 1
-            time.sleep(layout.click_wait_ms / 1000)
+            # §4.2 set_option：总下限 = 原输入层收尾 180 + v8 布局点击等待，从释放点算。
+            # 作者裁定：组内 0、组后 50（不加 200）。
+            wait_release("set_option", release, fallback_ms=_GROUP_TAIL_WAIT_MS if name == prepared[-1][0] else 0)
             clicks.append(click)
             boxes.append(box)
             frame_boxes.append(box)
@@ -575,15 +588,15 @@ def _select_sets_learn(
         for _ in range(_PICKER_SCROLL_EVENTS):
             with _checked_picker_input(
                 metrics, layout, key, None, "套装滚动前弹窗布局不符",
-            ), input_context("set_scroll"):
-                wheel_client(
+            ), input_context("set_scroll", defer_post_release=True):
+                release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
                     delta=_PICKER_SCROLL_DELTA,
                 )
             metrics.wheel_events += 1
             carried_events += 1
-            time.sleep(layout.scroll_wait_ms / 1000)
+            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
         image, _ = _grab()
         metrics.verification_frames += 1
 
@@ -613,9 +626,9 @@ def _select_sets_learn(
         metrics, layout, key,
         lambda img: _confirm_ready(img, confirm_identity, confirm_ref),
         "确认按钮输入前状态不符",
-    ), input_context("confirm_sets"):
-        click_client(hwnd, confirm_x, confirm_y)
-    time.sleep(layout.confirm_wait_ms / 1000)
+    ), input_context("confirm_sets", defer_post_release=True):
+        release = click_client(hwnd, confirm_x, confirm_y)
+    wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS)
     if _observe(metrics, _picker_popup_closed) is not True:
         raise FilterClickError("点击确认后弹窗未关闭，停止。")
     if not _panel_visible():
@@ -676,14 +689,14 @@ def _establish_origin(
         for _ in range(layout.top_wheel_events):
             with _checked_picker_input(
                 metrics, layout, key, None, "套装回顶前弹窗布局不符",
-            ), input_context("set_scroll"):
-                wheel_client(
+            ), input_context("set_scroll", defer_post_release=True):
+                release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
                     delta=layout.top_delta_units,
                 )
             metrics.wheel_events += 1
-            time.sleep(layout.scroll_wait_ms / 1000)
+            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
     if _observe(metrics, lambda img: _picker_at_top(img, layout)) is not True:
         raise FilterClickError("套装弹窗起始位置检查失败（顶部锚点不符），停止。")
 
@@ -718,14 +731,14 @@ def _select_sets_replay(
         for _ in range(stage.wheel_events):
             with _checked_picker_input(
                 metrics, layout, route.key, None, f"回放第 {index}/{stage_total} 段滚动前布局不符",
-            ), input_context("set_scroll"):
-                wheel_client(
+            ), input_context("set_scroll", defer_post_release=True):
+                release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
                     delta=stage.delta_units,
                 )
             metrics.wheel_events += 1
-            time.sleep(layout.scroll_wait_ms / 1000)
+            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
         if _observe(metrics, lambda img: _picker_stage_matches(img, layout)) is not True:
             raise FilterClickError(f"回放第 {index}/{stage_total} 段布局检查失败，停止。")
         for click in stage.clicks:
@@ -734,10 +747,12 @@ def _select_sets_replay(
                 metrics, layout, route.key,
                 lambda img, ref=ref, click=click: _pre_click_state(img, ref, click.identity),
                 f"回放第 {index}/{stage_total} 段目标 {click.name!r} 输入前状态不符",
-            ), input_context("set_option", target=click.name, stage_index=index, selected=True):
-                click_client(hwnd, click.x, click.y)
+            ), input_context("set_option", target=click.name, stage_index=index, selected=True,
+                             defer_post_release=True):
+                release = click_client(hwnd, click.x, click.y)
             metrics.selection_clicks += 1
-            time.sleep(layout.click_wait_ms / 1000)
+            # 作者裁定：组内 0、组后 50（不加 200）。
+            wait_release("set_option", release, fallback_ms=_GROUP_TAIL_WAIT_MS if click is stage.clicks[-1] else 0)
         seen: dict[str, QImage] = {}
 
         def post_state(img, stage=stage, seen=seen) -> bool | None:
@@ -774,9 +789,9 @@ def _select_sets_replay(
         metrics, layout, route.key,
         lambda img: _confirm_ready(img, route.confirm_identity, confirm_ref),
         "回放确认按钮输入前状态不符",
-    ), input_context("confirm_sets"):
-        click_client(hwnd, route.confirm_x, route.confirm_y)
-    time.sleep(layout.confirm_wait_ms / 1000)
+    ), input_context("confirm_sets", defer_post_release=True):
+        release = click_client(hwnd, route.confirm_x, route.confirm_y)
+    wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS)
     if _observe(metrics, _picker_popup_closed) is not True:
         raise FilterClickError("回放点击确认后弹窗未关闭，停止。")
     if not _panel_visible():
@@ -863,7 +878,8 @@ _PICKER_CHECK_DX = (46, 84)
 _PICKER_CHECK_DY = (-115, -70)
 # 副属性就位观察（§6.5）：一次滑到底后未知最多共 3 张（含滚后第一张），期间不补发输入
 _SUBSTAT_OBSERVE_FRAMES = 3
-_SUBSTAT_OBSERVE_INTERVAL_S = 0.1
+# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+_SUBSTAT_OBSERVE_INTERVAL_S = 0.05
 
 
 def _region(image: QImage, area: tuple[int, int, int, int], step: int = 2):
@@ -1011,8 +1027,8 @@ def _find_and_click(
     height: int,
     cutoff: float = 0.75,
     refuse_dismantle: bool = False,
-) -> bool:
-    """截屏 OCR，在 region 里找含 needle 的文本行并点中心。找到返回 True。"""
+) -> InputRelease | None:
+    """截屏 OCR，在 region 里找含 needle 的文本行并点中心：命中返回释放回执，落空返回 None。"""
     image, _ = _grab()
     for line in read_rect(image, region):
         ratio = SequenceMatcher(None, needle, line.text).ratio()
@@ -1022,9 +1038,8 @@ def _find_and_click(
         cy = (line.top + line.bottom) // 2
         if refuse_dismantle:
             _refuse_dismantle(cx, cy, width, height)
-        click_client(hwnd, cx, cy)
-        return True
-    return False
+        return click_client(hwnd, cx, cy)
+    return None
 
 
 def _select_names(
@@ -1054,6 +1069,7 @@ def _select_names(
         still: list[str] = []
         clicks: list[tuple[int, int, tuple[int, int, int, int]]] = []
         targets: list[str] = []
+        last_release = None
         for name in pending:
             hit = None
             for line in lines:
@@ -1066,15 +1082,21 @@ def _select_names(
             target = _legacy_option_target(hit.text, name)
             cx = (hit.left + hit.right) // 2
             cy = (hit.top + hit.bottom) // 2
-            with input_context("set_option", target=target, stage_index=stage_index + 1, selected=True):
-                click_client(hwnd, cx, cy)
+            with input_context("set_option", target=target, stage_index=stage_index + 1,
+                               selected=True, defer_post_release=True):
+                release = click_client(hwnd, cx, cy)
             if metrics is not None:
                 metrics.selection_clicks += 1
             log.info("picker clicked %r at (%d,%d)", name, hit.left, hit.top)
-            time.sleep(0.3)
+            # legacy 分支沿用相同动作ID但不消费实测（§4.2）。
+            # 作者裁定（组动作）：组内 0 等待、组后 _GROUP_TAIL_WAIT_MS（不加 200）。
+            wait_release("set_option", release, fallback_ms=0, allow_measured=False)
+            last_release = release
             clicks.append((cx, cy, (hit.left, hit.top, hit.right, hit.bottom)))
             targets.append(target)
         pending = still
+        if not pending and last_release is not None:
+            wait_release("set_option", last_release, fallback_ms=_GROUP_TAIL_WAIT_MS, allow_measured=False)
         if clicks:
             stage_index += 1
             if _evidence_enabled():  # 只在启用证据时抓这一帧
@@ -1090,11 +1112,12 @@ def _select_names(
                 )
         if not pending:
             return
-        with input_context("set_scroll"):
-            wheel_client(hwnd, *scale_point(*scroll_center, width, height))
+        with input_context("set_scroll", defer_post_release=True):
+            release = wheel_client(hwnd, *scale_point(*scroll_center, width, height))
         if metrics is not None:
             metrics.wheel_events += 1
-        time.sleep(0.35)
+        # legacy 分支：680 = 330 + 350，不消费实测。
+        wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS, allow_measured=False)
     raise FilterClickError(f"弹层里找不到目标，滚动 {_MAX_SCROLL_ROUNDS} 轮未果：{pending}")
 
 
@@ -1121,13 +1144,14 @@ def _confirm_popup(hwnd: int, metrics: _PickerMetrics | None = None) -> None:
     找不到按钮就中断，保持现状等人处理。查找按钮恰做一次整窗 OCR，
     与 optimized 确认区读取同口径计入 search_ocr_calls（spec §5.4）。
     """
-    with input_context("confirm_sets"):
-        found = _find_and_click(hwnd, "确认筛选", FULL_WINDOW, width=1920, height=1080, cutoff=0.8)
+    with input_context("confirm_sets", defer_post_release=True):
+        release = _find_and_click(hwnd, "确认筛选", FULL_WINDOW, width=1920, height=1080, cutoff=0.8)
     if metrics is not None:
         metrics.search_ocr_calls += 1
-    if not found:
+    if release is None:
         raise FilterClickError("没找到「确认筛选」按钮，弹层未关闭。按手册 01 中断。")
-    time.sleep(0.4)
+    # legacy 分支：580 = 180 + 400，不消费实测。
+    wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS, allow_measured=False)
 
 
 def _text_lines() -> list:
@@ -1174,33 +1198,29 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
 
     **返回**「已确认展开」那一帧的 OCR 文本行。紧接着调用的 `_pick_mainstats` 就在同一
     状态下点名，直接把这一帧交给它，省掉一次面板 OCR（中间无点击，帧不会变）。
+
+    2026-10-11 真机（S5 轮次 2）：标题露出但开关被裁在视口底部之外时，旧实现直接中断；
+    按 §4.2「目标未露出或落在底部点击无效区时向下滚动后重读」，改为继续滚动直到开关
+    进入可点区，或滚满轮数再中断。
     """
     log = get_logger("zzz_ddtool.gamefilter")
+    click_bottom = scale_point(0, 1080 - _PANEL_CLICK_BOTTOM_GAP, width, height)[1]
     for _round in range(_MAX_PANEL_SCROLLS + 1):
         lines = _text_lines()
         title_y = _title_y(lines, MAINSTAT_TITLE)
-        if title_y is None:
+        toggle = _toggle_below(lines, title_y) if title_y is not None else None
+        if toggle is None or toggle.bottom > click_bottom:
             if _round == _MAX_PANEL_SCROLLS:
                 break
-            with input_context("mainstat_scroll"):
-                wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
-            time.sleep(0.35)
+            with input_context("mainstat_scroll", defer_post_release=True):
+                release = wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+            wait_release("mainstat_scroll", release, fallback_ms=94 + _MEASURED_SAFETY_MS)
             continue
-        toggle = _toggle_below(lines, title_y)
-        if toggle is None:
-            raise FilterClickError("主属性词条区没找到「点击展开 / 点击收起」开关，中断。")
         if "收起" in toggle.text.replace(" ", ""):
             return lines
-        if toggle.bottom > scale_point(0, 1080 - _PANEL_CLICK_BOTTOM_GAP, width, height)[1]:
-            if _round == _MAX_PANEL_SCROLLS:
-                break
-            with input_context("mainstat_scroll"):
-                wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
-            time.sleep(0.35)
-            continue
-        with input_context("open_mainstats"):
-            click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
-        time.sleep(0.7)
+        with input_context("open_mainstats", defer_post_release=True):
+            release = click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
+        wait_release("open_mainstats", release, fallback_ms=94 + _MEASURED_SAFETY_MS)
         after = _text_lines()
         after_y = _title_y(after, MAINSTAT_TITLE)
         after_toggle = _toggle_below(after, after_y) if after_y is not None else None
@@ -1284,23 +1304,29 @@ def _pick_mainstats(
             )
             candidates = [line for line in lines if left <= (line.left + line.right) // 2 <= right]
             still = []
+            last_release = None
             for name in pending:
                 hit = _best_match(candidates, name, top, bottom)
                 if hit is None or hit.bottom > click_bottom:
                     still.append(name)
                     continue
-                _click_line(hwnd, hit, role="mainstat_option", target=hit.text)
+                release = _click_line(hwnd, hit, role="mainstat_option", target=hit.text)
                 log.info("mainstat clicked %r at (%d,%d)", name, hit.left, hit.top)
-                time.sleep(0.3)
+                # 作者裁定：组内 0 等待（组后 50 在循环结束时补）。
+                wait_release("mainstat_option", release, fallback_ms=0)
+                last_release = release
             pending = still
             if not pending:
+                # 组结束：补 50 ms（组内 0、组后 50，不加 200）。
+                if last_release is not None:
+                    wait_release("mainstat_option", last_release, fallback_ms=_GROUP_TAIL_WAIT_MS)
                 return
         if scrolls == _MAX_PANEL_SCROLLS:
             break
         log.info("主属性选项未全部就位，向下滚动重找（第%d次）：%s", scrolls + 1, pending)
-        with input_context("mainstat_scroll"):
-            wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
-        time.sleep(0.35)
+        with input_context("mainstat_scroll", defer_post_release=True):
+            release = wheel_client(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
+        wait_release("mainstat_scroll", release, fallback_ms=94 + _MEASURED_SAFETY_MS)
         lines = _text_lines()
     raise FilterClickError(f"主属性词条区滚动 {_MAX_PANEL_SCROLLS} 轮后仍找不到或无法点击：{pending}")
 
@@ -1322,11 +1348,11 @@ def apply_sets_mainstats(
     log = get_logger("zzz_ddtool.gamefilter")
     if sets:
         _validate_picker_names(sets)  # 第一条游戏输入之前拒绝非法名称（§3.1/§4.1）
-        with input_context("open_sets"):
-            opened = _find_and_click(hwnd, "点击选择", FILTER_SETS_BAR, width=width, height=height)
-        if not opened:
+        with input_context("open_sets", defer_post_release=True):
+            release = _find_and_click(hwnd, "点击选择", FILTER_SETS_BAR, width=width, height=height)
+        if release is None:
             raise FilterClickError("筛选面板里没找到「点击选择」条。")
-        time.sleep(0.6)
+        wait_release("open_sets", release, fallback_ms=166 + _MEASURED_SAFETY_MS)
         _select_sets_with_replay(hwnd, sets, width=width, height=height, replay_session=replay_session)
     if mainstats:
         # 展开最后一帧直接交给点名用，省一次面板 OCR（两者之间不点击，帧不变）。
@@ -1335,8 +1361,8 @@ def apply_sets_mainstats(
         log.info("mainstats picked: %s", list(mainstats))
 
 
-def _click_slot(hwnd: int, slot: int, width: int, height: int) -> None:
-    """OCR 找「分区[N]」按钮，点文字中心。面板滚动状态无关。认不上就中断。"""
+def _click_slot(hwnd: int, slot: int, width: int, height: int) -> InputRelease:
+    """OCR 找「分区[N]」按钮，点文字中心并返回释放回执。面板滚动状态无关。认不上就中断。"""
     image, _ = _grab()
     for line in read_rect(image, FILTER_SLOT_AREA):
         text = line.text.replace(" ", "")
@@ -1344,21 +1370,19 @@ def _click_slot(hwnd: int, slot: int, width: int, height: int) -> None:
             continue
         m = re.search(r"(\d+)", text)
         if m and int(m.group(1)) == slot:
-            with input_context("slot", target=slot):
-                click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-            return
+            with input_context("slot", target=slot, defer_post_release=True):
+                return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
     raise FilterClickError(f"筛选面板里没找到「分区[{slot}]」按钮，中断。")
 
 
-def _click_reset(hwnd: int, width: int, height: int) -> None:
-    """OCR 找面板底部的「重置」按钮点中心（避开批量操作）。"""
+def _click_reset(hwnd: int, width: int, height: int) -> InputRelease:
+    """OCR 找面板底部的「重置」按钮点中心并返回释放回执（避开批量操作）。"""
     image, _ = _grab()
     for line in read_rect(image, FILTER_RESET_AREA):
         text = line.text.replace(" ", "")
         if "重置" in text and "批量" not in text:
-            with input_context("reset"):
-                click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-            return
+            with input_context("reset", defer_post_release=True):
+                return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
     raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
 
 
@@ -1370,13 +1394,14 @@ def reset_game_filter(hwnd: int, width: int, height: int) -> None:
     """
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
-    with input_context("open_panel"):
-        click_client(hwnd, fx, fy)
-    time.sleep(0.55)
-    _click_reset(hwnd, width, height)
-    time.sleep(0.45)
-    press_key(hwnd, VK_ESCAPE)
-    time.sleep(0.4)
+    with input_context("open_panel", defer_post_release=True):
+        release = click_client(hwnd, fx, fy)
+    wait_release("open_panel", release, fallback_ms=75 + _MEASURED_SAFETY_MS)
+    reset_release = _click_reset(hwnd, width, height)
+    wait_release("reset", reset_release, fallback_ms=203 + _MEASURED_SAFETY_MS)
+    with input_context("close_panel_reset", defer_post_release=True):
+        esc_release = press_key(hwnd, VK_ESCAPE)
+    wait_release("close_panel_reset", esc_release, fallback_ms=80 + _MEASURED_SAFETY_MS)
 
 
 def _validate_picker_names(names: Sequence[str]) -> tuple[str, ...]:
@@ -1411,23 +1436,23 @@ def apply_game_filter(
     log = get_logger("zzz_ddtool.gamefilter")
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
-    with input_context("open_panel"):
-        click_client(hwnd, fx, fy)
-    time.sleep(0.55)
-    _click_reset(hwnd, width, height)
-    time.sleep(0.45)
+    with input_context("open_panel", defer_post_release=True):
+        release = click_client(hwnd, fx, fy)
+    wait_release("open_panel", release, fallback_ms=75 + _MEASURED_SAFETY_MS)
+    reset_release = _click_reset(hwnd, width, height)
+    wait_release("reset", reset_release, fallback_ms=203 + _MEASURED_SAFETY_MS)
     for slot in slots:
-        _click_slot(hwnd, slot, width, height)
-        time.sleep(0.12)
+        slot_release = _click_slot(hwnd, slot, width, height)
+        wait_release("slot", slot_release, fallback_ms=85 + _MEASURED_SAFETY_MS)
     if sets or mainstats:
         apply_sets_mainstats(
             hwnd, width, height, sets=sets, mainstats=mainstats, replay_session=replay_session
         )
     if substats:
         apply_substat_filter(hwnd, width, height, names=substats, counts=substat_counts)
-    with input_context("close_panel"):
-        press_key(hwnd, VK_ESCAPE)
-    time.sleep(0.35)
+    with input_context("close_panel", defer_post_release=True):
+        esc_release = press_key(hwnd, VK_ESCAPE)
+    wait_release("close_panel", esc_release, fallback_ms=89 + _MEASURED_SAFETY_MS)
     log.info("game filter done slots=%s sets=%s mains=%s", list(slots), list(sets), list(mainstats))
 
 
@@ -1436,8 +1461,11 @@ def _validate_substat_filter(names: Sequence[str], counts: Sequence[int]) -> Non
         return
     if not names or len(set(names)) != len(names) or set(names) - set(SUBSTAT_NAMES):
         raise FilterClickError("副属性筛选必须选择合法且不重复的副词条")
-    if not counts or tuple(counts) != tuple(range(min(counts), 5)) or min(counts) not in (1, 2, 3, 4):
-        raise FilterClickError("副属性命中数量必须从最低数量连续选到 4，避免强化后退出列表")
+    # 2026-10-11 真机：游戏只允许数量 ≤ 已选词条数（上限 4），按钮连续从最低数量选到上限。
+    upper = min(4, len(names))
+    if (not counts or tuple(counts) != tuple(range(min(counts), upper + 1))
+            or min(counts) not in range(1, upper + 1)):
+        raise FilterClickError("副属性命中数量必须从最低数量连续选到已选词条数（不超过 4）")
 
 
 def _panel_lines(image: QImage) -> list:
@@ -1457,30 +1485,35 @@ def _read_panel() -> tuple[QImage, list]:
 
 
 def _click_line(hwnd: int, line, *, role: str | None = None, target: str | int | None = None,
-                selected: bool | None = None) -> None:
+                selected: bool | None = None) -> InputRelease:
+    """点一条 OCR 行的中心并返回释放回执；带 role 时同时声明业务接管收尾（§3.2）。"""
     if role is None:
-        click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-        return
-    with input_context(role, target=target, selected=selected):
-        click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+        return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
+    with input_context(role, target=target, selected=selected, defer_post_release=True):
+        return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
 
 
-def _scroll_panel_to_bottom(hwnd: int, width: int, height: int, *, role: str = "substat_scroll") -> None:
+def _scroll_panel_to_bottom(
+    hwnd: int, width: int, height: int, *, role: str = "substat_scroll", budget_ms: int = 173 + _MEASURED_SAFETY_MS
+) -> None:
     """一次把筛选面板滑到底：连发滚轮事件，中途不抓图、不重复定位光标。
 
     面板内容比视口高，底部还有一条「点击无效带」。与其「滚一格 → 抓图 → 还不行 →
     再滚一格」（每格约 41px，要两三格才够，而每次都要一次全屏 OCR ≈1s），不如一次
     连发到底：到底后布局固定，按钮与后续选项都落在可点区，下一次 OCR 就能直接定位点击。
+    §4.2：事件间 60 ms 不变，最后一条后的原 60 ms 计入总预算（60+250=310），不另加。
     """
     sx, sy = client_to_screen(hwnd, *scale_point(*FILTER_PANEL_SCROLL, width, height))
     focus_window(hwnd)
     user32.SetCursorPos(sx, sy)
     time.sleep(0.05)
-    with input_context(role):
+    release: InputRelease | None = None
+    with input_context(role, defer_post_release=True):
         for _ in range(_PANEL_SCROLL_NOTCHES):
-            send_wheel_event(-3)
+            release = send_wheel_event(-3)
             time.sleep(0.06)
-    time.sleep(0.25)
+    assert release is not None  # _PANEL_SCROLL_NOTCHES > 0 时必已发送
+    wait_release(role, release, fallback_ms=budget_ms)
 
 
 def _option_selected(image: QImage, line) -> bool:
@@ -1513,8 +1546,8 @@ def _open_substat_section(hwnd: int, width: int, height: int) -> tuple[QImage, l
     main_y = _title_y(lines, MAINSTAT_TITLE)
     main_toggle = _toggle_below(lines, main_y) if main_y is not None else None
     if main_toggle is not None and "收起" in main_toggle.text and (main_toggle.top - main_y) < height / 8:
-        _click_line(hwnd, main_toggle, role="collapse_mainstats")
-        time.sleep(0.35)
+        release = _click_line(hwnd, main_toggle, role="collapse_mainstats")
+        wait_release("collapse_mainstats", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
         image, lines = _read_panel()
 
     # 2) 副属性区已展开就直接复用这一帧，不必再动。
@@ -1537,8 +1570,8 @@ def _open_substat_section(hwnd: int, width: int, height: int) -> tuple[QImage, l
         if "收起" in toggle.text:
             return image, lines
 
-    _click_line(hwnd, toggle, role="open_substats")
-    time.sleep(0.5)
+    release = _click_line(hwnd, toggle, role="open_substats")
+    wait_release("open_substats", release, fallback_ms=95 + _MEASURED_SAFETY_MS)
 
     after, after_lines = _read_panel()
     after_y = _title_y(after_lines, SUBSTAT_TITLE)
@@ -1623,10 +1656,12 @@ def apply_substat_filter(
     # _open_substat_section 返回「副属性区已展开」那一帧，状态与这里相同、中间无点击，
     # 直接复用，省掉一次全屏 OCR（约 1s）。
     frame = _open_substat_section(hwnd, width, height)
-    targets: list[str | int] = [*names, 1, 2, 3, 4]
+    # 2026-10-11 真机：数量按钮只在 ≤ 已选词条数时可用；只处理实际可选的数量键。
+    count_keys = list(range(1, min(4, len(names)) + 1))
+    targets: list[str | int] = [*names, *count_keys]
     expect: dict[str | int, bool] = {name: True for name in names}
-    # 重置态可能预选所有数量：低于下限的数量也要明确取消，不假定其状态。
-    expect.update({count: count in counts for count in range(1, 5)})
+    # 重置态可能预选数量：低于下限的数量也要明确取消，不假定其状态。
+    expect.update({count: count in counts for count in count_keys})
 
     ready, found = _inspect_substat_targets(frame[0], frame[1], names=names, counts=counts)
     if ready is not True:
@@ -1658,9 +1693,10 @@ def apply_substat_filter(
             x, y = (line.left + line.right) // 2, (line.top + line.bottom) // 2
             _refuse_dismantle(x, y, width, height)
             role = "substat_count" if isinstance(key, int) else "substat_option"
-            with input_context(role, target=key, selected=selected):
-                click_client(hwnd, x, y)
-            time.sleep(0.3)
+            with input_context(role, target=key, selected=selected, defer_post_release=True):
+                release = click_client(hwnd, x, y)
+            # 作者裁定：同动作连续点击为一组——组内 0 等待，最后一次后 50 ms。
+            wait_release(role, release, fallback_ms=_GROUP_TAIL_WAIT_MS if key == targets[-1] else 0)
             after, _ = _grab()  # 复核用抓图，不为该点击重做面板 OCR
             if _option_selected(after, line) != selected:
                 raise FilterClickError(f"副属性筛选选项 {key!r} 点击后未确认{'选中' if selected else '取消'}")

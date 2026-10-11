@@ -14,7 +14,7 @@ import pytest
 from zzz_ddtool import wininput
 from zzz_ddtool.hotkeys import RunnerStopped
 
-# spec §8.4：sink 原始字典的字段与顺序固定。
+# spec §2.1：sink 原始字典的字段与顺序固定（17 个）。
 FIELDS = (
     "t_ns",
     "event",
@@ -32,6 +32,7 @@ FIELDS = (
     "delta_units",
     "status",
     "error",
+    "released_at_ns",
 )
 
 NO_CONTEXT = (None, None, None, None)
@@ -46,6 +47,8 @@ def _no_windows(monkeypatch) -> None:
     monkeypatch.setattr(wininput, "focus_window", lambda hwnd: None)
     monkeypatch.setattr(wininput, "_send", lambda inputs: None)
     monkeypatch.setattr(wininput, "pause", lambda *a, **k: None)
+    # 收尾等待在观察用例里不真实睡（§4.1 的取值由 test_actionwait.py 验收）。
+    monkeypatch.setattr(wininput, "_post_release_wait", lambda seconds: None)
 
 
 def _collect(func, *args, **kwargs) -> list[dict[str, object]]:
@@ -113,6 +116,9 @@ def test_click_client_records_one_pair_with_target_center(monkeypatch):
         assert _context(event) == NO_CONTEXT
     assert isinstance(begin["t_ns"], int) and begin["t_ns"] > 0
     assert end["t_ns"] >= begin["t_ns"]
+    # §3.1：begin 为 null；正常返回的 end 记录实际释放时刻。
+    assert begin["released_at_ns"] is None
+    assert isinstance(end["released_at_ns"], int) and end["released_at_ns"] > 0
 
     with_alt = _collect(wininput.click_client, 4321, 640, 360, alt=True)
     assert [e["alt"] for e in with_alt] == [True, True]
@@ -235,6 +241,8 @@ def test_input_error_marks_failed_and_propagates(monkeypatch):
     assert end["status"] == "failed" and end["error"] == "InputError"
     assert end["call_id"] == begin["call_id"]
     assert (end["hwnd"], end["x"], end["y"], end["alt"]) == (7, 10, 20, False)
+    # 未到取时点失败：end 的释放时刻为 null（§3.1）。
+    assert end["released_at_ns"] is None
 
 
 def test_runner_stopped_in_call_marks_stopped_and_propagates(monkeypatch):

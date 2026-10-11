@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from collections import Counter
+from copy import deepcopy
+from final_evidence_fixture import PLAN, minimal_events, two_job_events
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "scripts" / "verify_spec.py"
-MEASURE = ROOT / "dev-docs" / "功能改造" / "扫描提速" / "scripts" / "measure_waits.py"
+SCRIPT = ROOT / "dev-docs" / "history" / "扫描提速" / "scripts" / "verify_spec.py"
+MEASURE = ROOT / "dev-docs" / "history" / "扫描提速" / "scripts" / "measure_waits.py"
 
 
 def _load(path: Path, name: str):
@@ -716,21 +719,7 @@ def _perf_event(event_id, component, *, job_index=None, disc_index=None,
 
 
 def final_perf_events():
-    """一份满足 §9.2 关联要求的最小真实事件集：run/disc/probe/wait 各一，run_id 一致。"""
-    return [
-        _perf_event("e00000001", "disc_total", job_index=0, disc_index=3, duration_ms=12.5,
-                    details={"input_sent": True, "outcome": "succeeded", "result": "done",
-                             "core": {"level": 0, "rarity": "S", "substats": []},
-                             "decisions": [{"job_id": "j1", "action": "skip", "reason": "r",
-                                            "score": 1.0, "level": 0}]}),
-        _perf_event("e00000002", "probe", job_index=0, disc_index=3,
-                    details={"kind": "select_disc", "wait_id": "e00000003"}),
-        _perf_event("e00000003", "wait_total", job_index=0, disc_index=3,
-                    details={"kind": "select_disc", "outcome": "succeeded"}),
-        _perf_event("e00000004", "run_total", duration_ms=900.0,
-                    details={"runner_outcome": "completed", "termination_kind": "completed",
-                             "end_reason": "已处理 1 个盘"}),
-    ]
+    return minimal_events(FINAL_RUN_ID)
 
 
 def write_perf(gate, events):
@@ -743,7 +732,7 @@ def write_perf(gate, events):
 @pytest.fixture
 def final_gate(gate):
     config = gate.root / "plan.yaml"
-    config.write_text("max_pages: 3\n", encoding="utf-8")
+    config.write_text(json.dumps(PLAN), encoding="utf-8")
     perf = gate.root / "perf.jsonl"
     gate.config_rel = "plan.yaml"
     gate.config_path = config
@@ -764,50 +753,26 @@ def final_coverage():
              "label_unlock_before_discard", "maxed_refund", "material_shortfall")}
 
 
-def final_body(gate, **over):
+def final_body(gate, *, events=None, **over):
+    events = final_perf_events() if events is None else events
+    root = events[-1]
     config_sha = vs.sha256_file(gate.config_path)
     body = {
-        "schema_version": 1,
-        "spec_sha256": vs.sha256_file(gate.spec),
-        "execution_identity": dict(gate.identity),
-        "run_id": FINAL_RUN_ID,
+        "schema_version": 1, "spec_sha256": vs.sha256_file(gate.spec),
+        "execution_identity": dict(gate.identity), "run_id": FINAL_RUN_ID,
         "environment": {"machine_id": "m" * 8, "client_width": 1920, "client_height": 1080,
                         "window_dpi": 96, "game_exe_path": "c:/game/z.exe", "game_build": "1"},
-        "config_path": gate.config_rel,
-        "config_sha256_before": config_sha,
+        "config_path": gate.config_rel, "config_sha256_before": config_sha,
         "config_sha256_after": config_sha,
-        "wait_profile_status": {"status": "default", "profile_path": "user/scan-waits.json",
-                                "profile_sha256": None},
-        "effective_policies": {"select_disc": {"min_wait_ms": 500, "timeout_ms": 3000,
-                                               "poll_ms": 50, "stable_frames": 2}},
-        "jobs": [{"job_index": 0, "job_id": "j1", "slot": 1, "sets": [], "mainstats": [],
-                  "accepted": 0, "max_discs": 3000, "quota_effective": 3000,
-                  "labels": {"save": False, "discard": False},
-                  "skipped": False, "processed": 1, "end_reason": "exhausted"}],
-        "discs": [{"job_index": 0, "disc_index": 3, "event_id": "e00000001",
-                   "duration_ms": 12.5, "input_sent": True, "result": "done",
-                   "outcome": "succeeded", "core": {"level": 0, "rarity": "S", "substats": []},
-                   "decisions": [{"job_id": "j1", "action": "skip", "reason": "r",
-                                  "score": 1.0, "level": 0}]}],
-        "timing": {"run_total_event_id": "e00000004", "run_duration_ms": 900.0,
-                   "first_parse_event_id": None, "disc_event_ids": ["e00000001"],
-                   "capture_count": 0, "png_save_count": 0, "parse_total_count": 0,
-                   "waits": [{"event_id": "e00000003", "kind": "select_disc",
-                              "outcome": "succeeded", "job_index": 0, "disc_index": 3,
-                              "parent_id": None, "trigger_input_id": None,
-                              "upgrade_input_id": None, "resume_from_wait_id": None}]},
-        "coverage": final_coverage(),
-        "perf_file": gate.perf_rel,
-        "component_counts": {"disc_total": 1, "probe": 1, "wait_total": 1, "run_total": 1},
-        "processed_discs": 1,
-        "runner_outcome": "completed",
-        "termination_kind": "completed",
-        "end_reason": "已处理 1 个盘",
-        "run_total": {"runner_outcome": "completed", "termination_kind": "completed",
-                      "end_reason": "已处理 1 个盘"},
-        "coverage_status": "sufficient",
-        "evidence_complete": True,
-        "passed": True,
+        "wait_profile_status": {"status": "default", "profile_path": "user/scan-waits.json", "profile_sha256": None},
+        "effective_policies": {"select_disc": {"min_wait_ms": 500, "timeout_ms": 3000, "poll_ms": 50, "stable_frames": 2}},
+        "jobs": deepcopy(root["details"]["jobs"]), "discs": mw._final_discs(events),
+        "timing": mw._final_timing(events, {}, root),
+        "coverage": mw._final_coverage(events, FINAL_RUN_ID, [], None, root["event_id"]),
+        "perf_file": gate.perf_rel, "component_counts": dict(Counter(e["component"] for e in events)),
+        "processed_discs": mw._final_processed(events), "runner_outcome": "completed",
+        "termination_kind": "completed", "end_reason": "已处理 1 个盘", "run_total": deepcopy(root["details"]),
+        "coverage_status": "sufficient", "evidence_complete": True, "passed": True,
     }
     body.update(over)
     return body
@@ -954,17 +919,12 @@ def test_check_final_fails_f6_when_processed_discs_is_tampered(final_gate):
 
 def test_check_final_counts_discs_by_job_identity_across_jobs(final_gate):
     """跨任务全局索引可重复：不同任务的同一 disc_index 是两盘，不能按裸索引合并。"""
-    events = final_perf_events()
-    events.insert(1, _perf_event(
-        "e00000005", "disc_total", job_index=1, disc_index=3, duration_ms=9.0,
-        details={"input_sent": True, "outcome": "succeeded", "result": "done",
-                 "core": {"level": 0, "rarity": "A", "substats": []}, "decisions": []}))
+    events = two_job_events(FINAL_RUN_ID)
+    plan = deepcopy(PLAN)
+    plan["task_chain"].append(dict(plan["task_chain"][0], id="j2"))
+    final_gate.config_path.write_text(json.dumps(plan), encoding="utf-8")
     write_perf(final_gate, events)
-    body = final_body(final_gate, processed_discs=2)
-    body["discs"].append({"job_index": 1, "disc_index": 3, "event_id": "e00000005",
-                          "duration_ms": 9.0, "input_sent": True, "result": "done",
-                          "outcome": "succeeded",
-                          "core": {"level": 0, "rarity": "A", "substats": []}, "decisions": []})
+    body = final_body(final_gate, events=events, processed_discs=2)
     write_final(final_gate, body)
 
     by_id = checks_by_id(vs.check_final()[0])
@@ -1031,3 +991,62 @@ def test_check_final_requires_evidence_complete_for_sufficient_coverage(final_ga
     write_final(final_gate, final_body(final_gate, evidence_complete=False))
 
     assert checks_by_id(vs.check_final()[0])["F6"]["passed"] is False
+
+
+@pytest.mark.parametrize("field", ["jobs", "discs", "timing"])
+def test_final_rejects_deleted_execution_evidence(final_gate, field):
+    body = final_body(final_gate)
+    body[field] = {} if field == "timing" else []
+    write_final(final_gate, body)
+    assert not vs.check_final()[2]
+
+
+@pytest.mark.parametrize("change", ["trigger", "decision", "input", "interval", "quota"])
+def test_final_rejects_broken_actual_links(final_gate, change):
+    body = final_body(final_gate)
+    if change == "trigger":
+        body["timing"]["waits"][0]["trigger_input_id"] = "invented"
+    elif change == "decision":
+        body["discs"][0]["decisions"][0]["decision"]["useful_types"] = 99
+    elif change == "input":
+        body["discs"][0]["inputs"] = []
+    elif change == "interval":
+        body["discs"][0]["ended_at"] += 1
+    else:
+        body["jobs"][0]["quota_effective"] = 1
+    write_final(final_gate, body)
+    assert not vs.check_final()[2]
+
+
+def test_final_rejects_phantom_input_even_when_report_and_events_agree(final_gate):
+    events = final_perf_events()
+    events[-1]["details"]["inputs"] = []
+    events[0]["details"]["inputs"] = []
+    write_perf(final_gate, events)
+    write_final(final_gate, final_body(final_gate, events=events))
+    checks, _, passed = vs.check_final()
+    assert not passed
+    assert not checks_by_id(checks)["F6"]["passed"]
+
+
+def test_final_checks_raw_yaml_quota_before_loader_clamp(final_gate):
+    plan = deepcopy(PLAN)
+    plan["task_chain"][0]["max_discs"] = 0
+    final_gate.config_path.write_text(json.dumps(plan), encoding="utf-8")
+    write_final(final_gate, final_body(final_gate))
+    assert not checks_by_id(vs.check_final()[0])["F3"]["passed"]
+
+
+@pytest.mark.parametrize("change", ["api", "target", "wait_kind"])
+def test_final_rejects_wrong_actual_operation_even_when_projection_matches(final_gate, change):
+    events = final_perf_events()
+    item = events[-1]["details"]["inputs"][0]
+    if change == "api":
+        item["api"] = "press_key_once"
+    elif change == "target":
+        item["target"]["x"] += 1
+    else:
+        next(e for e in events if e["component"] == "wait_total")["details"]["kind"] = "open_preview"
+    write_perf(final_gate, events)
+    write_final(final_gate, final_body(final_gate, events=events))
+    assert not checks_by_id(vs.check_final()[0])["F6"]["passed"]

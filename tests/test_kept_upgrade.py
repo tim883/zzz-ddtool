@@ -8,6 +8,7 @@ import pytest
 from PySide6.QtGui import QImage
 
 from zzz_ddtool import runner as rm, wininput
+from zzz_ddtool.actionwait import InputRelease
 from zzz_ddtool.config import LabelPolicy, Preset
 from zzz_ddtool.capture import CaptureError
 from zzz_ddtool.control import checkpoint_input, controlled_inputs
@@ -31,14 +32,16 @@ def setup(monkeypatch, fast_wait):
     monkeypatch.setattr(runner, "_grab", Mock(return_value=(image, "drive_disc", "test", 1)))
 
     def fake_upgrade_once(hwnd, material_slot=0, *, before=None):
-        # 替身升级输入：按 §6.2 记录升级时刻，供 _await_upgrade_result 使用。
-        runner._upgrade_started_at = rm.time.monotonic()
+        # 替身升级输入：按 §6.2 记录升级释放回执，供 _await_upgrade_result 使用。
+        runner._upgrade_release = InputRelease("click_client", int(rm.time.monotonic() * 1e9))
         return True
 
     monkeypatch.setattr(runner, "_upgrade_once", fake_upgrade_once)
     back = Mock(return_value=True)
     monkeypatch.setattr(runner, "_esc_back_to_grid", back)
     monkeypatch.setattr(rm.time, "sleep", lambda _: None)
+    # §4.3 释放下限由 wait_release 消费；本组用例验业务语义，替换掉计时。
+    monkeypatch.setattr(rm, "wait_release", lambda *args, **kwargs: None)
     state = [kept_disc()]
     parser = Mock(side_effect=lambda _image: state[0])
     monkeypatch.setattr(rm, "parse_disc", parser)

@@ -1,12 +1,19 @@
 """取消必须拦住下一次真实输入；所有 Windows 接口都用替身。"""
 
 import threading
+import time
 from unittest.mock import Mock
 
 import pytest
 
 from zzz_ddtool import hotkeys, wininput
-from zzz_ddtool.control import checkpoint_input, controlled_inputs, validated_inputs
+from zzz_ddtool.control import (
+    checkpoint_control,
+    checkpoint_input,
+    controlled_inputs,
+    input_pause_intervals,
+    validated_inputs,
+)
 from zzz_ddtool.hotkeys import HotkeyController, RunnerStopped
 
 
@@ -132,3 +139,23 @@ def test_generation_change_rejects_internal_boundary_before_native_input():
             checkpoint_input()
             native()
     native.assert_not_called()
+
+
+def test_pause_query_validates_seconds_and_never_calls_back_on_bad_input():
+    """§2.1：非有限/负数/区间反了/误传纳秒都抛 ValueError，且不调用 pauses 回调。"""
+    pauses = Mock(return_value=((1.0, 2.0),))
+    with controlled_inputs(lambda: None, pauses=pauses):
+        assert input_pause_intervals(0.0, time.monotonic()) == ((1.0, 2.0),)
+        for bad in ((0.0, 1e13), (2.0, 1.0), (-1.0, 1.0), (float("nan"), 1.0), (0.0, float("inf"))):
+            with pytest.raises(ValueError):
+                input_pause_intervals(*bad)
+    assert pauses.call_count == 1
+
+
+def test_checkpoint_control_skips_input_validation():
+    """§3.2：纯等待分片只触发控制回调，不重复触发输入前业务复验。"""
+    validate = Mock()
+    with controlled_inputs(lambda: 3), validated_inputs(validate, reuse_unchanged=True):
+        assert checkpoint_control() == 3
+        assert checkpoint_control() == 3
+    validate.assert_not_called()

@@ -25,6 +25,7 @@ from PySide6.QtGui import QImage
 from zzz_ddtool import gamefilter as gf
 from zzz_ddtool import ocr
 from zzz_ddtool import wininput
+from zzz_ddtool.actionwait import InputRelease
 from zzz_ddtool.filter_replay import (
     FilterReplaySession,
     SetPickerClick,
@@ -415,25 +416,36 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch, stub: _PickerStub, *, passthr
     def _click(_hwnd, x, y):
         checkpoint_input()  # 与 wininput.click_client 一致：暂停/停止先过检查点
         if passthrough:
-            wininput.click_client(_hwnd, x, y)
+            result = wininput.click_client(_hwnd, x, y)
+        else:
+            result = InputRelease("click_client", 0)
         stub.clicks.append((x, y))
         stub.apply_click(x, y)
+        return result
 
     def _wheel(_hwnd, x, y, delta=-3):
         checkpoint_input()
         if passthrough:
-            wininput.wheel_client(_hwnd, x, y, delta)
+            result = wininput.wheel_client(_hwnd, x, y, delta)
+        else:
+            result = InputRelease("wheel_client", 0)
         stub.wheels.append((x, y, delta))
         stub.apply_wheel()
+        return result
 
     def _key(_hwnd, vk):
         if passthrough:
-            wininput.press_key(_hwnd, vk)
+            result = wininput.press_key(_hwnd, vk)
+        else:
+            result = InputRelease("press_key", 0)
         stub.keys.append(vk)
+        return result
 
     monkeypatch.setattr(gf, "click_client", _click)
     monkeypatch.setattr(gf, "wheel_client", _wheel)
     monkeypatch.setattr(gf, "press_key", _key)
+    # §4.2 释放预算在 gamefilter 内由 wait_release 消费；本组用例只验动作/痕迹，替换掉计时。
+    monkeypatch.setattr(gf, "wait_release", lambda *args, **kwargs: None)
 
 
 def _layout() -> SetPickerLayout:

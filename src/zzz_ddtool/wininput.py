@@ -14,8 +14,9 @@ user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 advapi32 = ctypes.windll.advapi32
 
+from zzz_ddtool.actionwait import InputRelease, WaitReceipt, record_wait_receipt
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.control import checkpoint_input
+from zzz_ddtool.control import checkpoint_control, checkpoint_input, input_pause_intervals
 from zzz_ddtool.hotkeys import RunnerStopped
 
 _input_log = get_logger("zzz_ddtool.wininput")
@@ -115,6 +116,16 @@ class _InputContext(NamedTuple):
     target: str | int | None
     stage_index: int | None
     selected: bool | None
+    defer_post_release: bool
+
+
+class _ObserveHandle:
+    """一次输入调用的释放时刻载体：由输入函数在取时点写入，记录器在 end 行读取。"""
+
+    __slots__ = ("released_at_ns",)
+
+    def __init__(self) -> None:
+        self.released_at_ns: int | None = None
 
 
 _input_sink: ContextVar[Callable[[dict[str, object]], None] | None] = ContextVar(
@@ -145,7 +156,7 @@ def _new_record(
     vk: int | None,
     delta_units: int | None,
 ) -> dict[str, object]:
-    """构造 begin 行；字段固定为 spec §8.4 的 16 个，顺序固定。"""
+    """构造 begin 行；字段固定为 spec §2.1 的 17 个，顺序固定。"""
     return {
         "t_ns": time.monotonic_ns(),
         "event": "begin",
@@ -163,17 +174,21 @@ def _new_record(
         "delta_units": delta_units,
         "status": "started",
         "error": None,
+        "released_at_ns": None,
     }
 
 
-def _end_record(begin: dict[str, object], status: str, error: str | None) -> dict[str, object]:
-    """end 行保留同一调用的全部参数（与 begin 一致），只换时间/事件/状态/错误。"""
+def _end_record(
+    begin: dict[str, object], status: str, error: str | None, *, released_at_ns: int | None
+) -> dict[str, object]:
+    """end 行保留同一调用的全部参数（与 begin 一致），只换时间/事件/状态/错误与释放时刻。"""
     return {
         **begin,
         "t_ns": time.monotonic_ns(),
         "event": "end",
         "status": status,
         "error": error,
+        "released_at_ns": released_at_ns,
     }
 
 
@@ -187,11 +202,12 @@ def _observe_input(
     alt: bool | None = None,
     vk: int | None = None,
     delta_units: int | None = None,
-) -> Iterator[None]:
-    """包住一次逻辑输入调用。未启用 capture_inputs 时不取 call_id、不发事件。"""
+) -> Iterator[_ObserveHandle]:
+    """包住一次逻辑输入调用，并给出释放时刻载体。未启用 capture_inputs 时不取 call_id、不发事件。"""
+    handle = _ObserveHandle()
     sink = _input_sink.get()
     if sink is None:
-        yield
+        yield handle
         return
     ctx = _input_context.get()
     begin = _new_record(
@@ -209,17 +225,17 @@ def _observe_input(
     )
     sink(begin)
     try:
-        yield
+        yield handle
     except BaseException as exc:
         status = "stopped" if isinstance(exc, RunnerStopped) else "failed"
         try:
-            sink(_end_record(begin, status, type(exc).__name__))
+            sink(_end_record(begin, status, type(exc).__name__, released_at_ns=handle.released_at_ns))
         except Exception:
             # 观察回调自己出错也不能改变输入语义：原异常必须原样传播。
             _input_log.exception("输入观察回调上报失败时抛异常，已忽略以保留原异常")
         raise
     else:
-        sink(_end_record(begin, "completed", None))
+        sink(_end_record(begin, "completed", None, released_at_ns=handle.released_at_ns))
 
 
 @contextmanager
@@ -242,12 +258,17 @@ def input_context(
     target: str | int | None = None,
     stage_index: int | None = None,
     selected: bool | None = None,
+    defer_post_release: bool = False,
 ) -> Iterator[None]:
     """给当前执行上下文里的输入附加角色元数据；可嵌套，退出时恢复前值。
 
-    元数据只用于观察记录，不改变坐标、动作或既有匹配行为。
+    defer_post_release=False 时输入层拥有收尾等待（§4.1 确定值）；True 时调用方
+    拥有收尾等待，不得漏等（§3.2）。元数据只用于观察记录与等待所有权，不改变
+    坐标、动作或既有匹配行为。
     """
-    token = _input_context.set(_InputContext(role, target, stage_index, selected))
+    token = _input_context.set(
+        _InputContext(role, target, stage_index, selected, defer_post_release)
+    )
     try:
         yield
     finally:
@@ -397,10 +418,69 @@ def _key_event(vk: int, *, up: bool = False, scancode: bool = False) -> INPUT:
     return INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(vk, scan, flags, 0, None)))
 
 
-def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
+#: spec §4.1：输入层拥有的收尾等待（旧收尾请求的保守上界，不是测量值）。
+_POST_RELEASE_MS = {
+    "click_client": 180,
+    "wheel_client": 330,
+    "press_key_once": 580,
+    "press_key": 650,
+    "send_wheel_event": 0,
+}
+
+
+def _post_release_wait(seconds: float) -> float:
+    """输入层收尾等待：确定值、分片不超过 20 ms、片前后检查停止/暂停（§3.2）。
+
+    返回实际请求的睡眠总和（ms），供 §7.1 的 release_wait 明细使用。
+    """
+    end = time.monotonic() + max(0.0, seconds)
+    requested_ms = 0.0
+    while True:
+        checkpoint_control()
+        remaining = end - time.monotonic()
+        if remaining <= 1e-6:  # 浮点残差容差：不空转
+            return requested_ms
+        shard = min(0.02, remaining)
+        requested_ms += shard * 1000.0
+        time.sleep(shard)
+
+
+def _defer_post_release() -> bool:
+    ctx = _input_context.get()
+    return bool(ctx.defer_post_release) if ctx is not None else False
+
+
+def _finish_release(handle: _ObserveHandle, api: str) -> InputRelease:
+    """取时（§3.1：早于收尾等待、日志、抓图和观察回调），再按所有权执行收尾等待。"""
+    released_at_ns = time.monotonic_ns()
+    handle.released_at_ns = released_at_ns
+    seconds = _POST_RELEASE_MS[api] / 1000.0
+    defer = _defer_post_release()
+    requested_ms = 0.0
+    if not defer:
+        requested_ms = _post_release_wait(seconds) if seconds > 0 else 0.0
+        # §7.1：输入层自己拥有的收尾同样形成真实明细（未启用收集器时丢弃）。
+        end = time.monotonic()
+        release_s = released_at_ns / 1_000_000_000
+        pauses = input_pause_intervals(release_s, end)
+        paused = sum(float(b) - float(a) for a, b in pauses)
+        record_wait_receipt(
+            WaitReceipt(
+                released_at_ns=released_at_ns,
+                action_id=None,
+                floor_ms=_POST_RELEASE_MS[api],
+                policy_source="default",
+                requested_sleep_ms=requested_ms,
+                active_elapsed_ms=max(0.0, (end - release_s) - paused) * 1000.0,
+            )
+        )
+    return InputRelease(api=api, released_at_ns=released_at_ns)
+
+
+def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> InputRelease:
     """Foreground click, same idea as OneDragon: move cursor then mouse down/up."""
     checkpoint_input()
-    with _observe_input("click_client", hwnd=hwnd, x=x, y=y, alt=alt):
+    with _observe_input("click_client", hwnd=hwnd, x=x, y=y, alt=alt) as handle:
         _input_log.info("click (%d,%d) alt=%s", x, y, alt)
         sx, sy = client_to_screen(hwnd, x + randint(-2, 2), y + randint(-2, 2))
         focus_window(hwnd)
@@ -415,27 +495,26 @@ def click_client(hwnd: int, x: int, y: int, alt: bool = False) -> None:
         if alt:
             pause(0.04, 0.08)
             _send([_key_event(VK_MENU, up=True)])
-        pause()
+        return _finish_release(handle, "click_client")
 
 
-def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> None:
+def wheel_client(hwnd: int, x: int, y: int, delta: int = -3) -> InputRelease:
     """把光标移到窗口客户区 (x,y) 后滚动。delta 负数向下翻页。一格约 120。
 
-    保持既有调用兼容（一次缩放 delta、自带聚焦/移光标/随机等待）。批量按行
+    保持既有调用兼容（一次缩放 delta、自带聚焦/移光标与收尾等待）。批量按行
     发送请用 send_wheel_event，不要用这个。"""
     checkpoint_input()
-    with _observe_input("wheel_client", hwnd=hwnd, x=x, y=y, delta_units=delta):
+    with _observe_input("wheel_client", hwnd=hwnd, x=x, y=y, delta_units=delta) as handle:
         _input_log.info("wheel (%d,%d) delta=%d", x, y, delta)
         sx, sy = client_to_screen(hwnd, x, y)
         focus_window(hwnd)
         user32.SetCursorPos(sx, sy)
         pause(0.04, 0.08)
         user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta * 120, 0)
-        time.sleep(0.15)
-        pause()
+        return _finish_release(handle, "wheel_client")
 
 
-def send_wheel_event(delta_units: int) -> None:
+def send_wheel_event(delta_units: int) -> InputRelease:
     """只发送一条原始滚轮事件（spec §5.2）。
 
     不聚焦、不移光标、不做随机等待、不发多条。调用方（scroll_rows）负责
@@ -447,28 +526,28 @@ def send_wheel_event(delta_units: int) -> None:
     if delta_units == 0:
         raise InputError("滚轮事件格数不能为 0。")
     checkpoint_input()
-    with _observe_input("send_wheel_event", delta_units=delta_units):
+    with _observe_input("send_wheel_event", delta_units=delta_units) as handle:
         _input_log.info("wheel_event delta_units=%d", delta_units)
         user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_units * 120, 0)
+        return _finish_release(handle, "send_wheel_event")
 
 
-def press_key_once(hwnd: int, vk: int) -> None:
+def press_key_once(hwnd: int, vk: int) -> InputRelease:
     """只按一次键（down+up 一对）。R 弃置这类开关型键必须用这个：
     press_key 会发多对 down/up，R 按奇数次才有效，偶数次等于没按。"""
     checkpoint_input()
-    with _observe_input("press_key_once", hwnd=hwnd, vk=vk):
+    with _observe_input("press_key_once", hwnd=hwnd, vk=vk) as handle:
         _input_log.info("key_once vk=0x%02X", vk)
         focus_window(hwnd)
         _send([_key_event(vk), _key_event(vk, scancode=True)])
         time.sleep(0.05)
         _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
-        time.sleep(0.03)
-        pause(0.35, 0.55)
+        return _finish_release(handle, "press_key_once")
 
 
-def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
+def press_key(hwnd: int, vk: int = VK_ESCAPE) -> InputRelease:
     checkpoint_input()
-    with _observe_input("press_key", hwnd=hwnd, vk=vk):
+    with _observe_input("press_key", hwnd=hwnd, vk=vk) as handle:
         _input_log.info("key vk=0x%02X", vk)
         scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) or SCAN_ESCAPE
         focus_window(hwnd)
@@ -480,4 +559,4 @@ def press_key(hwnd: int, vk: int = VK_ESCAPE) -> None:
         _send([_key_event(vk, up=True), _key_event(vk, up=True, scancode=True)])
         user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 1)
         user32.PostMessageW(hwnd, WM_KEYUP, vk, 1 | (1 << 30) | (1 << 31))
-        pause(0.45, 0.65)
+        return _finish_release(handle, "press_key")

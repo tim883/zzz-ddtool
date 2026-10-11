@@ -25,6 +25,12 @@ def line(text: str, cx: int, cy: int, w: int = 60, h: int = 28) -> OcrLine:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_release_timing(monkeypatch):
+    """§4.2 释放预算在 gamefilter 内由 wait_release 消费；本组用例只验动作/坐标，替换掉计时。"""
+    monkeypatch.setattr(gf, "wait_release", lambda *args, **kwargs: None)
+
+
 # 面板滚到底 + 主属性区已展开（坐标取自 probe-slot4.png 的真机 OCR）
 PANEL_EXPANDED = [
     line("分区", 1320, 350),
@@ -58,6 +64,8 @@ def _stub(monkeypatch, frames, clicks, wheels, frames_are_fn=False):
     monkeypatch.setattr(gf, "_text_lines", frames if frames_are_fn else (lambda: list(frames)))
     monkeypatch.setattr(gf, "click_client", lambda hwnd, x, y: clicks.append((x, y)))
     monkeypatch.setattr(gf, "wheel_client", lambda hwnd, x, y: wheels.append((x, y)))
+    # §4.2 释放预算在 gamefilter 内由 wait_release 消费；本组用例只验动作/坐标，替换掉计时。
+    monkeypatch.setattr(gf, "wait_release", lambda *args, **kwargs: None)
     monkeypatch.setattr(gf.time, "sleep", lambda seconds: None)
 
 
@@ -127,16 +135,41 @@ def test_open_mainstat_section_scrolls_until_title_visible(monkeypatch) -> None:
 
 
 def test_open_mainstat_section_raises_when_toggle_missing(monkeypatch) -> None:
-    """标题在但开关认不上：直接中断，不瞎滚。"""
+    """标题在但开关一直认不上：按 §4.2 先向下滚重读，滚满轮数仍不行才中断。"""
     clicks: list[tuple[int, int]] = []
     wheels: list[tuple[int, int]] = []
     _stub(monkeypatch, [line("主属性词条", 1349, 570, w=105)], clicks, wheels)
 
-    with pytest.raises(FilterClickError):
+    with pytest.raises(FilterClickError, match="滚动面板"):
         gf._open_mainstat_section(1, 1920, 1080)
 
     assert clicks == []
-    assert wheels == []
+    assert len(wheels) == gf._MAX_PANEL_SCROLLS
+
+
+def test_open_mainstat_section_scrolls_when_toggle_clipped(monkeypatch) -> None:
+    """标题露出但开关被裁在底部点击无效带外（S5 轮次 2 真机）：滚一轮后开关可点即展开。"""
+    clicks: list[tuple[int, int]] = []
+    wheels: list[tuple[int, int]] = []
+    seq = [
+        [line("主属性词条", 1349, 908, w=105), line("点击展开", 1563, 962, w=80)],
+        [line("主属性词条", 1349, 570, w=105), line("点击展开", 1563, 624, w=80)],
+        [line("主属性词条", 1349, 570, w=105), line("点击收起", 1563, 624, w=80)],
+    ]
+    state = {"index": 0}
+
+    def frames():
+        index = min(state["index"], len(seq) - 1)
+        state["index"] += 1
+        return list(seq[index])
+
+    _stub(monkeypatch, frames, clicks, wheels, frames_are_fn=True)
+
+    result = gf._open_mainstat_section(1, 1920, 1080)
+
+    assert len(wheels) == 1
+    assert len(clicks) == 1
+    assert result == seq[2]
 
 
 def test_open_mainstat_section_scrolls_before_clicking_bottom_toggle(monkeypatch) -> None:

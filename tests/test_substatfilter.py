@@ -29,7 +29,8 @@ def test_double_crit_uses_two_through_four():
     ))
     plan = plan_substat_filter(preset)
     assert set(plan.names) == {"暴击率", "暴击伤害"}
-    assert plan.counts == (2, 3, 4)
+    # 只有 2 个词条时游戏只允许数量 ≤ 2：minimum..词条数 与 ≥minimum 等价（2026-10-11 真机）。
+    assert plan.counts == (2,)
 
 
 def test_alternatives_need_full_union_and_shared_minimum():
@@ -38,7 +39,7 @@ def test_alternatives_need_full_union_and_shared_minimum():
     ))
     plan = plan_substat_filter(preset)
     assert set(plan.names) == set(WEIGHTS)
-    assert plan.counts == (2, 3, 4)
+    assert plan.counts == (2, 3)
     # 游戏条件可以多筛，最终白名单仍然拒绝另一种两两组合。
     disc = Disc(0, (Substat("暴击伤害"), Substat("穿透值"), Substat("防御力")))
     assert plan.matches(sub.name for sub in disc.substats)
@@ -49,7 +50,7 @@ def test_single_crit_remains_after_adding_second_crit():
     preset = Preset(weights=WEIGHTS, accepted=(pid(("暴击率",)), pid(("暴击伤害",))))
     plan = plan_substat_filter(preset)
     assert set(plan.names) == {"暴击率", "暴击伤害"}
-    assert plan.counts == (1, 2, 3, 4)
+    assert plan.counts == (1, 2)
     assert plan.matches(("暴击率", "生命值", "防御力"))
     assert plan.matches(("暴击率", "生命值", "防御力", "暴击伤害"))
 

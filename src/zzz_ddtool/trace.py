@@ -97,10 +97,10 @@ def action_name(action: str) -> str:
 class Trace:
     """一轮运行的步骤跟踪：每步一条日志 + 一张图，容量按策略回收。"""
 
-    def __init__(self, tag: str = "") -> None:
+    def __init__(self, tag: str = "", *, dir: Path | None = None) -> None:
         self.tag = tag or time.strftime("%Y%m%d-%H%M%S")
         self._step = 0
-        self._dir: Path | None = None
+        self._dir: Path | None = Path(dir) if dir is not None else None
         self.failed = False
         self._disc_no = 0  # 当前在处理第几个盘（0=还没进盘）
         self._shots: list[Path] = []  # 本轮存过的图，收尾时用来算数
@@ -112,7 +112,7 @@ class Trace:
     def dir(self) -> Path:
         if self._dir is None:
             self._dir = captures_dir() / self.tag
-            self._dir.mkdir(parents=True, exist_ok=True)
+        self._dir.mkdir(parents=True, exist_ok=True)
         return self._dir
 
     @property

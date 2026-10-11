@@ -17,6 +17,7 @@ import zzz_ddtool.screen as screen_module
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
+from zzz_ddtool.actionwait import InputRelease
 from zzz_ddtool.models import MAX_LEVEL, Action, Disc, Substat
 from zzz_ddtool.patterns import enumerate_filtered
 from zzz_ddtool.taskcards import effective_weights
@@ -60,17 +61,28 @@ def generated_preset(**kwargs):
 
 
 def upgrade_once_stub(runner):
-    """替身升级输入：按 §6.2 记录升级时刻，供 _await_upgrade_result 使用。
+    """替身升级输入：按 §6.2 记录升级释放回执，供 _await_upgrade_result 使用。
 
-    返回一个 Mock，既可断言调用次数，又能在被调用时写入 ``_upgrade_started_at``，
-    使 §6.1 的取时刻契约在离线替身下仍然成立。
+    返回一个 Mock，既可断言调用次数，又能在被调用时写入 ``_upgrade_release``，
+    使 §4.3 的释放点契约在离线替身下仍然成立。
     """
 
     def _fn(hwnd, material_slot=0, *, before=None):
-        runner._upgrade_started_at = runner_module.time.monotonic()
+        runner._upgrade_release = InputRelease(
+            "click_client", int(runner_module.time.monotonic() * 1e9)
+        )
         return True
 
     return Mock(side_effect=_fn)
+
+
+@pytest.fixture(autouse=True)
+def _release_timing_stub(monkeypatch):
+    """§4 释放等待在本文件的业务用例里只验调用链，替换掉计时。
+
+    真实计时/分片/暂停语义由 tests/test_actionwait.py 与 tests/test_runner_waits.py 覆盖。
+    """
+    monkeypatch.setattr(runner_module, "wait_release", lambda *args, **kwargs: None)
 
 
 def make_cell(global_row0, col, screen_row0, level=0):
@@ -1089,9 +1101,10 @@ def test_auto_substat_filter_is_applied_for_each_task(offline_runner, monkeypatc
     assert runner.outcome == "completed"
     filters = offline_runner["apply_game_filter"].call_args_list
     assert set(filters[0].kwargs["substats"]) == {"暴击率", "暴击伤害"}
-    assert filters[0].kwargs["substat_counts"] == (2, 3, 4)
+    # 数量只能选到已选词条数（2026-10-11 真机）：2 个词条 → 数量 2。
+    assert filters[0].kwargs["substat_counts"] == (2,)
     assert filters[1].kwargs["substats"] == ("穿透值",)
-    assert filters[1].kwargs["substat_counts"] == (1, 2, 3, 4)
+    assert filters[1].kwargs["substat_counts"] == (1,)
 
 
 def test_disabled_labels_suppress_all_discard_changes_but_return_to_grid(offline_runner, monkeypatch):
@@ -1223,7 +1236,9 @@ def test_return_failure_fails_entire_chain(offline_runner, monkeypatch, level, r
     monkeypatch.setattr(ocr_module, "parse_disc_upgrade_page", lambda image: disc)
 
     def once(hwnd, material_slot=0, *, before=None):
-        runner._upgrade_started_at = runner_module.time.monotonic()
+        runner._upgrade_release = InputRelease(
+            "click_client", int(runner_module.time.monotonic() * 1e9)
+        )
         state["page"] = "menu"  # 升级后回退时停在主菜单
         return True
 
@@ -2219,7 +2234,7 @@ def test_first_upgrade_reuses_only_once_and_times_full_stage(offline_runner, mon
     def upgrade(hwnd, material_slot=0, *, before=None):
         events.append("upgrade")
         clock[0] += 3
-        runner._upgrade_started_at = clock[0]
+        runner._upgrade_release = InputRelease("click_client", int(clock[0] * 1e9))
         return True
 
     def parse(image):

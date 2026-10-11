@@ -147,7 +147,7 @@ def fast_wait(monkeypatch):
     ``test_readiness.py`` 与 ``test_runner_waits.py`` 用显式模拟时钟直接断言
     （§8：不得把 ``_wait_ready`` 全部固定成成功）。这里只表语义，不当运行依赖。
     """
-    from zzz_ddtool import readiness
+    from zzz_ddtool import actionwait, readiness
     from zzz_ddtool.runner import Runner
 
     wrong = {"menu", "storage", "overworld"}
@@ -157,7 +157,7 @@ def fast_wait(monkeypatch):
             message, last_sample=None, active_ms=0.0, samples=1, pause_generation=None
         )
 
-    def fast_wait_ready(self, kind, *, started_at, before=None, before_frame=None,
+    def fast_wait_ready(self, kind, *, release, before=None, before_frame=None,
                         cell=None, expected_level=None, **kwargs):
         if kind == "select_disc":
             frame, page, *_ = self._grab(allow_esc=False)
@@ -184,7 +184,7 @@ def fast_wait(monkeypatch):
 
     monkeypatch.setattr(Runner, "_wait_ready", fast_wait_ready)
     monkeypatch.setattr(
-        Runner, "_wait_policy", lambda self, kind: readiness.WaitPolicy(0, 1000, 50, 2)
+        Runner, "_wait_policy", lambda self, kind: actionwait.ActionWaitPolicy(0, "default")
     )
     # 返回层级替身默认「已在仓库」，使离线 _esc_back_to_grid 不按 Esc 直接返回。
     monkeypatch.setattr(Runner, "_return_layer", lambda self, image: "warehouse")
