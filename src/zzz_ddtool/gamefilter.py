@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -11,8 +12,8 @@ from types import SimpleNamespace
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool.capture import grab_game_image, window_pid
-from zzz_ddtool.control import validated_inputs
+from zzz_ddtool.capture import client_size, find_game_hwnd, grab_game_image, window_pid
+from zzz_ddtool.control import checkpoint_control, validated_inputs
 from zzz_ddtool.filter_replay import (
     FilterEvidence,
     FilterReplaySession,
@@ -35,6 +36,7 @@ from zzz_ddtool.layout import (
     scale_rect,
 )
 from zzz_ddtool.logutil import get_logger
+from zzz_ddtool.paths import debug_dir
 from zzz_ddtool.ocr import OcrLine, read_name_bands, read_name_span, read_rect
 from zzz_ddtool import picker_names
 from zzz_ddtool.actionwait import InputRelease, wait_release
@@ -81,8 +83,14 @@ _PANEL_SCROLL_NOTCHES = 8
 #: + 本保底。调用点一律写成「实测值 + _MEASURED_SAFETY_MS」；日后调保底只改这里，
 #: 不准再往任何数值里手写 +200。
 _MEASURED_SAFETY_MS = 200
-#: 组动作（同一动作连续点击）的组后等待：组内 0、组后 50；这四项**不加** _MEASURED_SAFETY_MS。
-_GROUP_TAIL_WAIT_MS = 50
+# 套装滚动采用用户已修正的学习预算；学习/回放/回顶/legacy共用，避免坐标基准不同。
+_SET_SCROLL_WAIT_MS = 784  # 最终预算，不再叠加200ms
+#: 连续点击：组内零等待且不检测，最后一个实际点击按其动作的实测值等待。
+#: 四项沿用组动作不叠加200ms的约定；来源《等待时间表》第14轮。
+_SET_OPTION_TAIL_WAIT_MS = 87
+_MAINSTAT_OPTION_TAIL_WAIT_MS = 160
+_SUBSTAT_OPTION_TAIL_WAIT_MS = 93
+_SUBSTAT_COUNT_TAIL_WAIT_MS = 86
 # 主属性名与词条名的相似度下限，低于它宁可中断也不猜（手册 01 底线）
 _MATCH_CUTOFF = 0.75
 
@@ -309,19 +317,16 @@ def _emit_evidence(event: str, stage_index: int | None, targets, boxes, image: Q
 
 
 def _pre_click_state(image: QImage, click, identity: SetPickerIdentity) -> bool | None:
-    """§13：套装包括灰色零件数选项均可点，仅确认名称身份和未选状态。"""
+    """§13：套装包括灰色零件数选项均可点，仅确认名称身份，不判断勾选状态。"""
     identity_ok = identity_matches(image, identity)
-    selected = _picker_selected(image, click)
-    if identity_ok is not True or selected is not False:
+    if identity_ok is not True:
         get_logger("zzz_ddtool.gamefilter").debug(
-            "套装点击前检查 identity=%s selected=%s box=%s",
-            identity_ok, selected, (click.left, click.top, click.right, click.bottom),
+            "套装点击前检查 identity=%s box=%s",
+            identity_ok, (click.left, click.top, click.right, click.bottom),
         )
-    if identity_ok is False or selected is True:
-        return False
-    if identity_ok is True and selected is False:
-        return True
-    return None
+    if identity_ok is False:
+        _save_picker_pre_click_failure(image, click, identity_ok)
+    return identity_ok
 
 
 def _read_picker_name_span(
@@ -397,7 +402,8 @@ _picker_templates_disabled = False
 
 
 def _read_picker_targets(
-    image: QImage, pending: Sequence[str], layout: SetPickerLayout, metrics: _PickerMetrics
+    image: QImage, pending: Sequence[str], layout: SetPickerLayout, metrics: _PickerMetrics,
+    *, cached_clicks: Sequence[SetPickerClick] = (),
 ) -> dict | None:
     """一帧的名称读取与匹配（§5.1.2）：列表区粗读 → 完整名称带逐带认名 → 匹配。
 
@@ -408,6 +414,11 @@ def _read_picker_targets(
     lines = read_rect(image, layout.list_area)
     metrics.search_ocr_calls += 1
     bands = _picker_name_bands(image, lines, layout)
+    # 只读未缓存的名称带；粗读仍用于本屏行几何，不匹配缓存名称。
+    bands = tuple(band for band in bands if not any(
+        band[0] <= click.x <= band[2] and band[1] <= click.y <= band[3]
+        for click in cached_clicks
+    ))
     if not bands:
         return _match_targets([], pending)
     decided: dict[int, OcrLine] = {}
@@ -481,6 +492,28 @@ def _prepare_picker_clicks(
     return None
 
 
+def _cached_picker_targets(
+    session: FilterReplaySession, key: SetPickerKey, layout: SetPickerLayout,
+) -> tuple[dict[str, tuple[int, SetPickerClick]], SetPickerRoute | None]:
+    targets: dict[str, tuple[int, SetPickerClick]] = {}
+    confirm = None
+    for route in session.routes.values():
+        if route.layout != layout or (route.key.hwnd, route.key.pid, route.key.width,
+                route.key.height, route.key.dpi, route.key.layout_id) != (
+                key.hwnd, key.pid, key.width, key.height, key.dpi, key.layout_id):
+            continue
+        if any(stage.wheel_events and (stage.delta_units != _PICKER_SCROLL_DELTA
+                or stage.wheel_events % _PICKER_SCROLL_EVENTS) for stage in route.stages):
+            continue
+        confirm = route
+        round_index = 0
+        for stage in route.stages:
+            round_index += stage.wheel_events // _PICKER_SCROLL_EVENTS
+            for click in stage.clicks:
+                targets.setdefault(click.name, (round_index, click))
+    return targets, confirm
+
+
 def _select_sets_learn(
     hwnd: int,
     names: Sequence[str],
@@ -490,23 +523,33 @@ def _select_sets_learn(
     layout: SetPickerLayout,
     key: SetPickerKey,
     metrics: _PickerMetrics,
+    cached_targets: dict[str, tuple[int, SetPickerClick]] | None = None,
+    cached_confirm: SetPickerRoute | None = None,
 ) -> SetPickerRoute:
     """§5.1 学习：定位、执行并记录滚动与点击；成功后才返回完整路径（失败不发布半成品）。
 
     名称带近似命中但未精确隔离时，不点击并重拍新帧重读（上限见
     `_PICKER_NAME_READ_ATTEMPTS`），认对一次即用；上限内仍不精确才按 R21 停止。
     """
+    cached_targets = cached_targets or {}
     stages: list[SetPickerStage] = []
     pending = list(names)
     stage_index = 0
     carried_events = 0
 
     # 1) 起始位置（reopen_top 只检查一次；wheel_top 先按记录回顶）
-    _establish_origin(hwnd, layout, width=width, height=height, metrics=metrics, key=key)
-    image, _ = _grab()
+    _establish_origin(hwnd, layout, width=width, height=height, metrics=metrics, key=key, cached=bool(cached_targets))
+    image = None
 
     for round_index in range(_PICKER_MAX_ROUNDS):
-        matched = _read_picker_targets(image, pending, layout, metrics)
+        uncached = [name for name in pending if name not in cached_targets]
+        if uncached:
+            image, _ = _grab()
+            if round_index:
+                metrics.verification_frames += 1
+        cached_on_screen = [click for row, click in cached_targets.values() if row == round_index]
+        matched = (_read_picker_targets(image, uncached, layout, metrics, cached_clicks=cached_on_screen)
+                   if uncached else {})
         if matched is None:
             raise FilterClickError("套装名称匹配到冲突框（同分或同框），停止。")
         clicks: list[SetPickerClick] = []
@@ -515,7 +558,7 @@ def _select_sets_learn(
         prepared: list[tuple[str, SetPickerClick]] = []
         prepared_boxes: list[tuple[str, SetPickerClick, tuple[int, int, int, int]]] = []
         # §5.1.3 / R21：本帧**所有**候选的名称框与指纹先全部就绪，任何一项失败都在任何点击之前停止
-        failing = _prepare_picker_clicks(image, names, matched, prepared, prepared_boxes)
+        failing = _prepare_picker_clicks(image, uncached, matched, prepared, prepared_boxes)
         # 近似命中但未精确隔离：识错不点击，重拍新帧再认，认对一次即用（用户决定 2026-10-11）。
         for attempt in range(2, _PICKER_NAME_READ_ATTEMPTS + 1):
             if failing is None:
@@ -526,26 +569,22 @@ def _select_sets_learn(
             time.sleep(_PICKER_NAME_RETRY_DELAY_S)
             image, _ = _grab()
             metrics.verification_frames += 1
-            matched = _read_picker_targets(image, pending, layout, metrics)
+            matched = _read_picker_targets(image, uncached, layout, metrics, cached_clicks=cached_on_screen)
             if matched is None:
                 raise FilterClickError("套装名称匹配到冲突框（同分或同框），停止。")
-            failing = _prepare_picker_clicks(image, names, matched, prepared, prepared_boxes)
+            failing = _prepare_picker_clicks(image, uncached, matched, prepared, prepared_boxes)
         if failing is not None:
             raise FilterClickError(f"套装名 {failing!r} 无法隔离精确文字框，停止。")
+        by_name = dict(prepared)
+        by_name.update({name: cached_targets[name][1] for name in pending
+                        if name in cached_targets and cached_targets[name][0] == round_index})
+        prepared = [(name, by_name[name]) for name in names if name in by_name]
+        _click_picker_group(
+            hwnd, [click for _name, click in prepared], metrics=metrics,
+            layout=layout, key=key, stage_index=stage_index + 1, cached=bool(cached_targets),
+        )
         for name, click in prepared:
             box = (click.left, click.top, click.right, click.bottom)
-            ref = _click_ref(box)
-            with _checked_picker_input(
-                metrics, layout, key,
-                lambda img, ref=ref, identity=click.identity: _pre_click_state(img, ref, identity),
-                f"套装 {name!r} 输入前状态不符",
-            ), input_context("set_option", target=name, stage_index=stage_index + 1, selected=True,
-                             defer_post_release=True):
-                release = click_client(hwnd, click.x, click.y)
-            metrics.selection_clicks += 1
-            # §4.2 set_option：总下限 = 原输入层收尾 180 + v8 布局点击等待，从释放点算。
-            # 作者裁定：组内 0、组后 50（不加 200）。
-            wait_release("set_option", release, fallback_ms=_GROUP_TAIL_WAIT_MS if name == prepared[-1][0] else 0)
             clicks.append(click)
             boxes.append(box)
             frame_boxes.append(box)
@@ -553,22 +592,6 @@ def _select_sets_learn(
 
         if clicks:
             stage_index += 1
-            seen: dict[str, QImage] = {}
-
-            def post_state(img, clicks=clicks, seen=seen) -> bool | None:
-                seen["image"] = img
-                states = [
-                    _picker_selected(img, _click_ref((c.left, c.top, c.right, c.bottom)))
-                    for c in clicks
-                ]
-                if any(state is False for state in states):
-                    return False
-                if all(state is True for state in states):
-                    return True
-                return None
-
-            if _observe(metrics, post_state) is not True:
-                raise FilterClickError("本段目标点击后未确认全部选中，停止。")
             stages.append(
                 SetPickerStage(
                     wheel_events=carried_events,
@@ -576,9 +599,11 @@ def _select_sets_learn(
                     clicks=tuple(clicks),
                 )
             )
-            _emit_evidence(
-                "set_stage_selected", stage_index, [c.name for c in clicks], boxes, seen.get("image", image)
-            )
+            if _evidence_enabled():
+                evidence_image, _ = _grab()
+                metrics.verification_frames += 1
+                # 保留历史事件名，表示本段点击已发送；不证明实际勾选。
+                _emit_evidence("set_stage_selected", stage_index, [c.name for c in clicks], boxes, evidence_image)
             carried_events = 0
         if not pending:
             break
@@ -586,9 +611,10 @@ def _select_sets_learn(
             break
         # 4) 本屏未找全：滚动后重读（滚动事件归属下一段）
         for _ in range(_PICKER_SCROLL_EVENTS):
-            with _checked_picker_input(
+            guard = (_bound_picker_input(key) if cached_targets else _checked_picker_input(
                 metrics, layout, key, None, "套装滚动前弹窗布局不符",
-            ), input_context("set_scroll", defer_post_release=True):
+            ))
+            with guard, input_context("set_scroll", defer_post_release=True):
                 release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
@@ -596,38 +622,42 @@ def _select_sets_learn(
                 )
             metrics.wheel_events += 1
             carried_events += 1
-            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
-        image, _ = _grab()
-        metrics.verification_frames += 1
+            wait_release("set_scroll", release, fallback_ms=_SET_SCROLL_WAIT_MS, allow_measured=False)
 
     if pending:
         raise FilterClickError(f"滚动 {_PICKER_MAX_ROUNDS} 轮后仍未找到全部目标：{pending}")
 
-    # 5) 确认按钮：只读确认区、精确匹配、隔离文字框、点中心
-    image, _ = _grab()
-    metrics.verification_frames += 1
-    lines = read_rect(image, layout.confirm_area)
-    metrics.search_ocr_calls += 1
-    hits = [ln for ln in lines if _normalize_match_text(ln.text) == _PICKER_CONFIRM_TEXT]
-    if len(hits) != 1:
-        raise FilterClickError(f"确认按钮精确命中 {len(hits)} 个框，停止。")
-    confirm_span = read_name_span(image, hits[0], name=_PICKER_CONFIRM_TEXT)
-    metrics.search_ocr_calls += 1
-    if confirm_span is None:
-        raise FilterClickError("确认按钮文字框无法隔离，停止。")
-    confirm_box = (confirm_span.left, confirm_span.top, confirm_span.right, confirm_span.bottom)
-    confirm_identity = make_identity(image, confirm_box)
-    if confirm_identity is None:
-        raise FilterClickError("确认按钮的文字指纹生成失败，停止。")
-    confirm_ref = _click_ref(confirm_box)
-    confirm_x = (confirm_box[0] + confirm_box[2]) // 2
-    confirm_y = (confirm_box[1] + confirm_box[3]) // 2
-    with _checked_picker_input(
-        metrics, layout, key,
-        lambda img: _confirm_ready(img, confirm_identity, confirm_ref),
-        "确认按钮输入前状态不符",
-    ), input_context("confirm_sets", defer_post_release=True):
-        release = click_client(hwnd, confirm_x, confirm_y)
+    if cached_confirm is not None:
+        confirm_identity = cached_confirm.confirm_identity
+        confirm_x, confirm_y = cached_confirm.confirm_x, cached_confirm.confirm_y
+        with _bound_picker_input(key), input_context("confirm_sets", defer_post_release=True):
+            release = click_client(hwnd, confirm_x, confirm_y)
+    else:
+        # 5) 确认按钮：只读确认区、精确匹配、隔离文字框、点中心
+        image, _ = _grab()
+        metrics.verification_frames += 1
+        lines = read_rect(image, layout.confirm_area)
+        metrics.search_ocr_calls += 1
+        hits = [ln for ln in lines if _normalize_match_text(ln.text) == _PICKER_CONFIRM_TEXT]
+        if len(hits) != 1:
+            raise FilterClickError(f"确认按钮精确命中 {len(hits)} 个框，停止。")
+        confirm_span = read_name_span(image, hits[0], name=_PICKER_CONFIRM_TEXT)
+        metrics.search_ocr_calls += 1
+        if confirm_span is None:
+            raise FilterClickError("确认按钮文字框无法隔离，停止。")
+        confirm_box = (confirm_span.left, confirm_span.top, confirm_span.right, confirm_span.bottom)
+        confirm_identity = make_identity(image, confirm_box)
+        if confirm_identity is None:
+            raise FilterClickError("确认按钮的文字指纹生成失败，停止。")
+        confirm_ref = _click_ref(confirm_box)
+        confirm_x = (confirm_box[0] + confirm_box[2]) // 2
+        confirm_y = (confirm_box[1] + confirm_box[3]) // 2
+        with _checked_picker_input(
+            metrics, layout, key,
+            lambda img: _confirm_ready(img, confirm_identity, confirm_ref),
+            "确认按钮输入前状态不符",
+        ), input_context("confirm_sets", defer_post_release=True):
+            release = click_client(hwnd, confirm_x, confirm_y)
     wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS)
     if _observe(metrics, _picker_popup_closed) is not True:
         raise FilterClickError("点击确认后弹窗未关闭，停止。")
@@ -681,23 +711,76 @@ def _checked_picker_input(
         yield
 
 
-def _establish_origin(
-    hwnd: int, layout: SetPickerLayout, *, width: int, height: int, metrics: _PickerMetrics, key: SetPickerKey
+@contextmanager
+def _bound_picker_input(key: SetPickerKey) -> Iterator[None]:
+    """缓存坐标输入只核对窗口绑定，不截图、不识别游戏页面。"""
+    def validate() -> None:
+        hwnd = find_game_hwnd()
+        if (hwnd != key.hwnd or window_pid(hwnd) != key.pid
+                or client_size(hwnd) != (key.width, key.height)
+                or _window_dpi(hwnd) != key.dpi):
+            raise FilterClickError("缓存坐标输入前窗口绑定变化，停止。")
+
+    with validated_inputs(validate):
+        yield
+
+
+def _click_picker_group(
+    hwnd: int, clicks: Sequence[SetPickerClick], *, metrics: _PickerMetrics,
+    layout: SetPickerLayout, key: SetPickerKey, stage_index: int, cached: bool = False,
 ) -> None:
-    """§4.3 起始位置：reopen_top 打开后只做一次顶部检查；wheel_top 先按记录发正向事件回顶再检查。"""
+    """连续发送整批；学习复验剩余身份，缓存坐标只绑定窗口。"""
+    completed = 0
+
+    def remaining_state(image: QImage) -> bool | None:
+        states = [
+            _pre_click_state(image, c, c.identity)
+            for c in clicks[completed:]
+        ]
+        if any(state is False for state in states):
+            return False
+        return True if all(state is True for state in states) else None
+
+    # 验证作用域跨越整批，正常检查点复用同一暂停代次的整批结果。
+    # 控制检查仍逐次执行；恢复时重验剩余目标，已完成点击不重发。
+    guard = (_bound_picker_input(key) if cached else _checked_picker_input(
+        metrics, layout, key, remaining_state, "套装批量点击输入前状态不符",
+    ))
+    with guard:
+        for click in clicks:
+            with input_context(
+                "set_option", target=click.name, stage_index=stage_index,
+                selected=True, defer_post_release=True,
+            ):
+                release = click_client(hwnd, click.x, click.y)
+            completed += 1
+            metrics.selection_clicks += 1
+            wait_release(
+                "set_option", release,
+                fallback_ms=_SET_OPTION_TAIL_WAIT_MS if completed == len(clicks) else 0,
+                allow_measured=completed == len(clicks),
+            )
+
+
+def _establish_origin(
+    hwnd: int, layout: SetPickerLayout, *, width: int, height: int, metrics: _PickerMetrics, key: SetPickerKey,
+    cached: bool = False,
+) -> None:
+    """学习检查顶部；缓存仅按起始模式执行回顶事件，不判读页面。"""
     if layout.origin_mode == "wheel_top":
         for _ in range(layout.top_wheel_events):
-            with _checked_picker_input(
+            guard = (_bound_picker_input(key) if cached else _checked_picker_input(
                 metrics, layout, key, None, "套装回顶前弹窗布局不符",
-            ), input_context("set_scroll", defer_post_release=True):
+            ))
+            with guard, input_context("set_scroll", defer_post_release=True):
                 release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
                     delta=layout.top_delta_units,
                 )
             metrics.wheel_events += 1
-            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
-    if _observe(metrics, lambda img: _picker_at_top(img, layout)) is not True:
+            wait_release("set_scroll", release, fallback_ms=_SET_SCROLL_WAIT_MS, allow_measured=False)
+    if not cached and _observe(metrics, lambda img: _picker_at_top(img, layout)) is not True:
         raise FilterClickError("套装弹窗起始位置检查失败（顶部锚点不符），停止。")
 
 
@@ -724,72 +807,31 @@ def _select_sets_replay(
 ) -> None:
     """§5.2 回放：按记录的滚动与点击执行，零名称查找 OCR；失败由调用方移除路径。"""
     layout = route.layout
-    _establish_origin(hwnd, layout, width=width, height=height, metrics=metrics, key=route.key)
-    image, _ = _grab()
-    stage_total = len(route.stages)
+    _establish_origin(hwnd, layout, width=width, height=height, metrics=metrics, key=route.key, cached=True)
     for index, stage in enumerate(route.stages, start=1):
         for _ in range(stage.wheel_events):
-            with _checked_picker_input(
-                metrics, layout, route.key, None, f"回放第 {index}/{stage_total} 段滚动前布局不符",
-            ), input_context("set_scroll", defer_post_release=True):
+            with _bound_picker_input(route.key), input_context("set_scroll", defer_post_release=True):
                 release = wheel_client(
                     hwnd,
                     *scale_point(layout.scroll_x, layout.scroll_y, width, height),
                     delta=stage.delta_units,
                 )
             metrics.wheel_events += 1
-            wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS)
-        if _observe(metrics, lambda img: _picker_stage_matches(img, layout)) is not True:
-            raise FilterClickError(f"回放第 {index}/{stage_total} 段布局检查失败，停止。")
-        for click in stage.clicks:
-            ref = _click_ref((click.left, click.top, click.right, click.bottom))
-            with _checked_picker_input(
-                metrics, layout, route.key,
-                lambda img, ref=ref, click=click: _pre_click_state(img, ref, click.identity),
-                f"回放第 {index}/{stage_total} 段目标 {click.name!r} 输入前状态不符",
-            ), input_context("set_option", target=click.name, stage_index=index, selected=True,
-                             defer_post_release=True):
-                release = click_client(hwnd, click.x, click.y)
-            metrics.selection_clicks += 1
-            # 作者裁定：组内 0、组后 50（不加 200）。
-            wait_release("set_option", release, fallback_ms=_GROUP_TAIL_WAIT_MS if click is stage.clicks[-1] else 0)
-        seen: dict[str, QImage] = {}
-
-        def post_state(img, stage=stage, seen=seen) -> bool | None:
-            seen["image"] = img
-            states = [
-                _picker_selected(img, _click_ref((c.left, c.top, c.right, c.bottom)))
-                for c in stage.clicks
-            ]
-            if any(state is False for state in states):
-                return False
-            if all(state is True for state in states):
-                return True
-            return None
-
-        if _observe(metrics, post_state) is not True:
-            raise FilterClickError(f"回放第 {index}/{stage_total} 段点击后未确认全部选中，停止。")
-        _emit_evidence(
-            "set_stage_selected",
-            index,
-            [c.name for c in stage.clicks],
-            [(c.left, c.top, c.right, c.bottom) for c in stage.clicks],
-            seen.get("image", image),
+            wait_release("set_scroll", release, fallback_ms=_SET_SCROLL_WAIT_MS, allow_measured=False)
+        _click_picker_group(
+            hwnd, stage.clicks, metrics=metrics, layout=layout,
+            key=route.key, stage_index=index, cached=True,
         )
+        if _evidence_enabled():
+            evidence_image, _ = _grab()
+            metrics.verification_frames += 1
+            # 保留历史事件名，表示本段点击已发送；不证明实际勾选。
+            _emit_evidence(
+                "set_stage_selected", index, [c.name for c in stage.clicks],
+                [(c.left, c.top, c.right, c.bottom) for c in stage.clicks], evidence_image,
+            )
 
-    confirm_ref = _click_ref(
-        (
-            route.confirm_identity.left,
-            route.confirm_identity.top,
-            route.confirm_identity.right,
-            route.confirm_identity.bottom,
-        )
-    )
-    with _checked_picker_input(
-        metrics, layout, route.key,
-        lambda img: _confirm_ready(img, route.confirm_identity, confirm_ref),
-        "回放确认按钮输入前状态不符",
-    ), input_context("confirm_sets", defer_post_release=True):
+    with _bound_picker_input(route.key), input_context("confirm_sets", defer_post_release=True):
         release = click_client(hwnd, route.confirm_x, route.confirm_y)
     wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS)
     if _observe(metrics, _picker_popup_closed) is not True:
@@ -822,10 +864,18 @@ def _select_sets_with_replay(
             key = _picker_key(hwnd, width, height, names, layout)
             route = session.routes.get(key)
             if route is None:
-                metrics = _PickerMetrics("learn")
-                route = _select_sets_learn(
-                    hwnd, names, width=width, height=height, layout=layout, key=key, metrics=metrics
-                )
+                cached_targets, cached_confirm = _cached_picker_targets(session, key, layout)
+                cached_targets = {name: cached_targets[name] for name in names if name in cached_targets}
+                metrics = _PickerMetrics("replay" if len(cached_targets) == len(names) else "learn")
+                try:
+                    route = _select_sets_learn(
+                        hwnd, names, width=width, height=height, layout=layout, key=key, metrics=metrics,
+                        cached_targets=cached_targets, cached_confirm=cached_confirm,
+                    )
+                except Exception:
+                    if cached_targets:
+                        session.routes.clear()  # 混合执行失败后不再沿用所消费的坐标缓存。
+                    raise
                 session.routes[key] = route
                 metrics.success = True
             else:
@@ -853,29 +903,18 @@ def _select_sets_with_replay(
 # 区域为设计坐标（1920x1080）；阈值取自 2026-10-06 静态样本实测
 # （手册/参考图/驱动盘筛选/，见该页说明.md）：
 #   提示行均值：弹窗存在 124.4—124.6 / 关闭 42.9；首行上沿条带亮尾：在顶部 34.2—65.5 / 已滚动 242.2；
-#   右上角黄绿勾像素：已选 581 / 未选 0；格子平均亮度：可用 105.9—108.7 / 0 件灰格 43.6。
 _PICKER_HINT_BAND = (764, 299, 1156, 328)
 _PICKER_TOP_BAND = (830, 366, 1470, 384)
 _PICKER_POPUP_OPEN_MIN = 100.0
 _PICKER_POPUP_CLOSED_MAX = 60.0
 _PICKER_TOP_MAX = 120.0
 _PICKER_SCROLLED_MIN = 180.0
-_PICKER_GREEN_MIN = 50
-_PICKER_GREEN_NONE_MAX = 10
 _PICKER_ENABLED_MIN_LUMA = 80.0
-# 选中勾：黄绿↔金黄两种动画相位实测 b 通道恒为 0、未选区 0—12 个杂点
-_PICKER_CHECK_MIN = 100
-_PICKER_CHECK_NONE_MAX = 20
-_PICKER_CHECK_BLUE_MAX = 60
 # 可用判据用「亮尾」（区域最亮 5% 像素的均值）：可用格 216—255、灰格 128—133、确认按钮 255
 _PICKER_ENABLED_MIN_TAIL = 180.0
 # 面板仍在判据（§4.2 图像判据，不做 OCR）：底部「重置」区亮尾(5%) 实测 面板在 191.3 / 面板关 57.3（2026-10-07）
 _PANEL_RESET_MIN_TAIL = 120.0
-# 勾区横向由四列中心定位，不能跟随名称字数/字符框右边缘，否则会扫到盘面绿图案。
 _PICKER_COLUMN_CENTERS = (900, 1064, 1228, 1392)
-_PICKER_COLUMN_TOLERANCE = 16
-_PICKER_CHECK_DX = (46, 84)
-_PICKER_CHECK_DY = (-115, -70)
 # 副属性就位观察（§6.5）：一次滑到底后未知最多共 3 张（含滚后第一张），期间不补发输入
 _SUBSTAT_OBSERVE_FRAMES = 3
 # 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
@@ -960,42 +999,29 @@ def _picker_stage_matches(image: QImage, layout) -> bool | None:
     return True if opened is True else None
 
 
-def _picker_check_zone(click) -> tuple[int, int, int, int] | None:
-    center = (click.left + click.right) / 2
-    column = min(_PICKER_COLUMN_CENTERS, key=lambda x: abs(x - center))
-    if abs(column - center) > _PICKER_COLUMN_TOLERANCE:
-        return None
-    return (
-        column + _PICKER_CHECK_DX[0],
-        click.top + _PICKER_CHECK_DY[0],
-        column + _PICKER_CHECK_DX[1],
-        click.top + _PICKER_CHECK_DY[1],
-    )
-
-
-def _picker_selected(image: QImage, click) -> bool | None:
-    """目标格子是否已选中：右上角有没有选中勾。
-
-    勾是黄绿↔金黄（会随动画相位变化），实测 b 通道恒为 0；未选时同区最多 12 个杂点。
-    """
-    zone = _picker_check_zone(click)
-    if zone is None or (image.width(), image.height()) != (1920, 1080):
-        return None
-    left, top, right, bottom = zone
-    if not (0 <= left < right <= image.width() and 0 <= top < bottom <= image.height()):
-        return None
-    hits = 0
-    for y in range(max(0, top), min(image.height(), bottom)):
-        for x in range(max(0, left), min(image.width(), right)):
-            color = image.pixelColor(x, y)
-            r, g, b = color.red(), color.green(), color.blue()
-            if b <= _PICKER_CHECK_BLUE_MAX and g >= 120 and g - b >= 60 and r - b >= 40:
-                hits += 1
-    if hits >= _PICKER_CHECK_MIN:
-        return True
-    if hits <= _PICKER_CHECK_NONE_MAX:
-        return False
-    return None
+def _save_picker_pre_click_failure(image, click, identity_ok) -> None:
+    """DEBUG 下保存导致拒绝的原帧，避免事后截图丢失瞬时误判证据。"""
+    log = get_logger("zzz_ddtool.gamefilter")
+    if not log.isEnabledFor(logging.DEBUG) or (image.width(), image.height()) != (1920, 1080):
+        return
+    try:
+        folder = debug_dir() / "picker-failures"
+        folder.mkdir(parents=True, exist_ok=True)
+        stem = f"pre-click-{time.time_ns()}"
+        path = folder / f"{stem}.png"
+        if not image.save(str(path), "PNG"):
+            raise OSError(f"无法保存 {path}")
+        details = {
+            "target": getattr(click, "name", getattr(click, "text", None)),
+            "name_box": [click.left, click.top, click.right, click.bottom],
+            "identity": identity_ok,
+        }
+        (folder / f"{stem}.json").write_text(
+            json.dumps(details, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        log.debug("套装拒绝原帧=%s 判据=%s", path, json.dumps(details, ensure_ascii=False))
+    except Exception as exc:
+        log.warning("保存套装拒绝原帧失败：%s", exc)
 
 
 def _picker_enabled(image: QImage, click) -> bool | None:
@@ -1089,14 +1115,14 @@ def _select_names(
                 metrics.selection_clicks += 1
             log.info("picker clicked %r at (%d,%d)", name, hit.left, hit.top)
             # legacy 分支沿用相同动作ID但不消费实测（§4.2）。
-            # 作者裁定（组动作）：组内 0 等待、组后 _GROUP_TAIL_WAIT_MS（不加 200）。
+            # 组内零等待；不在相邻点击之间抓图判读。
             wait_release("set_option", release, fallback_ms=0, allow_measured=False)
             last_release = release
             clicks.append((cx, cy, (hit.left, hit.top, hit.right, hit.bottom)))
             targets.append(target)
         pending = still
-        if not pending and last_release is not None:
-            wait_release("set_option", last_release, fallback_ms=_GROUP_TAIL_WAIT_MS, allow_measured=False)
+        if last_release is not None:
+            wait_release("set_option", last_release, fallback_ms=_SET_OPTION_TAIL_WAIT_MS, allow_measured=False)
         if clicks:
             stage_index += 1
             if _evidence_enabled():  # 只在启用证据时抓这一帧
@@ -1116,8 +1142,8 @@ def _select_names(
             release = wheel_client(hwnd, *scale_point(*scroll_center, width, height))
         if metrics is not None:
             metrics.wheel_events += 1
-        # legacy 分支：680 = 330 + 350，不消费实测。
-        wait_release("set_scroll", release, fallback_ms=84 + _MEASURED_SAFETY_MS, allow_measured=False)
+        # legacy滚动共用套装预算，不消费实测档案。
+        wait_release("set_scroll", release, fallback_ms=_SET_SCROLL_WAIT_MS, allow_measured=False)
     raise FilterClickError(f"弹层里找不到目标，滚动 {_MAX_SCROLL_ROUNDS} 轮未果：{pending}")
 
 
@@ -1312,14 +1338,14 @@ def _pick_mainstats(
                     continue
                 release = _click_line(hwnd, hit, role="mainstat_option", target=hit.text)
                 log.info("mainstat clicked %r at (%d,%d)", name, hit.left, hit.top)
-                # 作者裁定：组内 0 等待（组后 50 在循环结束时补）。
-                wait_release("mainstat_option", release, fallback_ms=0)
+                # 组内零等待，不消费会把零等待抬高的实测策略。
+                wait_release("mainstat_option", release, fallback_ms=0, allow_measured=False)
                 last_release = release
             pending = still
+            if last_release is not None:
+                # 每个视口已发送的点击是一组；滚动或返回前只等待最后一次释放。
+                wait_release("mainstat_option", last_release, fallback_ms=_MAINSTAT_OPTION_TAIL_WAIT_MS)
             if not pending:
-                # 组结束：补 50 ms（组内 0、组后 50，不加 200）。
-                if last_release is not None:
-                    wait_release("mainstat_option", last_release, fallback_ms=_GROUP_TAIL_WAIT_MS)
                 return
         if scrolls == _MAX_PANEL_SCROLLS:
             break
@@ -1647,7 +1673,7 @@ def apply_substat_filter(
 
     先按共享判读函数 `_inspect_substat_targets` 确认全部目标就位，
     **就位之前不选择任何目标**；未就位时只滑到底一次，之后只观察、不再重复滚动；
-    就位后在同一帧批量完成属性和数量，逐项复核蓝色选中态。
+    就位后用同一帧准备属性和数量，连续点击；最后一次实际点击等待后统一复核。
     """
     _validate_substat_filter(names, counts)
     if not names:
@@ -1684,26 +1710,48 @@ def apply_substat_filter(
 
     image, _lines = frame
     done_boxes: dict[str | int, tuple[int, int, int, int]] = {}
+    planned = []
+    # 用已就位的同一帧决定全部点击，发送过程中不读切换动画。
     for key in targets:
         line = found.get(key)
-        if line is None:  # ready=True 已保证齐全，这里只防御内部不一致
+        if line is None:
             raise FilterClickError(f"副属性目标 {key!r} 没有文字框，停止筛选")
-        selected = expect[key]
-        if _option_selected(image, line) != selected:
+        done_boxes[key] = (line.left, line.top, line.right, line.bottom)
+        if _option_selected(image, line) != expect[key]:
             x, y = (line.left + line.right) // 2, (line.top + line.bottom) // 2
             _refuse_dismantle(x, y, width, height)
-            role = "substat_count" if isinstance(key, int) else "substat_option"
-            with input_context(role, target=key, selected=selected, defer_post_release=True):
-                release = click_client(hwnd, x, y)
-            # 作者裁定：同动作连续点击为一组——组内 0 等待，最后一次后 50 ms。
-            wait_release(role, release, fallback_ms=_GROUP_TAIL_WAIT_MS if key == targets[-1] else 0)
-            after, _ = _grab()  # 复核用抓图，不为该点击重做面板 OCR
-            if _option_selected(after, line) != selected:
-                raise FilterClickError(f"副属性筛选选项 {key!r} 点击后未确认{'选中' if selected else '取消'}")
-            image = after
-        done_boxes[key] = (line.left, line.top, line.right, line.bottom)
-        log.info("substat filter %r selected=%s", key, selected)
-        # 属性和数量按钮切换不改变面板布局，同一帧中可批量复用目标框。
+            planned.append((key, x, y))
+
+    for index, (key, x, y) in enumerate(planned):
+        role = "substat_count" if isinstance(key, int) else "substat_option"
+        with input_context(role, target=key, selected=expect[key], defer_post_release=True):
+            release = click_client(hwnd, x, y)
+        last = index == len(planned) - 1
+        wait_release(
+            role, release,
+            fallback_ms=(
+                (_SUBSTAT_COUNT_TAIL_WAIT_MS if role == "substat_count" else _SUBSTAT_OPTION_TAIL_WAIT_MS)
+                if last else 0
+            ),
+            allow_measured=last,
+        )
+
+    if planned:
+        # 不补发点击；动画尚未完成时最多观察三帧，避免首帧仍为旧态就立即判失败。
+        mismatched = []
+        for observed in range(_SUBSTAT_OBSERVE_FRAMES):
+            if observed:
+                time.sleep(_SUBSTAT_OBSERVE_INTERVAL_S)
+            checkpoint_control()
+            image, _ = _grab()
+            mismatched = [key for key in targets if _option_selected(image, found[key]) != expect[key]]
+            if not mismatched:
+                break
+        if mismatched:
+            key = mismatched[0]
+            raise FilterClickError(f"副属性筛选选项 {key!r} 点击后未确认{'选中' if expect[key] else '取消'}")
+    for key in targets:
+        log.info("substat filter %r selected=%s", key, expect[key])
     # §8.4：全部属性和数量完成、返回之前发一次，复用最后检查帧，不等 Esc 后取证。
     if _evidence_enabled():
         _emit_evidence(

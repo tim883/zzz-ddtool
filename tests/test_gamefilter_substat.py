@@ -218,12 +218,12 @@ def test_substat_acceptance(monkeypatch, case: str) -> None:
         monkeypatch.setattr(gf, "_inspect_substat_targets", spy)
         gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1,))
         assert calls, "apply_substat_filter 没有调用共享判读函数"
-    else:  # S05：点击后判读仍 False → 不重做面板 OCR、不继续余项
+    else:  # S05：整批完成后仍不满足 → 不重做面板 OCR、不补发点击，不继续扫描
         state, clicks = fake_panel(monkeypatch, fail_click=True)
         with pytest.raises(gf.FilterClickError, match="未确认选中"):
             gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1,))
         assert state["panel_reads"]["n"] == 2  # 不用重做面板 OCR 覆盖失败
-        assert len([item for item in clicks if item[1] != 565]) == 1  # 不继续余项
+        assert [item for item in clicks if item[1] != 565] == [(1425, 620), (1480, 820)]
 
 
 @pytest.mark.parametrize("counts", [(), (0, 1, 2, 3, 4), (2,), (1, 2), (2, 4)])
@@ -326,3 +326,82 @@ def test_bottom_band_option_is_scrolled_before_click(monkeypatch):
     assert state["selected"] == {"暴击率", "1"}
     # 数字行初始 y=1000 落在无效带里，滑动之前不得点它。
     assert not any(y >= 920 for _x, y in clicks), clicks
+
+
+def test_substat_batch_never_captures_between_clicks_and_observes_delayed_paint(monkeypatch):
+    state, clicks = fake_panel(monkeypatch, selected=(1,), four_options=True)
+    original_grab = gf._grab
+    old_frame = original_grab()[0]
+    captures, waits, sleeps = [], [], []
+
+    def grab():
+        sent = len([p for p in clicks if p[1] != 565])
+        captures.append(sent)
+        assert sent in (0, 8), "组内不能抓图检测动画"
+        if sent and captures.count(sent) == 1:
+            return old_frame, 1  # 末尾首帧仍未呈现；后续新帧才画完。
+        return original_grab()
+
+    def wait(role, release, **kwargs):
+        if role in ("substat_option", "substat_count"):
+            waits.append((role, len([p for p in clicks if p[1] != 565]), kwargs))
+
+    monkeypatch.setattr(gf, "_grab", grab)
+    monkeypatch.setattr(gf, "wait_release", wait)
+    monkeypatch.setattr(gf.time, "sleep", lambda seconds: sleeps.append(seconds))
+    gf.apply_substat_filter(1, 1920, 1080, names=("暴击率", "暴击伤害", "攻击力%", "攻击力"), counts=(2, 3, 4))
+    assert state["selected"] == {"暴击率", "暴击伤害", "攻击力百分比", "攻击力", "2", "3", "4"}
+    assert len(waits) == 8
+    assert all(w[2] == {"fallback_ms": 0, "allow_measured": False} for w in waits[:-1])
+    assert waits[-1] == ("substat_count", 8, {"fallback_ms": 86, "allow_measured": True})
+    assert captures.count(8) == 2 and sleeps == [0.05]
+    assert state["panel_reads"]["n"] == 2  # 末尾观察不重做OCR。
+
+
+@pytest.mark.parametrize("selected,names,counts,expected_role,expected_ms,expected_clicks", [
+    ((1,), ("暴击率",), (1,), "substat_option", 93, 1),
+    ((1, 2, 3, 4), ("暴击率", "暴击伤害", "攻击力%", "攻击力"), (2, 3, 4), "substat_count", 86, 5),
+])
+def test_substat_tail_wait_follows_last_sent_click_not_last_target(monkeypatch, selected, names, counts, expected_role, expected_ms, expected_clicks):
+    state, clicks = fake_panel(monkeypatch, selected=selected, four_options=True)
+    waits = []
+    monkeypatch.setattr(gf, "wait_release", lambda role, release, **kw: waits.append((role, kw)))
+    gf.apply_substat_filter(1, 1920, 1080, names=names, counts=counts)
+    option_waits = [(r, kw) for r, kw in waits if r in ("substat_option", "substat_count")]
+    assert len(option_waits) == expected_clicks
+    assert option_waits[-1] == (expected_role, {"fallback_ms": expected_ms, "allow_measured": True})
+    assert all(kw == {"fallback_ms": 0, "allow_measured": False} for r, kw in option_waits[:-1])
+
+
+def test_substat_final_verification_exhausts_three_frames_without_resending(monkeypatch):
+    state, clicks = fake_panel(monkeypatch, fail_click=True)
+    original_grab = gf._grab
+    captures = []
+    def grab():
+        captures.append(len([p for p in clicks if p[1] != 565]))
+        return original_grab()
+    monkeypatch.setattr(gf, "_grab", grab)
+    with pytest.raises(gf.FilterClickError, match="未确认选中"):
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1,))
+    assert [p for p in clicks if p[1] != 565] == [(1425, 620), (1480, 820)]
+    assert captures.count(2) == 3 and 1 not in captures
+
+
+def test_substat_stop_during_final_observation_does_not_resend(monkeypatch):
+    from zzz_ddtool.control import controlled_inputs
+    state, clicks = fake_panel(monkeypatch, fail_click=True)
+    def stop():
+        raise RuntimeError("stop during observation")
+    with controlled_inputs(stop), pytest.raises(RuntimeError, match="stop during observation"):
+        gf.apply_substat_filter(1, 1920, 1080, names=("暴击率",), counts=(1,))
+    assert [p for p in clicks if p[1] != 565] == [(1425, 620), (1480, 820)]
+
+
+def test_failure_after_frame_attack_percent_is_selected_with_real_predicate():
+    image = QImage(str(BASE / "手册/参考图/驱动盘筛选/副属性-攻击百分比误报失败后-20261012.png"))
+    assert not image.isNull() and (image.width(), image.height()) == (1920, 1080)
+    names = ("攻击力%", "暴击伤害", "暴击率", "攻击力", "穿透值")
+    ready, targets = gf._inspect_substat_targets(image, gf._panel_lines(image), names=names, counts=(3, 4))
+    assert ready is True
+    assert gf._option_selected(image, targets["攻击力%"]) is True
+    assert all(gf._option_selected(image, targets[n]) is False for n in names[1:])

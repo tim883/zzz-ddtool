@@ -414,3 +414,26 @@ def test_normalize_stat_aliases() -> None:
     assert gf._normalize_stat("攻击力％") == "攻击力百分比"
     assert gf._normalize_stat("攻击力百分比") == "攻击力百分比"
     assert gf._normalize_stat("暴击率") == "暴击率"
+
+
+def test_mainstat_group_waits_only_after_last_click_in_each_viewport(monkeypatch):
+    clicks, wheels, waits = [], [], []
+    initial = [*PANEL_EXPANDED, line("攻击力百分比", 1706, 678, w=114)]
+    initial = [l for l in initial if l.text != "暴击伤害"]
+    _stub(monkeypatch, PANEL_EXPANDED, clicks, wheels)
+    from zzz_ddtool.actionwait import InputRelease
+    def click(hwnd, x, y):
+        clicks.append((x, y))
+        return InputRelease("click_client", len(clicks) * 1000000)
+    monkeypatch.setattr(gf, "click_client", click)
+    monkeypatch.setattr(gf, "wait_release", lambda role, release, **kw: waits.append((role, len(clicks), kw)))
+    gf._pick_mainstats(1, ["生命值", "攻击力%", "暴击伤害"], width=1920, height=1080, lines=initial)
+    main = [w for w in waits if w[0] == "mainstat_option"]
+    assert main == [
+        ("mainstat_option", 1, {"fallback_ms": 0, "allow_measured": False}),
+        ("mainstat_option", 2, {"fallback_ms": 0, "allow_measured": False}),
+        ("mainstat_option", 2, {"fallback_ms": 160}),
+        ("mainstat_option", 3, {"fallback_ms": 0, "allow_measured": False}),
+        ("mainstat_option", 3, {"fallback_ms": 160}),
+    ]
+    assert len(wheels) == 1

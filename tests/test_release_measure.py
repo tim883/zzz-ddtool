@@ -690,3 +690,20 @@ def test_final_run_rejects_no_speedup_keeps_report(tmp_path, monkeypatch):
     report = common.read_json(output)
     assert report["passed"] is False and report["speedup"] == []
     assert report["stage"] == "final"
+
+
+@pytest.mark.parametrize("visible,usable,expected", [(True, True, True), (False, True, False), (True, False, False)])
+def test_judge_set_option_uses_name_geometry_without_checkmark(monkeypatch, visible, usable, expected):
+    judge = measure.judge
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(QColor(180, 220, 0))
+    target = SimpleNamespace(left=1188, top=491, right=1266, bottom=517)
+    pending = SimpleNamespace(left=1350, top=491, right=1428, bottom=517 if usable else 1080)
+    targets = {"pending": pending}
+    if visible:
+        targets["target"] = target
+    monkeypatch.setattr(judge, "_picker_layout", lambda _: object())
+    monkeypatch.setattr(judge, "_picker_targets", lambda *_: targets)
+    result = judge.evaluate("set_option", image, judge.JudgeContext(target="target", pending_names=("pending",)))
+    assert result.ready is expected
+    assert dict(result.states) == {"target_visible": visible, "pending_usable": usable}

@@ -51,25 +51,15 @@ def test_page_learning_then_replay_uses_real_identity_and_no_name_ocr(page, monk
     popup = [True]
     sent = []
     by_name = {line.text: line for line in names}
-    original_selected = gf._picker_selected
     monkeypatch.setattr(gf, "_grab", lambda: (image, 1))
     monkeypatch.setattr(gf, "_window_dpi", lambda _: 96)
     monkeypatch.setattr(gf, "window_pid", lambda _: 2)
+    monkeypatch.setattr(gf, "find_game_hwnd", lambda: 1)
+    monkeypatch.setattr(gf, "client_size", lambda _: (1920, 1080))
     monkeypatch.setattr(gf, "_establish_origin", Mock())  # 中部静态帧不证明顶部/真实翻页
     monkeypatch.setattr(gf.time, "sleep", lambda _: None)
     monkeypatch.setattr(gf, "_picker_popup_closed", lambda _: not popup[0])
     monkeypatch.setattr(gf, "_panel_present", lambda _: not popup[0])
-
-    def name_of_box(box, tol=12):
-        """按名称框认名字；底图为同字数固定宽的“字区”框，与 OCR 框可差十几像素内（格距 164px，无歧义）。"""
-        left, top, right, bottom = box
-        return next((n for n, line in by_name.items()
-                     if abs(line.left - left) <= tol and abs(line.top - top) <= tol
-                     and abs(line.right - right) <= tol and abs(line.bottom - bottom) <= tol), None)
-
-    def state(frame, ref):
-        name = name_of_box((ref.left, ref.top, ref.right, ref.bottom))
-        return True if name in selected else original_selected(frame, ref)
 
     def click(hwnd, x, y):
         checkpoint_input()
@@ -85,7 +75,6 @@ def test_page_learning_then_replay_uses_real_identity_and_no_name_ocr(page, monk
             selected.add(name)
         sent.append((x, y))
 
-    monkeypatch.setattr(gf, "_picker_selected", state)
     monkeypatch.setattr(gf, "click_client", click)
     monkeypatch.setattr(gf, "wheel_client", Mock(side_effect=AssertionError("本帧全部目标已可见")))
     # §4.2 释放预算在 gamefilter 内由 wait_release 消费；本组用例只验名称/点击，替换掉计时。

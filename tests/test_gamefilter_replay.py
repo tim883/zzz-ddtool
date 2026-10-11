@@ -125,6 +125,8 @@ def test_reference_manifest_cases() -> None:
     for case in _data_cases():
         expected = case["expected"]
         observation = case["observation"]
+        if observation == "selected":
+            continue  # 历史勾选语料保留；当前执行已移除此判据。
         image = _image(case["image"])
         if observation == "popup_open":
             got = gf._picker_popup_open(image)
@@ -134,17 +136,13 @@ def test_reference_manifest_cases() -> None:
             got = gf._picker_at_top(image, LAYOUT)
         elif observation == "stage_match":
             got = gf._picker_stage_matches(image, LAYOUT)
-        elif observation in ("enabled", "selected"):
+        elif observation == "enabled":
             box = _name_box(case["image"], case["target"])
             if box is None:
                 failures.append(f"{case['id']}: 名称隔离失败（{case['target']}）")
                 continue
             click = _click_box(box)
-            got = (
-                gf._picker_enabled(image, click)
-                if observation == "enabled"
-                else gf._picker_selected(image, click)
-            )
+            got = gf._picker_enabled(image, click)
         elif observation == "identity_match":
             identity = _identity_of(case["identity_source_id"])
             got = identity_matches(image, identity)
@@ -160,55 +158,28 @@ def _data_cases():
     return _DATA["cases"]
 
 
-def test_green_disc_art_is_not_a_selected_check_and_target_is_clickable():
-    relative = "手册/参考图/驱动盘筛选/套装弹窗-激素朋克未选-绿色图案.png"
-    image = _image(relative)
-    box = _name_box(relative, "激素朋克")
-    assert box is not None
-    identity = make_identity(image, box)
-    assert identity is not None
-    ref = _click_box(box)
-    old_zone = (ref.right + 4, ref.top - 115, ref.right + 45, ref.top - 70)
-    old_hits = sum(
-        color.blue() <= 60 and color.green() >= 120
-        and color.green() - color.blue() >= 60 and color.red() - color.blue() >= 40
-        for y in range(old_zone[1], old_zone[3])
-        for x in range(old_zone[0], old_zone[2])
-        for color in (image.pixelColor(x, y),)
-    )
-    # 列表 OCR / 整图 OCR 的字符框可能相差一像素，两者均落入旧判据的未知区间。
-    assert gf._PICKER_CHECK_NONE_MAX < old_hits < gf._PICKER_CHECK_MIN
-    assert gf._picker_selected(image, ref) is False
-    assert gf._pre_click_state(image, ref, identity) is True
-
-
-@pytest.mark.parametrize("center", [900, 1064, 1228, 1392])
-def test_check_zone_uses_column_center_instead_of_name_width(center):
-    short = _click_box((center - 30, 738, center + 30, 761))
-    long = _click_box((center - 65, 738, center + 65, 761))
-    assert gf._picker_check_zone(short) == gf._picker_check_zone(long)
-
-
-def test_check_zone_unknown_geometry_stays_unknown():
-    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
-    image.fill(0)
-    assert gf._picker_selected(image, _click_box((1150, 738, 1190, 761))) is None
-    assert gf._picker_selected(image, _click_box((870, 40, 930, 65))) is None
-    small = QImage(960, 540, QImage.Format.Format_RGB32)
-    small.fill(0)
-    assert gf._picker_selected(small, _click_box((870, 738, 930, 761))) is None
-
-
-def test_partial_green_evidence_stays_unknown():
+def test_pre_click_failure_saves_the_rejected_frame_without_recapturing(monkeypatch, tmp_path):
+    """保存身份不符那一帧，不能用稍后抓的另一帧代替。"""
     from PySide6.QtGui import QColor
 
     image = QImage(1920, 1080, QImage.Format.Format_RGB32)
     image.fill(0)
-    ref = _click_box((1190, 738, 1266, 761))
-    left, top, right, _bottom = gf._picker_check_zone(ref)
-    for i in range(50):
-        image.setPixelColor(left + i % (right-left), top + i // (right-left), QColor(180, 220, 0))
-    assert gf._picker_selected(image, ref) is None
+    ref = _click_box((1188, 491, 1266, 517))
+    image.setPixelColor(0, 0, QColor(180, 220, 0))
+    monkeypatch.setattr(gf, "identity_matches", lambda *_: False)
+    monkeypatch.setattr(gf, "debug_dir", lambda: tmp_path)
+    monkeypatch.setattr(gf, "get_logger", lambda _: Mock())
+    monkeypatch.setattr(gf, "_grab", Mock(side_effect=AssertionError("诊断不能重新截图")))
+    assert gf._pre_click_state(image, ref, object()) is False
+    image.fill(0)  # 后续状态已变化，落盘仍须保留导致拒绝的原图
+    folder = tmp_path / "picker-failures"
+    files = list(folder.glob("*.json"))
+    assert len(files) == 1
+    details = json.loads(files[0].read_text(encoding="utf-8"))
+    assert details["identity"] is False
+    assert "selected" not in details and "color_hits" not in details
+    saved = QImage(str(files[0].with_suffix(".png")))
+    assert not saved.isNull() and saved.pixelColor(0, 0) == QColor(180, 220, 0)
 
 
 def test_reference_manifest_name_spans() -> None:
@@ -289,9 +260,7 @@ class _PickerStub:
         self.identity_ok: bool | None = True
         self.mark_selected = True
         self.stop_after_clicks: int | None = None
-        # 点击后验证帧的三态队列（R19）：取空后回落到真实状态
-        self.selected_sequence: list[bool | None] = []
-        # 这些帧号（index）上 make_identity 返回 None，模拟「行被裁掉/遮挡」的本帧不可用
+            # 这些帧号（index）上 make_identity 返回 None，模拟「行被裁掉/遮挡」的本帧不可用
         self.identity_none_frames: set[int] = set()
 
     def reset_log(self) -> None:
@@ -369,6 +338,8 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch, stub: _PickerStub, *, passthr
     monkeypatch.setattr(gf, "_grab", lambda: (image, stub.hwnd))
     monkeypatch.setattr(gf, "_window_dpi", lambda _hwnd: 96)
     monkeypatch.setattr(gf, "window_pid", lambda _hwnd: 200)
+    monkeypatch.setattr(gf, "find_game_hwnd", lambda: stub.hwnd)
+    monkeypatch.setattr(gf, "client_size", lambda _hwnd: (stub.width, stub.height))
     monkeypatch.setattr(gf.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(gf, "read_rect", lambda _image, area: (stub.reads.append(tuple(area)), stub.lines_for(tuple(area)))[1])
     monkeypatch.setattr(gf, "read_name_bands", lambda _image, _bands: stub.lines_for(_layout().list_area))
@@ -398,16 +369,6 @@ def _install_stub(monkeypatch: pytest.MonkeyPatch, stub: _PickerStub, *, passthr
     monkeypatch.setattr(gf, "identity_matches", lambda _image, _identity: stub.identity_ok)
     monkeypatch.setattr(gf, "_picker_enabled", lambda _image, _click: stub.enabled)
 
-    def _selected(_image, click):
-        name = stub.name_at((click.left + click.right) // 2, (click.top + click.bottom) // 2) or ""
-        if stub.selected_sequence and stub.clicks:
-            value = stub.selected_sequence.pop(0)
-            if value is True:
-                stub.selected.add(name)
-            return value
-        return name in stub.selected
-
-    monkeypatch.setattr(gf, "_picker_selected", _selected)
     monkeypatch.setattr(gf, "_picker_at_top", lambda _image, _layout: stub.at_top)
     monkeypatch.setattr(gf, "_picker_stage_matches", lambda _image, _layout: True)
     monkeypatch.setattr(gf, "_picker_popup_closed", lambda _image: not stub.popup_open)
@@ -607,20 +568,22 @@ def test_new_environment(monkeypatch: pytest.MonkeyPatch, change: str) -> None:
         assert session.last_metrics is not None and session.last_metrics["mode"] == "legacy"
 
 
-def test_origin_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """R08：缓存后弹窗不在顶部（reopen_top）→ 立即失败、移除路径、追加输入为 0。"""
+def test_cached_replay_does_not_check_origin_or_target(monkeypatch):
+    """已有坐标按记录执行，顶部、名称身份、布局和确认按钮不再识别。"""
     stub = _PickerStub([["河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
     _run(session, stub, ("河豚电音",))
+    expected = list(stub.clicks)
     stub.reset_log()
-    stub.at_top = False
-    with pytest.raises(gf.FilterClickError):
-        _run(session, stub, ("河豚电音",))
-    assert stub.clicks == [] and stub.wheels == []
-    assert session.routes == {}
-    assert session.last_metrics is not None
-    assert session.last_metrics["mode"] == "replay" and session.last_metrics["success"] is False
+    for name in ("_picker_at_top", "_picker_stage_matches", "_pre_click_state",
+                 "identity_matches", "_confirm_ready", "read_rect", "read_name_bands", "read_name_span"):
+        monkeypatch.setattr(gf, name, Mock(side_effect=AssertionError("缓存目标不识别")))
+    _run(session, stub, ("河豚电音",))
+    assert stub.clicks == expected and stub.wheels == []
+    assert session.last_metrics["mode"] == "replay" and session.last_metrics["success"]
+    assert session.last_metrics["search_ocr_calls"] == 0
+    assert session.last_metrics["verification_frames"] == 1  # 最终关闭确认
 
 
 def test_wheel_top(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -669,16 +632,16 @@ def test_wheel_top(monkeypatch: pytest.MonkeyPatch) -> None:
     assert session.last_metrics is not None and session.last_metrics["wheel_events"] == 5
 
 
-def test_hidden_selection_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """R10：本段点击后仍未选中 → 第一段即失败，不发第二段与确认，路径不入缓存。"""
+def test_missing_checkmark_feedback_does_not_block_clicks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """勾选检测已移除：没有勾选反馈也不阻断后续点击和确认。"""
     stub = _PickerStub([["静听嘉音", "折枝剑歌"], ["河豚电音"]])
     _install_stub(monkeypatch, stub)
     stub.mark_selected = False
     session = FilterReplaySession()
-    with pytest.raises(gf.FilterClickError):
-        _run(session, stub, ("河豚电音", "静听嘉音", "折枝剑歌"))
-    assert len(stub.clicks) == 2
-    assert session.routes == {}
+    _run(session, stub, ("河豚电音", "静听嘉音", "折枝剑歌"))
+    assert len(stub.clicks) == 4  # 三个目标和一次确认
+    assert stub.selected == set() and not stub.popup_open
+    assert len(session.routes) == 1
 
 
 @pytest.mark.parametrize("state", [False, None])
@@ -817,7 +780,7 @@ def test_matching_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_identity_replay_no_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """R18：回放零名称查找 OCR（列表/确认区一读就炸），身份不符时不点错目标、移除路径。"""
+    """R18：回放零名称查找 OCR（列表/确认区一读就炸），不复验缓存文字身份。"""
     stub = _PickerStub([["河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
@@ -836,13 +799,12 @@ def test_identity_replay_no_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
     metrics = session.last_metrics
     assert metrics is not None and metrics["mode"] == "replay" and metrics["search_ocr_calls"] == 0
     assert len(session.routes) == 1
-    # 同位置换成别的文字：身份不符 → 不点错目标、路径移除
+    # 缓存回放不调用文字身份检测
     stub.reset_log()
     stub.identity_ok = False
-    with pytest.raises(gf.FilterClickError):
-        _run(session, stub, ("河豚电音",))
-    assert stub.clicks == [] and stub.wheels == []
-    assert session.routes == {}
+    _run(session, stub, ("河豚电音",))
+    assert len(stub.clicks) == 2 and stub.wheels == []
+    assert len(session.routes) == 1
 
 
 def test_identity_no_file_and_release(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -861,33 +823,6 @@ def test_identity_no_file_and_release(monkeypatch: pytest.MonkeyPatch) -> None:
     session.routes.clear()
     gc.collect()
     assert ref() is None
-
-
-@pytest.mark.parametrize(
-    ("sequence", "expect_frames", "expect_ok"),
-    [
-        ([False], 3, False),  # 起始 1 + 底层点击前 1 + 点击后首帧失败
-        ([None, None, True], 8, True),  # 起始 1 + 点击前 1 + 点击后 3 + 确认定位 1 + 确认前 1 + 关闭 1
-        ([None, None, None], 5, False),  # 起始 1 + 点击前 1 + 点击后未知 3
-    ],
-)
-def test_observation_budget(
-    monkeypatch: pytest.MonkeyPatch, sequence: list, expect_frames: int, expect_ok: bool
-) -> None:
-    """R19：点击后验证——False 首帧即失败；未知最多共 3 帧（不补发输入）；耗尽即失败。"""
-    stub = _PickerStub([["河豚电音"]])
-    _install_stub(monkeypatch, stub)
-    stub.selected_sequence = list(sequence)
-    session = FilterReplaySession()
-    if expect_ok:
-        _run(session, stub, ("河豚电音",))
-    else:
-        with pytest.raises(gf.FilterClickError):
-            _run(session, stub, ("河豚电音",))
-    metrics = session.last_metrics
-    assert metrics is not None and metrics["verification_frames"] == expect_frames
-    assert stub.wheels == []  # 追加帧期间不补发输入
-    assert stub.selected_sequence == []
 
 
 @pytest.mark.parametrize(
@@ -922,8 +857,10 @@ def test_evidence_sink_restoration(monkeypatch: pytest.MonkeyPatch) -> None:
         assert len(inner) == 1 and len(outer) == 1  # 内层退出后只到 A
 
         stub.reset_log()
-        stub.identity_ok = False
-        with gf._capture_filter_evidence(inner.append), pytest.raises(gf.FilterClickError):
+        def fail_input():
+            raise gf.FilterClickError("输入失败")
+
+        with gf._capture_filter_evidence(inner.append), controlled_inputs(fail_input), pytest.raises(gf.FilterClickError):
             _run(session, stub, ("河豚电音",))
         assert len(inner) == 1 and len(outer) == 1  # 异常路径同样只回落到 A
 
@@ -969,7 +906,7 @@ def test_evidence_contract_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list = []
     with gf._capture_filter_evidence(events.append):
         _run(session, stub, names)
-    assert grabs["n"] - before == baseline  # 证据复用本段已有的帧，不多拍
+    assert grabs["n"] - before == baseline + 2  # 仅启用取证时，每个已发送段另存一帧；不判断勾选。
     assert len(events) == 2  # 两个选择段各一帧
     assert [event.event for event in events] == ["set_stage_selected", "set_stage_selected"]
     assert [event.stage_index for event in events] == [1, 2]
@@ -1452,54 +1389,81 @@ def test_artifact_checker_untracked_files(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- 点击前状态（F01）
 
 
-@pytest.mark.parametrize(
-    ("identity", "enabled", "selected", "expected"),
-    [
-        (True, True, False, True),      # 三项满足
-        (True, True, None, None),       # 选中未知：不能当未选中
-        (True, True, True, False),      # 已选中：再点会取消
-        (None, True, False, None),      # 身份未知
-        (False, True, False, False),    # 身份明确不符
-        (True, False, False, True),     # 套装忽略亮度判据
-        (True, None, False, True),      # 灰色或暗图案仍可选
-        (None, False, False, None),     # 身份未知仍观察三帧
-    ],
-)
-def test_pre_click_state_three_valued(identity, enabled, selected, expected, monkeypatch):
-    """F01/§4.2：点击前状态三态合成——明确不符优先、未知返回 None、不把 None 当未选中。"""
-    monkeypatch.setattr(gf, "identity_matches", lambda _image, _identity: identity)
-    monkeypatch.setattr(gf, "_picker_enabled", lambda _image, _click: enabled)
-    monkeypatch.setattr(gf, "_picker_selected", lambda _image, _click: selected)
-    click = _click_box((100, 100, 140, 120))
-    image = QImage(4, 4, QImage.Format.Format_RGB32)
-    assert gf._pre_click_state(image, click, object()) is expected
-
-
-@pytest.mark.parametrize(
-    ("sequence", "clicks", "frames", "failed"),
-    [
-        ([None, None, False, True], 1, None, False),  # 第三帧确认后才允许点击；点击后选中为 True
-        ([None, None, None], 0, 4, True),             # 未知耗尽三帧：零点击失败（含起始检查 1 帧）
-        ([True], 0, 2, True),                         # 首帧已选中：立即失败，不消耗重拍预算
-    ],
-)
-def test_pre_click_unknown_selected(sequence, clicks, frames, failed, monkeypatch):
-    """F01 补验收：点击前 selected 的 None/True 不得被当作可点；未知按三帧预算处理。"""
-    stub = _PickerStub([["河豚电音"]])
+@pytest.mark.parametrize("replay", [False, True], ids=["learn", "replay"])
+def test_picker_batch_does_not_capture_between_clicks(monkeypatch, replay):
+    """一帧准备三个目标；中间点击动画不参与判读，整批结束后才定位确认按钮。"""
+    names = ("河豚电音", "静听嘉音", "折枝剑歌")
+    stub = _PickerStub([names])
     _install_stub(monkeypatch, stub)
-    values = list(sequence)
-    monkeypatch.setattr(gf, "_picker_selected", lambda _image, _click: values.pop(0) if values else True)
     session = FilterReplaySession()
-    if failed:
-        with pytest.raises(gf.FilterClickError, match="输入前状态不符"):
-            _run(session, stub, ("河豚电音",))
-        assert stub.clicks == []
+    if replay:
+        with controlled_inputs(lambda: 0):
+            _run(session, stub, names)
+        stub.reset_log()
+    original_grab = gf._grab
+    capture_positions = []
+
+    def grab():
+        capture_positions.append(len(stub.clicks))
+        assert len(stub.clicks) not in (1, 2), "批内不得截图判读"
+        return original_grab()
+
+    monkeypatch.setattr(gf, "_grab", grab)
+    with controlled_inputs(lambda: 0):
+        _run(session, stub, names)
+    assert [stub.name_at(x, y) for x, y in stub.clicks[:-1]] == list(names)
+    assert stub.selected == set(names)
+    assert (4 if replay else 3) in capture_positions  # 回放只在确认后抓图
+    assert session.last_metrics["success"] is True
+
+
+def test_picker_batch_rejects_bad_last_target_before_first_click(monkeypatch):
+    """末项名称身份不符时整批不发送输入，不能先点前两项再发现失败。"""
+    names = ("河豚电音", "静听嘉音", "折枝剑歌")
+    stub = _PickerStub([names])
+    _install_stub(monkeypatch, stub)
+    last_box = stub.name_boxes()[names[-1]]
+    monkeypatch.setattr(gf, "identity_matches", lambda _image, identity:
+                        (identity.left, identity.top, identity.right, identity.bottom) != last_box)
+    session = FilterReplaySession()
+    with controlled_inputs(lambda: 0), pytest.raises(gf.FilterClickError, match="输入前状态不符"):
+        _run(session, stub, names)
+    assert stub.clicks == []
+    assert session.routes == {}
+
+
+@pytest.mark.parametrize("changed", [False, True], ids=["resume", "page_changed"])
+def test_picker_batch_resume_checks_only_remaining_targets(monkeypatch, changed):
+    names = ("河豚电音", "静听嘉音", "折枝剑歌")
+    stub = _PickerStub([names])
+    _install_stub(monkeypatch, stub)
+    original_pre = gf._pre_click_state
+    checked = []
+
+    def pre(image, ref, identity):
+        name = stub.name_at((ref.left + ref.right) // 2, (ref.top + ref.bottom) // 2)
+        checked.append((len(stub.clicks), name))
+        return original_pre(image, ref, identity)
+
+    def checkpoint():
+        if stub.clicks and changed:
+            stub.identity_ok = False
+        return 1 if stub.clicks else 0  # 模拟第一项之后暂停恢复
+
+    monkeypatch.setattr(gf, "_pre_click_state", pre)
+    session = FilterReplaySession()
+    with controlled_inputs(checkpoint):
+        if changed:
+            with pytest.raises(gf.FilterClickError, match="输入前状态不符"):
+                _run(session, stub, names)
+        else:
+            _run(session, stub, names)
+    assert checked == [(0, name) for name in names] + [(1, name) for name in names[1:]]
+    assert len(stub.clicks) == (1 if changed else 4)
+    if changed:
+        assert session.routes == {}
     else:
-        _run(session, stub, ("河豚电音",))
-        assert len(stub.clicks) == clicks + 1  # 选项点击 clicks 次 + 确认按钮 1 次
-    if frames is not None:
-        assert session.last_metrics is not None
-        assert session.last_metrics["verification_frames"] == frames
+        assert stub.selected == set(names)
 
 
 def test_pre_click_identity_unknown_ignores_brightness(monkeypatch):
@@ -1533,8 +1497,8 @@ def test_pause_changed_page_before_resume_click(monkeypatch: pytest.MonkeyPatch)
     assert session.routes == {}
 
 
-def test_pause_changed_page_during_replay(monkeypatch: pytest.MonkeyPatch) -> None:
-    """F02/§5.3：回放中暂停期间页面变化 → 旧坐标一次都不发，路径移除。"""
+def test_pause_changed_window_during_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F02/§5.3：回放中暂停期间窗口绑定变化 → 旧坐标一次都不发，路径移除。"""
     stub = _PickerStub([["静听嘉音", "河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
@@ -1543,9 +1507,9 @@ def test_pause_changed_page_during_replay(monkeypatch: pytest.MonkeyPatch) -> No
     stub.reset_log()
 
     def hook() -> None:
-        stub.identity_ok = False  # 回放第一项的恢复确认时页面已变
+        monkeypatch.setattr(gf, "_window_dpi", lambda _hwnd: 144)
 
-    with controlled_inputs(hook), pytest.raises(gf.FilterClickError, match="输入前状态不符"):
+    with controlled_inputs(hook), pytest.raises(gf.FilterClickError, match="窗口绑定变化"):
         _run(session, stub, ("静听嘉音", "河豚电音"))
     assert stub.clicks == []
     assert session.routes == {}
@@ -1649,7 +1613,7 @@ def test_origin_observation_budget(sequence, expect_frames, ok, monkeypatch):
 
 
 def test_stage_layout_observation_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """F05/§5.2：回放段布局检查接入三帧预算（None→True 补拍后继续，不重发滚动）。"""
+    """F05/§5.2：回放不调用段布局判读。"""
     stub = _PickerStub([["静听嘉音", "河豚电音"]])
     _install_stub(monkeypatch, stub)
     session = FilterReplaySession()
@@ -1660,6 +1624,7 @@ def test_stage_layout_observation_budget(monkeypatch: pytest.MonkeyPatch) -> Non
         gf, "_picker_stage_matches", lambda _image, _layout: values.pop(0) if values else True
     )
     _run(session, stub, ("静听嘉音", "河豚电音"))
+    assert values == [None, True]
     assert stub.wheels == []
     assert session.last_metrics is not None and session.last_metrics["mode"] == "replay"
     assert session.last_metrics["wheel_events"] == 0  # 单屏路线：无滚动事件
@@ -1674,9 +1639,9 @@ def test_confirm_observation_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gf, "_picker_enabled", lambda _image, _click: values.pop(0) if values else True)
     session = FilterReplaySession()
     _run(session, stub, ("河豚电音",))
-    # 起始 1 + 点击前 1 + 点击后 1 + 确认定位 1 + 确认观察 2 + 关闭确认 1
+    # 起始 1 + 点击前 1 + 确认定位 1 + 确认观察 2 + 关闭确认 1
     assert session.last_metrics is not None
-    assert session.last_metrics["verification_frames"] == 7
+    assert session.last_metrics["verification_frames"] == 6
     assert session.last_metrics["success"] is True
 
 
@@ -1720,8 +1685,11 @@ def test_changed_page_at_native_checkpoint(monkeypatch, mode, action, boundary, 
         # 此处模拟检查点阻塞后用户改变页面，再恢复。
         state["changed"] = True
         state["sent_before"] = len(windows.mouse_event.mock_calls)
-        stub.identity_ok = False
-        monkeypatch.setattr(gf, "_picker_stage_matches", lambda image, layout: False)
+        if mode == "replay":
+            monkeypatch.setattr(gf, "_window_dpi", lambda _hwnd: 144)
+        else:
+            stub.identity_ok = False
+            monkeypatch.setattr(gf, "_picker_stage_matches", lambda image, layout: False)
 
     def with_generation():
         checkpoint()
@@ -1782,6 +1750,7 @@ def test_environment_changed_at_input_checkpoint(monkeypatch, mode, field):
 
     def checkpoint():
         if field == "hwnd":
+            monkeypatch.setattr(gf, "find_game_hwnd", lambda: stub.hwnd + 1)
             original = gf._grab
             monkeypatch.setattr(gf, "_grab", lambda: (original()[0], stub.hwnd + 1))
         elif field == "pid":
@@ -1789,6 +1758,7 @@ def test_environment_changed_at_input_checkpoint(monkeypatch, mode, field):
         elif field == "dpi":
             monkeypatch.setattr(gf, "_window_dpi", lambda hwnd: 120)
         else:
+            monkeypatch.setattr(gf, "client_size", lambda hwnd: (1280, 720))
             image = QImage(1280, 720, QImage.Format.Format_RGB32)
             monkeypatch.setattr(gf, "_grab", lambda: (image, stub.hwnd))
 
@@ -1841,7 +1811,10 @@ def test_blocked_focus_checkpoint_resume(monkeypatch, mode, changed):
         assert entered.wait(2)
         assert windows.mouse_event.call_count == 0
         if changed:
-            stub.identity_ok = False
+            if mode == "replay":
+                monkeypatch.setattr(gf, "_window_dpi", lambda _hwnd: 144)
+            else:
+                stub.identity_ok = False
         resume.set()
         thread.join(2)
         assert not thread.is_alive()
@@ -1899,7 +1872,7 @@ def test_all_requested_sets_clicked_without_option_enabled_check(monkeypatch):
         route = next(iter(session.routes.values()))
         assert {c.name for stage in route.stages for c in stage.clicks} == set(names)
         stub.reset_log()
-    assert len(enabled_calls) == 2
+    assert len(enabled_calls) == 1  # 只在首次学习确认按钮时判读
 
 
 _THUNDER_FRAME = "手册/参考图/驱动盘筛选/套装弹窗-震星迪斯科候选漏字.png"
@@ -1991,7 +1964,6 @@ def test_real_frame_learning_and_replay_after_truncated_candidate(monkeypatch):
         stub.reset_log()
 
 
-
 def test_all_twelve_visible_names_in_truncated_candidate_frame():
     """同一真机滚动帧覆盖全部完整可见名称，避免只验收新报错的一项。"""
     names = ("法厄同之歌", "河豚电音", "混沌爵士", "激素朋克", "静听嘉音", "灵魂摇滚",
@@ -2030,3 +2002,233 @@ def test_name_recovery_restores_engine_after_second_failure(monkeypatch):
         gf._read_picker_name_span(image, line, name="震星迪斯科", layout=LAYOUT, metrics=metrics)
     assert engine.call_count == metrics.search_ocr_calls == 2
     assert (engine.return_word_box, engine.return_single_char_box) == (False, False)
+
+
+@pytest.mark.parametrize("identity", [True, False, None])
+def test_pre_click_state_uses_only_identity(identity, monkeypatch):
+    monkeypatch.setattr(gf, "identity_matches", lambda *_: identity)
+    monkeypatch.setattr(gf, "_picker_enabled", Mock(side_effect=AssertionError("套装不检测亮度")))
+    image = QImage(4, 4, QImage.Format.Format_RGB32)
+    assert gf._pre_click_state(image, _click_box((100, 100, 140, 120)), object()) is identity
+
+
+@pytest.mark.parametrize("hits", [0, 50, 100, 500])
+def test_checkmark_colors_do_not_block_identity_match(hits, monkeypatch):
+    from PySide6.QtGui import QColor
+    image = QImage(1920, 1080, QImage.Format.Format_RGB32)
+    image.fill(0)
+    for i in range(hits):
+        image.setPixelColor(1274 + i % 38, 376 + i // 38, QColor(180, 220, 0))
+    monkeypatch.setattr(gf, "identity_matches", lambda *_: True)
+    monkeypatch.setattr(gf, "_save_picker_pre_click_failure", Mock(side_effect=AssertionError("勾选不能阻断")))
+    assert gf._pre_click_state(image, _click_box((1188, 491, 1266, 517)), object()) is True
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_picker_waits_actual_time_only_after_last_click(monkeypatch, replay):
+    names = ("河豚电音", "静听嘉音", "折枝剑歌")
+    stub = _PickerStub([names])
+    _install_stub(monkeypatch, stub)
+    session = FilterReplaySession()
+    if replay:
+        with controlled_inputs(lambda: 0):
+            _run(session, stub, names)
+        stub.reset_log()
+    waits = []
+    monkeypatch.setattr(gf, "wait_release", lambda role, release, **kw: waits.append((role, len(stub.clicks), kw)))
+    with controlled_inputs(lambda: 0):
+        _run(session, stub, names)
+    assert [w for w in waits if w[0] == "set_option"] == [
+        ("set_option", 1, {"fallback_ms": 0, "allow_measured": False}),
+        ("set_option", 2, {"fallback_ms": 0, "allow_measured": False}),
+        ("set_option", 3, {"fallback_ms": 87, "allow_measured": True}),
+    ]
+
+
+def test_legacy_picker_tail_waits_each_viewport_before_scrolling(monkeypatch):
+    names = ("静听嘉音", "折枝剑歌")
+    stub = _PickerStub([[names[0]], [names[1]]])
+    _install_stub(monkeypatch, stub)
+    waits = []
+    monkeypatch.setattr(gf, "wait_release", lambda role, release, **kw: waits.append((role, len(stub.clicks), kw)))
+    gf._select_names(stub.hwnd, names, width=1920, height=1080, scroll_center=(960, 540))
+    assert [w for w in waits if w[0] == "set_option"] == [
+        ("set_option", 1, {"fallback_ms": 0, "allow_measured": False}),
+        ("set_option", 1, {"fallback_ms": 87, "allow_measured": False}),
+        ("set_option", 2, {"fallback_ms": 0, "allow_measured": False}),
+        ("set_option", 2, {"fallback_ms": 87, "allow_measured": False}),
+    ]
+
+
+@pytest.mark.parametrize("cached_round,new_round", [(0, 0), (1, 0), (0, 2), (2, 1)])
+def test_new_target_is_recognized_and_merged_with_cached_coordinates(monkeypatch, cached_round, new_round):
+    names = ("河豚电音", "静听嘉音")
+    screens = [[] for _ in range(max(cached_round, new_round) + 1)]
+    screens[cached_round].append(names[0])
+    screens[new_round].append(names[1])
+    stub = _PickerStub(screens)
+    _install_stub(monkeypatch, stub)
+    session = FilterReplaySession()
+    _run(session, stub, names[:1])
+    cached_click = next(iter(session.routes.values())).stages[-1].clicks[0]
+    stub.reset_log()
+    original_read = gf._read_picker_targets
+    original_identity = gf.make_identity
+    recognized = []
+    identity_boxes = []
+    captures = []
+    original_grab = gf._grab
+
+    def read(image, pending, layout, metrics, **kwargs):
+        assert pending == [names[1]], "缓存名称不得重新匹配"
+        recognized.append(stub.index)
+        return original_read(image, pending, layout, metrics, **kwargs)
+
+    def identity(image, box):
+        identity_boxes.append(box)
+        return original_identity(image, box)
+
+    def grab():
+        captures.append((stub.index, len(stub.clicks)))
+        return original_grab()
+
+    monkeypatch.setattr(gf, "_read_picker_targets", read)
+    monkeypatch.setattr(gf, "make_identity", identity)
+    monkeypatch.setattr(gf, "_grab", grab)
+    monkeypatch.setattr(gf, "_pre_click_state", Mock(side_effect=AssertionError("识别完就连续点击")))
+    monkeypatch.setattr(gf, "_confirm_ready", Mock(side_effect=AssertionError("确认坐标已缓存")))
+    _run(session, stub, names)
+    assert recognized == list(range(new_round + 1))
+    assert identity_boxes == [stub.box_of(new_round, screens[new_round].index(names[1]), names[1])]
+    assert (cached_click.x, cached_click.y) in stub.clicks[:-1]
+    assert stub.selected == set(names) and len(stub.clicks) == 3
+    assert len(stub.wheels) == max(cached_round, new_round)
+    if cached_round == new_round:
+        assert (cached_round, 1) not in captures  # 两种来源坐标在同一批次点击
+    route = session.routes[gf._picker_key(stub.hwnd, 1920, 1080, names, _layout())]
+    assert {c.name for stage in route.stages for c in stage.clicks} == set(names)
+    stub.reset_log()
+    monkeypatch.setattr(gf, "_read_picker_targets", Mock(side_effect=AssertionError("全部已有缓存")))
+    _run(session, stub, names)
+    assert session.last_metrics["mode"] == "replay" and session.last_metrics["search_ocr_calls"] == 0
+    assert stub.selected == set(names)
+
+
+def test_cached_names_are_reused_across_target_sets_without_ocr(monkeypatch):
+    names = ("河豚电音", "静听嘉音", "折枝剑歌")
+    stub = _PickerStub([list(names)])
+    _install_stub(monkeypatch, stub)
+    session = FilterReplaySession()
+    _run(session, stub, names[:2])
+    stub.reset_log()
+    _run(session, stub, names[2:])
+    stub.reset_log()
+    for name in ("_read_picker_targets", "read_rect", "read_name_bands", "make_identity",
+                 "_pre_click_state", "_picker_stage_matches", "_picker_at_top", "_confirm_ready"):
+        monkeypatch.setattr(gf, name, Mock(side_effect=AssertionError("跨集合缓存坐标不得识别")))
+    _run(session, stub, (names[0], names[2]))
+    assert stub.selected == {names[0], names[2]} and len(stub.clicks) == 3
+    assert session.last_metrics["mode"] == "replay" and session.last_metrics["search_ocr_calls"] == 0
+
+
+def test_mixed_scan_skips_cached_name_band(monkeypatch):
+    stub = _PickerStub([["河豚电音", "静听嘉音"]])
+    _install_stub(monkeypatch, stub)
+    image, _ = gf._grab()
+    boxes = stub.name_boxes()
+    cached_box = boxes["河豚电音"]
+    cached = SetPickerClick("河豚电音", *cached_box,
+        (cached_box[0]+cached_box[2])//2, (cached_box[1]+cached_box[3])//2,
+        gf.make_identity(image, cached_box))
+    bands = tuple(boxes.values())
+    monkeypatch.setattr(gf, "_picker_name_bands", lambda *args: bands)
+    received = []
+
+    def read(_image, requested_bands):
+        received.extend(requested_bands)
+        box = boxes["静听嘉音"]
+        return [OcrLine(text="静听嘉音", left=box[0], top=box[1], right=box[2], bottom=box[3], score=1)]
+
+    monkeypatch.setattr(gf, "read_name_bands", read)
+    matched = gf._read_picker_targets(image, ["静听嘉音"], _layout(), gf._PickerMetrics("learn"),
+                                      cached_clicks=[cached])
+    assert received == [boxes["静听嘉音"]]
+    assert list(matched) == ["静听嘉音"]
+
+
+def test_mixed_missing_target_stops_without_confirmation_or_publishing_cache(monkeypatch):
+    stub = _PickerStub([["河豚电音"]])
+    _install_stub(monkeypatch, stub)
+    session = FilterReplaySession()
+    _run(session, stub, ("河豚电音",))
+    stub.reset_log()
+    with pytest.raises(gf.FilterClickError, match="仍未找到全部目标"):
+        _run(session, stub, ("河豚电音", "静听嘉音"))
+    assert len(stub.clicks) == 1  # 已发缓存选项不重发、不盲点确认
+    assert stub.popup_open and session.routes == {}
+    assert session.last_metrics["success"] is False
+
+
+def test_learning_and_cached_replay_wait_for_same_scroll_completion(monkeypatch):
+    names = ("静听嘉音", "折枝剑歌")
+    stub = _PickerStub([[], names])
+    _install_stub(monkeypatch, stub)
+    clock = [0]
+    settled_at = [0]
+    scroll_waits = []
+    real_wheel = gf.wheel_client
+
+    def wheel(*args, **kwargs):
+        result = real_wheel(*args, **kwargs)
+        settled_at[0] = clock[0] + 784
+        return result
+
+    def wait(role, release, *, fallback_ms, **kwargs):
+        if role == "set_scroll":
+            scroll_waits.append(fallback_ms)
+        clock[0] += fallback_ms
+
+    monkeypatch.setattr(gf, "wheel_client", wheel)
+    monkeypatch.setattr(gf, "wait_release", wait)
+    # 弹层布局已经出现不代表滚动结束；过早核对缓存位置仍会得到False。
+    monkeypatch.setattr(gf, "identity_matches", lambda *_: clock[0] >= settled_at[0])
+    session = FilterReplaySession()
+    with controlled_inputs(lambda: 0):
+        _run(session, stub, names)
+    assert len(session.routes) == 1
+    assert session.last_metrics["mode"] == "learn"
+    stub.reset_log()
+    with controlled_inputs(lambda: 0):
+        _run(session, stub, names)
+    assert scroll_waits == [784, 784]
+    assert session.last_metrics["mode"] == "replay"
+    assert session.last_metrics["success"] and session.last_metrics["search_ocr_calls"] == 0
+    assert stub.selected == set(names) and len(stub.wheels) == 1
+
+
+def test_legacy_scroll_uses_same_picker_scroll_budget(monkeypatch):
+    names = ("静听嘉音", "折枝剑歌")
+    stub = _PickerStub([[names[0]], [names[1]]])
+    _install_stub(monkeypatch, stub)
+    scroll_waits = []
+    def wait(role, release, **kwargs):
+        if role == "set_scroll":
+            scroll_waits.append(kwargs)
+    monkeypatch.setattr(gf, "wait_release", wait)
+    gf._select_names(stub.hwnd, names, width=1920, height=1080, scroll_center=(960,540))
+    assert scroll_waits == [{"fallback_ms": 784, "allow_measured": False}]
+
+
+def test_scroll_rejection_frame_is_in_motion_despite_valid_popup_layout():
+    from dataclasses import replace
+    from zzz_ddtool.filter_replay import identity_score
+    reference = _image("手册/参考图/驱动盘筛选/套装弹窗-两项选中第三项未选-20261012.png")
+    moving = _image("手册/参考图/驱动盘筛选/套装回放-滚动中拒绝原帧-20261012.png")
+    settled = _image("手册/参考图/驱动盘筛选/套装回放-滚动稳定失败后-20261012.png")
+    identity = make_identity(reference, (1188,491,1266,517))
+    assert identity is not None
+    assert gf._picker_stage_matches(moving, LAYOUT) is True
+    assert identity_matches(moving, identity) is False
+    assert identity_matches(settled, identity) is True
+    displaced = replace(identity, top=identity.top+10, bottom=identity.bottom+10)
+    assert identity_score(moving, displaced) > identity_score(moving, identity) + 0.2
