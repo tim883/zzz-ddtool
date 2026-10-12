@@ -71,44 +71,25 @@ def layout_file() -> Path:
 
 
 def log_settings_file() -> Path:
-    """日志设置记忆（日志级别 + 截图张数上限）。用户数据，更新永不碰。"""
+    """日志设置记忆（日志级别 + 历史日志保留轮数）。用户数据，更新永不碰。"""
     return user_dir() / "log-settings.json"
 
 
-def log_dir() -> Path:
-    """所有运行时产出的根目录，第一层就叫 log。
+def log_root() -> Path:
+    """正式运行的日志根，第一层就叫 log。
 
     与 user/ 用同一条定位规则（``user_data_root()``）：开发态=仓库根/log；
     打包态=公共根/log，周围没有根标记时回退到 exe 同级/log。
     这样把包放进新的版本子目录、删掉旧版本目录，日志仍然保留。
-    运行时产出，不随包分发。文本和图片分开两个明确路径：
-
-        log/text/ddtool.log       文本日志
-        log/captures/<时间戳>/    本轮截图
+    运行时产出，不随包分发。内部结构（每轮一个时间戳目录）见 loground.py。
     """
     return user_data_root() / "log"
 
 
-def captures_dir() -> Path:
-    """图片日志：一轮一个子目录。"""
-    return log_dir() / "captures"
+def test_log_root() -> Path:
+    """测试、探测、回放、标定、基准和验证的日志根。
 
-
-def logs_dir() -> Path:
-    """文本日志目录（里面是 ddtool.log）。"""
-    return log_dir() / "text"
-
-
-def status_file() -> Path:
-    """运行状态（给界面读的临时文件）。"""
-    return log_dir() / "run-status.json"
-
-
-def stats_dir() -> Path:
-    """运行统计（一轮一个 json）。不放 captures 下，免得跟截图回收搅在一起。"""
-    return log_dir() / "stats"
-
-
-def debug_dir() -> Path:
-    """调试用的零散截图（标定、探测等一次性产物）。"""
-    return log_dir() / "debug"
+    与 ``log_root()`` 同一条定位规则，和正式运行分开：这些入口的日志
+    不参与生产轮数计数，也不进用户交付包。
+    """
+    return user_data_root() / "log_test"

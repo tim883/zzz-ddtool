@@ -2204,12 +2204,11 @@ def test_generation_in_progress_keeps_task_invalid_and_prevents_start(qapp, tmp_
 
 
 def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_path) -> None:
-    """窗口大小/三栏比例/置顶要记住：调完关掉再开，不能又回到默认那一坨。"""
+    """窗口大小/三栏比例要记住：调完关掉再开，不能又回到默认那一坨。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")
     window.show()
     qapp.processEvents()
     window.resize(1500, 900)
-    window.stay_on_top.setChecked(True)
     qapp.processEvents()
     # 比例放在最后设、设完就关：中间再跑一轮事件循环的话，布局会把没落定的尺寸
     # 按拉伸因子重算一遍，就把刚设的比例冲掉了（存下来的就不是这里的值）。
@@ -2218,7 +2217,6 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     window.close()
 
     saved = read_layout()
-    assert saved["on_top"] is True
     assert saved["geometry"]
     assert len(saved["config_splitter"]) == 3
     assert len(saved["main_splitter"]) == 2
@@ -2227,7 +2225,6 @@ def test_window_layout_is_remembered_across_restarts(qapp: QApplication, tmp_pat
     reopened = MainWindow(config_path=tmp_path / "t.yaml")
     reopened.show()
     qapp.processEvents()
-    assert reopened.stay_on_top.isChecked()
     # 离屏窗口很窄（1000px 上下），三栏会被各自的最小宽度顶住、比例根本体现不出来；
     # 撑到跟保存时差不多的宽度再套一次记录里的比例，才验得出"比例真的存下来了"。
     reopened.resize(1500, 900)

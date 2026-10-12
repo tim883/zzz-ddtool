@@ -728,11 +728,14 @@ def _upgrade_page_runner(monkeypatch):
 
 
 def test_w9_open_preview_timeout_does_not_resend_detail_button(monkeypatch):
+    """提速改造（2026-10-12）：open_preview 就绪轮询已移除（固定等待 + 硬编码箭头坐标），
+    但「详情按钮只发一次、失败不盲目重发输入」的保证仍在：箭头超时后先重新定位，
+    定位不到（强化页没进来、预览丢失）就不再发箭头，Esc 回仓库。"""
     runner, click = _upgrade_page_runner(monkeypatch)
-    monkeypatch.setattr(runner, "_wait_ready", Mock(side_effect=timeout("open_preview 超时")))
+    monkeypatch.setattr(runner, "_wait_ready", Mock(side_effect=timeout("箭头超时")))
 
     assert runner._enter_upgrade_page(1, before=disc(3)) is False
-    assert click.call_count == 1
+    assert click.call_count == 2      # 详情按钮 + 第一次箭头；重试定位不到不再发
     runner._esc_back_to_grid.assert_called_once_with(1)
 
 
@@ -757,6 +760,8 @@ def test_w9_open_upgrade_second_attempt_needs_same_object_preview(monkeypatch):
 
 
 def test_w9_open_upgrade_fails_when_preview_is_lost(monkeypatch):
+    """提速改造（2026-10-12）：首次箭头坐标为硬编码，`_zoom_arrow_of` 只在重试前
+    重新定位时调用；预览丢失（定位不到「等级」行）→ 不发第二次箭头。"""
     runner, click = _upgrade_page_runner(monkeypatch)
 
     def fake_wait(kind, **_kwargs):
@@ -765,50 +770,32 @@ def test_w9_open_upgrade_fails_when_preview_is_lost(monkeypatch):
         raise timeout("箭头后未进强化页")
 
     monkeypatch.setattr(runner, "_wait_ready", fake_wait)
-    monkeypatch.setattr(runner, "_zoom_arrow_of", Mock(side_effect=[(500, 200), None]))
+    monkeypatch.setattr(runner, "_zoom_arrow_of", Mock(side_effect=[None]))
 
     assert runner._enter_upgrade_page(1, before=disc(3)) is False
-    assert click.call_count == 2      # 详情按钮 + 第一次箭头，第二次不再发
+    assert click.call_count == 2      # 详情按钮 + 第一次箭头，重试定位失败不再发
     runner._esc_back_to_grid.assert_called_once_with(1)
 
 
 def test_w9_open_upgrade_probe_ignores_unknown_rarity_on_upgrade_page(monkeypatch):
-    """强化页不显示等级上限 → 解析 rarity=None；对象接续只比等级与词条（§6.2 表）。
+    """提速改造（2026-10-12）：open_upgrade 就绪判定 = 固定坐标「阶段添加」锚点命中，
+    不再解析盘面、不再比对对象（原 rarity=None 卡死问题随旧探针一并移除）。
 
-    2026-10-10 真机标定实测：若按含稀有度的 ``_core_key`` 全字段比较，强化页解析出的
-    rarity 恒为 None，而 before 来自详情页（「等级12/15」→ 上限 15 → S），这条等待在
-    真机上永远不就绪（`open_upgrade` 5/5 超时，12 帧全 `stage_add=True` 且词条一致）。
+    历史（2026-10-10 真机标定）：旧探针按含稀有度的 ``_core_key`` 全字段比较，
+    强化页 rarity 恒为 None 而 before 为 S → 真机 5/5 超时；该教训的现行等价物是
+    「就绪只看锚点，与 before 盘面完全解耦」。
     """
     runner = Runner(Preset(), hotkeys=False)
     runner.trace = Mock()
     bind_grab(monkeypatch, runner, Frames([{"image": image()}]))
-    monkeypatch.setattr(runner, "_has_stage_add", lambda _frame: True)
     before = Disc(12, (Substat("暴击率", 1), Substat("攻击力", 1)), rarity="S")
 
-    # 强化页：rarity 读不出，等级与词条与 before 一致 → 就绪
-    upgrade = Disc(12, (Substat("攻击力", 1), Substat("暴击率", 1)), rarity=None)
-    monkeypatch.setattr(runner, "_parse_upgrade_page", lambda _frame: upgrade)
+    # 锚点命中 → 就绪（无论 before 是什么盘面）
+    monkeypatch.setattr(runner_module, "is_upgrade_stage_add", lambda _frame: True)
     assert runner._probe_open_upgrade(before)().ready is True
 
-    # 词条区域还没渲染完（少一条）→ 不就绪
-    monkeypatch.setattr(
-        runner, "_parse_upgrade_page",
-        lambda _frame: Disc(12, (Substat("攻击力", 1),), rarity=None),
-    )
-    assert runner._probe_open_upgrade(before)().ready is False
-
-    # 等级与 before 不一致 → 不就绪
-    monkeypatch.setattr(
-        runner, "_parse_upgrade_page",
-        lambda _frame: Disc(11, upgrade.substats, rarity=None),
-    )
-    assert runner._probe_open_upgrade(before)().ready is False
-
-    # 两侧稀有度都已知且不同 → 仍不就绪（稀有度只在都已知时参与比较）
-    monkeypatch.setattr(
-        runner, "_parse_upgrade_page",
-        lambda _frame: Disc(12, upgrade.substats, rarity="A"),
-    )
+    # 锚点未命中（页面没到/还没渲染完）→ 不就绪
+    monkeypatch.setattr(runner_module, "is_upgrade_stage_add", lambda _frame: False)
     assert runner._probe_open_upgrade(before)().ready is False
 
     # 没有「阶段添加」→ 不就绪

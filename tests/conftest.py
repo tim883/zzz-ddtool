@@ -57,7 +57,17 @@ class SimClock:
         seconds = float(seconds)
         if seconds < 0:
             raise ValueError("模拟 sleep 不能为负")
-        self.t += seconds
+        # 2026-10-12：时钟在 10000.0 量级的 float64 ULP≈1.8e-12， readiness 轮询
+        # 在 floor/poll 收尾处会算出比 ULP 还小的尘埃 gap（实测 7.3e-13），
+        # 直接 += 会被舍入吞掉、时钟纹丝不动 → wait_ready 内层调度循环死转
+        # （超时检查同样依赖时钟，永不触发）。契约要求 sleep 必须推进时间，
+        # 故保证至少推进 1 ULP（math.nextafter）。
+        advanced = self.t + seconds
+        if advanced <= self.t and seconds > 0:
+            import math
+
+            advanced = math.nextafter(self.t, math.inf)
+        self.t = advanced
 
 
 class FakeController:

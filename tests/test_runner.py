@@ -2433,7 +2433,9 @@ def test_enter_upgrade_reads_detail_button_area_once(offline_runner, monkeypatch
         offline_runner["click_client"].assert_not_called()
         back.assert_called_once()
     else:
-        assert offline_runner["click_client"].call_args_list == [call(1, 1700, 830), call(1, 1420, 220)]
+        # 2026-10-12 提速改造：箭头坐标改硬编码 (1416, 226)（1920x1080 设计坐标），
+        # 不再由 ZOOM_LEVEL_AREA 的「等级」行 OCR 定位（旧值 1420, 220）。
+        assert offline_runner["click_client"].call_args_list == [call(1, 1700, 830), call(1, 1416, 226)]
         back.assert_not_called()
 
 

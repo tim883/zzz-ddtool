@@ -15,6 +15,21 @@ UNKNOWN = "unknown"
 # 盘面查看/强化弹窗右上角关闭 X。只有确认弹窗存在，才允许 Esc 回退。
 DISC_MODAL_CLOSE = IconMark("盘面弹窗关闭", "discs/modal-close.png", (1625, 187, 1694, 234), 0.90)
 
+# 强化页「阶段添加」按钮文字（紧贴四字 +5px 边距，1232,851-1346,883）。
+# 按钮上缘「长按连续添加材料」提示（闪烁）、按钮下缘均有动画，不能拿来比对
+# （2026-10-12 老大提醒）；本子区经真机 5 帧互比**零像素变动**（NCC=1.000），
+# 非强化页同坐标 -0.19~0，阈值 0.90 余量充足。裁剪样式对齐 picker set-00（紧贴文字）。
+# 模板取自 2026-10-12 真机帧 calibration-evidence-20261012-015208/frame-00011.png。
+STAGE_ADD_ANCHOR = IconMark("阶段添加按钮", "discs/stage-add.png", (1232, 851, 1346, 883), 0.90)
+
+
+def is_upgrade_stage_add(image) -> bool:
+    """强化页固定锚点：「阶段添加」按钮模板匹配（毫秒级，不跑 OCR/认页）。
+
+    供 open_upgrade 就绪探针判定"已进强化页"；替代原来 ~1s/轮的 OCR 判定。
+    """
+    return all_marks_hit(image, (STAGE_ADD_ANCHOR,))
+
 # 详情页点「查看/强化」后的缩放预览层：右上角有「等级xx/15」，但**没有**关闭 X；
 # 再 Esc 一次才回网格。区域只框缩放页的等级文字，详情页侧栏与仓库页都不在此处出词。
 DISC_PREVIEW_LEVEL_AREA = (1140, 175, 1420, 265)

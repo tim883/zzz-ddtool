@@ -1536,7 +1536,7 @@ class MainWindow(QMainWindow):
         for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
             box.toggled.connect(self._mark_unsaved)
         self.max_discs.valueChanged.connect(self._mark_unsaved)
-        # 恢复上次的窗口大小/位置、三栏比例、置顶状态。放在最后：控件都建好了才动。
+        # 恢复上次的窗口大小/位置、三栏比例。放在最后：控件都建好了才动。
         self._restore_layout()
         self._layout_ready = True
 
@@ -1600,8 +1600,6 @@ class MainWindow(QMainWindow):
         if isinstance(geometry, str) and geometry:
             restored = bool(self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii"))))
         self._fit_to_screen(restored)
-        if data.get("on_top"):
-            self.stay_on_top.setChecked(True)
         # 两条比例都延到窗口真正摆好之后再套。构造函数里窗口还没显示，分隔条宽度
         # 还是出厂值，这会儿 setSizes 会被按错误的宽度归一化，比例就歪了
         # （窗口被屏幕夹窄时尤其明显：中间栏本该最宽，结果比右栏还窄）。
@@ -1625,7 +1623,6 @@ class MainWindow(QMainWindow):
         data["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
         data["config_splitter"] = [int(value) for value in self._config_splitter.sizes()]
         data["main_splitter"] = [int(value) for value in self._main_splitter.sizes()]
-        data["on_top"] = bool(self.stay_on_top.isChecked())
         write_layout(data)
 
     def _queue_layout_save(self) -> None:
@@ -1763,18 +1760,12 @@ class MainWindow(QMainWindow):
         titles.addLayout(hint_row)
         self._reset_saved_state()
 
-        capture_btn = QPushButton("截取游戏")
-        capture_btn.clicked.connect(self.capture_game)
-        warehouse_btn = QPushButton("进入驱动盘")
-        warehouse_btn.clicked.connect(self.goto_warehouse)
         open_btn = QPushButton("打开")
         save_btn = QPushButton("保存")
         save_as_btn = QPushButton("另存为")
         open_btn.clicked.connect(self.open_preset)
         save_btn.clicked.connect(self.save_current)
         save_as_btn.clicked.connect(self.save_as)
-        self.stay_on_top = QCheckBox("置顶")
-        self.stay_on_top.toggled.connect(self._toggle_on_top)
         settings_btn = QPushButton("日志设置")
         settings_btn.clicked.connect(self.open_settings)
         check_btn = QPushButton("检查更新")
@@ -1782,8 +1773,6 @@ class MainWindow(QMainWindow):
         examples_btn = QPushButton("获取公共示例")
         examples_btn.clicked.connect(self.fetch_public_examples)
         self._task_controls = [
-            capture_btn,
-            warehouse_btn,
             open_btn,
             save_btn,
             save_as_btn,
@@ -1793,12 +1782,9 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
-        actions.addWidget(self.stay_on_top)
         actions.addWidget(settings_btn)
         actions.addWidget(check_btn)
         actions.addWidget(examples_btn)
-        actions.addWidget(capture_btn)
-        actions.addWidget(warehouse_btn)
         actions.addWidget(open_btn)
         actions.addWidget(save_btn)
         actions.addWidget(save_as_btn)
@@ -3487,17 +3473,6 @@ class MainWindow(QMainWindow):
             f"{scope}：组合共 {total} 种，{condition} {visible}，已勾选 {picked}"
         )
 
-    def _toggle_on_top(self, on: bool) -> None:
-        flags = self.windowFlags()
-        if on:
-            self.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
-        else:
-            self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
-        # setWindowFlags 会把窗口藏掉；只有本来就显示着才需要重新 show。
-        # 启动时恢复上一次的勾选状态也走这里，那会儿窗口还没显示，不能弹出来。
-        if self.isVisible():
-            self.show()
-
     def _start_utility(self, operation, on_success, message: str) -> None:  # noqa: ANN001
         if self._utility_thread is not None or self._run_thread is not None or self._closing:
             return
@@ -3528,25 +3503,6 @@ class MainWindow(QMainWindow):
         else:
             self._update_status()
             self._utility_success(worker.value)
-
-    def _show_capture_result(self, dest: Path, label: str) -> None:
-        self.path_label.setText(f"{label}  {dest.name}")
-        self.path_label.setToolTip(str(dest))
-
-    def capture_game(self) -> None:
-        from zzz_ddtool.capture import capture_game
-
-        self._start_utility(
-            capture_game, lambda dest: self._show_capture_result(dest, "已截取"), "正在截取游戏…"
-        )
-
-    def goto_warehouse(self) -> None:
-        from zzz_ddtool.nav import goto_warehouse
-
-        self._start_utility(
-            goto_warehouse, lambda dest: self._show_capture_result(dest, "已进入驱动盘"),
-            "正在进入驱动盘…",
-        )
 
     def open_preset(self) -> None:
         from zzz_ddtool.paths import plans_dir

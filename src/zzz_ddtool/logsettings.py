@@ -1,14 +1,13 @@
-"""日志设置：级别 + 截图容量。
+"""日志设置：级别 + 历史日志保留轮数。
 
 分开两件事，别混：
-    级别   —— 日志写多少（截图始终全量，不受这个影响）
-    容量   —— 截图留多少张，纯按数量，超了从最旧的轮次整轮删
+    级别     —— 日志写多少（截图始终全量，不受这个影响）
+    保留轮数 —— 已关闭的历史轮次留几轮，超了从最旧的整轮删
 
-这两样都会记到 user/log-settings.json（读写归 logprefs.py），下次启动自动装回。
+这两样都会记到 ``user/log-settings.json``（读写归 logprefs.py），下次启动自动装回。
 
-为什么没有「失败永远保留」：
-    排错靠 debug 模式重跑复现，不靠翻旧图回溯。留着失败图
-    只会把正常的图挤掉。见 retain.py。
+保留轮数是文本框：只允许 1—100，超过 100 不进（见 QIntValidator）。
+正在写入的那一轮不占历史名额，所以运行期间目录数可能暂时多于设置值。
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -25,19 +24,20 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from zzz_ddtool import loground
 from zzz_ddtool.logprefs import (
-    MAX_KEEP_FILES,
-    MIN_KEEP_FILES,
+    MAX_KEEP_ROUNDS,
+    MIN_KEEP_ROUNDS,
     apply as apply_prefs,
     load as load_prefs,
 )
-from zzz_ddtool.retain import clear_captures, count_captures, retain_captures
-from zzz_ddtool.widgets import NoWheelSpinBox
+from zzz_ddtool.retain import clear_history, count_rounds, dir_size, retain_rounds
 
 # 级别只影响日志写多少，不影响截图
 LEVELS: tuple[tuple[str, int], ...] = (
@@ -58,26 +58,23 @@ def human_size(num_bytes: int) -> str:
 
 
 def folder_size(directory: Path) -> int:
-    if not directory.exists():
-        return 0
-    return sum(p.stat().st_size for p in directory.rglob("*") if p.is_file())
+    return dir_size(directory)
 
 
 class LogSettingsDialog(QDialog):
-    """日志设置窗口：级别 + 截图容量 + 当前占用。"""
+    """日志设置窗口：级别 + 保留轮数 + 当前占用和清理。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("日志设置")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(500)
 
-        from zzz_ddtool.paths import captures_dir, log_dir
+        from zzz_ddtool import paths
 
-        self._captures_dir = captures_dir
-        self._log_dir = log_dir
+        self._log_root = paths.log_root
 
         # 从记着的设置里读，不从运行时状态读：只在内存里改过没保存的那一轮不该被显示出来
-        saved_level, saved_keep = load_prefs()
+        saved_level, saved_rounds = load_prefs()
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -92,35 +89,43 @@ class LogSettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow("", note)
 
-        self.keep_spin = NoWheelSpinBox()
-        self.keep_spin.setRange(MIN_KEEP_FILES, MAX_KEEP_FILES)
-        self.keep_spin.setSingleStep(50)
-        self.keep_spin.setSuffix(" 张")
-        self.keep_spin.setValue(saved_keep)
-        form.addRow("截图最多留", self.keep_spin)
+        self.rounds_edit = QLineEdit(str(saved_rounds))
+        self.rounds_edit.setValidator(QIntValidator(MIN_KEEP_ROUNDS, MAX_KEEP_ROUNDS, self))
+        self.rounds_edit.setMaximumWidth(90)
+        rounds_row = QHBoxLayout()
+        rounds_row.addWidget(self.rounds_edit)
+        rounds_row.addWidget(QLabel(f"轮（{MIN_KEEP_ROUNDS}—{MAX_KEEP_ROUNDS}）"))
+        rounds_row.addStretch(1)
+        form.addRow("历史日志保留最近", rounds_row)
 
-        keep_note = QLabel("超了从最旧的轮次整轮删。半截的轮次没参考价值。")
+        keep_note = QLabel(
+            "超了从最旧的轮次整轮删（主日志、报告、统计、性能、截图一起走）。"
+            "正在写入的那一轮不算名额。"
+        )
         keep_note.setObjectName("hint")
         keep_note.setWordWrap(True)
         form.addRow("", keep_note)
 
         layout.addLayout(form)
 
-        # 当前占用：没有这个数字，用户填上限是瞎填
+        # 当前占用：没有这些数字，用户填上限是瞎填
         self.usage = QLabel()
         self.usage.setObjectName("hint")
         self.usage.setWordWrap(True)
         layout.addWidget(self.usage)
 
-        open_row = QHBoxLayout()
-        open_btn = QPushButton("打开日志文件夹")
-        open_btn.clicked.connect(self._open_folder)
-        clear_btn = QPushButton("立即清理全部截图")
+        button_row = QHBoxLayout()
+        current_btn = QPushButton("打开当前日志文件夹")
+        current_btn.clicked.connect(self._open_current)
+        root_btn = QPushButton("打开日志根目录")
+        root_btn.clicked.connect(self._open_root)
+        clear_btn = QPushButton("清理历史日志")
         clear_btn.clicked.connect(self._clear)
-        open_row.addWidget(open_btn)
-        open_row.addWidget(clear_btn)
-        open_row.addStretch(1)
-        layout.addLayout(open_row)
+        button_row.addWidget(current_btn)
+        button_row.addWidget(root_btn)
+        button_row.addWidget(clear_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -132,37 +137,58 @@ class LogSettingsDialog(QDialog):
         self._refresh_usage()
 
     def _refresh_usage(self) -> None:
-        """显示当前占了多少，让用户填数字时有依据。"""
-        shots = count_captures()
-        total = folder_size(self._log_dir())
+        """显示当前轮次、历史轮数和占用，让用户填数字时有依据。"""
+        root = self._log_root()
+        history = count_rounds(root)
+        total = dir_size(root)
+        round_ = loground.current()
+        if round_ is None:
+            current = "当前：没有正在写入的轮次"
+        else:
+            current = f"当前轮次：{round_.id}（{round_.root}）"
         self.usage.setText(
-            f"当前：截图 {shots} 张，日志目录共 {human_size(total)}\n"
-            f"位置：{self._log_dir()}"
+            f"{current}\n"
+            f"历史轮次：{history} 轮；日志根共 {human_size(total)}\n"
+            f"日志根：{root}"
         )
 
-    def _open_folder(self) -> None:
-        folder = self._log_dir()
+    def _open_current(self) -> None:
+        round_ = loground.current()
+        folder = round_.root if round_ is not None else self._log_root()
+        self._open(folder)
+
+    def _open_root(self) -> None:
+        self._open(self._log_root())
+
+    @staticmethod
+    def _open(folder: Path) -> None:
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     def _clear(self) -> None:
-        removed = clear_captures()
+        """只清理已关闭的历史轮次，留着正在写入的目录。"""
+        removed = clear_history()
         self._refresh_usage()
-        self.usage.setText(f"已清理 {removed} 张截图。\n" + self.usage.text())
+        self.usage.setText(f"已清理 {removed} 轮历史日志。\n" + self.usage.text())
 
     def chosen_level(self) -> int:
         return self.level_combo.currentData()
 
-    def chosen_keep(self) -> int:
-        return self.keep_spin.value()
+    def chosen_rounds(self) -> int:
+        """文本框里的轮数。空着或填坏（中间态）就退回记着的值。"""
+        try:
+            value = int(self.rounds_edit.text().strip())
+        except (TypeError, ValueError):
+            return load_prefs()[1]
+        return min(MAX_KEEP_ROUNDS, max(MIN_KEEP_ROUNDS, value))
 
     def apply_settings(self) -> None:
-        """应用设置：改级别 + 记下新上限 + 按它回收。
+        """应用设置：改级别 + 记下新轮数 + 按它回收。
 
-        上限要落盘，否则下次启动 retain 又回到 300，用户填的数字等于白填。
+        轮数要落盘，否则下次启动 retain 又回到默认值，用户填的数字等于白填。
         """
-        apply_prefs(self.chosen_level(), self.chosen_keep())
-        retain_captures()
+        apply_prefs(self.chosen_level(), self.chosen_rounds())
+        retain_rounds()
 
 
 class _LevelCombo(QComboBox):

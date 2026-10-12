@@ -69,7 +69,7 @@ from zzz_ddtool.readiness import (
     ReadinessTimeout,
     WaitResult,
 )
-from zzz_ddtool.screen import DRIVE_DISC, classify_image, is_disc_modal, is_disc_preview, is_page
+from zzz_ddtool.screen import DRIVE_DISC, classify_image, is_disc_modal, is_disc_preview, is_page, is_upgrade_stage_add
 from zzz_ddtool.stats import (
     OUTCOME_DISCARDED,
     OUTCOME_FAILED,
@@ -776,22 +776,35 @@ class Runner:
         def probe() -> readiness.WaitSample:
             frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
             captured = time.monotonic()
-            has_add = self._has_stage_add(frame)
-            disc = self._parse_upgrade_page(frame) if has_add else None
-            ready = bool(has_add and self._same_upgrade_object(disc, before))
+            # 提速（2026-10-12 老大拍板）：固定坐标「阶段添加」按钮模板匹配判定就绪
+            # （毫秒级，无 OCR/认页）。锚点取按钮文字带稳定子区——按钮上缘经验条与
+            # 下缘有动画不能比，已避开。原 OCR 逻辑注释保留在下方，随时可还原。
+            has_add = is_upgrade_stage_add(frame)
             return readiness.WaitSample(
                 frame=frame,
                 captured_at=captured,
-                ready=ready,
-                state_key=("open_upgrade", has_add, self._core_key(disc)),
-                evidence=self._evidence(
-                    core=self._core_of(disc),
-                    return_layer="upgrade" if has_add else "unknown",
-                    stage_add=has_add,
-                    before_core=self._core_of(before),
-                ),
-                disc=disc if ready else None,
+                ready=bool(has_add),
+                state_key=("open_upgrade", has_add),
+                evidence=self._evidence(stage_add=has_add),
+                disc=None,
             )
+            # ===== 原逻辑（OCR 判定 + 全量盘面解析做同盘校验，~1.5s/轮）=====
+            # has_add = self._has_stage_add(frame)
+            # disc = self._parse_upgrade_page(frame) if has_add else None
+            # ready = bool(has_add and self._same_upgrade_object(disc, before))
+            # return readiness.WaitSample(
+            #     frame=frame,
+            #     captured_at=captured,
+            #     ready=ready,
+            #     state_key=("open_upgrade", has_add, self._core_key(disc)),
+            #     evidence=self._evidence(
+            #         core=self._core_of(disc),
+            #         return_layer="upgrade" if has_add else "unknown",
+            #         stage_add=has_add,
+            #         before_core=self._core_of(before),
+            #     ),
+            #     disc=disc if ready else None,
+            # )
 
         return probe
 
@@ -3287,6 +3300,9 @@ class Runner:
         §6.3：详情按钮返回后的 0.9 秒由 ``open_preview`` 替代；箭头返回后的轮询与
         成功等待由一次 ``open_upgrade`` 替代。返回 True=已进强化页；False=中断
         （调用方 Esc 回仓库页）。``before`` 为本次 select 得到的盘面，用于接续证据。
+
+        临时提速（2026-10-12）：open_preview 就绪轮询与箭头定位已注释停用，
+        改为固定等待 + 硬编码箭头坐标，原逻辑保留在方法体内。
         """
         from zzz_ddtool.ocr import read_rect
 
@@ -3309,29 +3325,47 @@ class Runner:
             return False
         with self._business_input("open_preview"):
             preview_release = click_client(hwnd, (hit.left + hit.right) // 2, (hit.top + hit.bottom) // 2)
-        try:
-            preview = self._wait_ready("open_preview", release=preview_release, before=before)
-        except ReadinessTimeout as exc:
-            # §6.3：open_preview 超时不重发详情按钮、不点箭头，清理后返回 False。
-            self.log.warning("UPGRADE: open_preview 超时（%s）", exc)
-            self.trace.fail("zoom", "enter_upgrade", f"未进入预览层：{exc}")
-            self._esc_back_to_grid(hwnd)
-            return False
-        image = preview.frame
+        # 点①前截图留档（OCR 找「查看/强化」按钮用的那一帧，即点击前画面）。
+        self.trace.ok("detail", "step-open-preview", "点「查看/强化」前截图", image=image)
 
-        # 2) 缩放页「等级」右缘 +110px 的「>>」箭头（用预览完成帧定位）
-        arrow = self._zoom_arrow_of(image, before)
-        if arrow is None:
-            self.log.warning("UPGRADE: 缩放页没找到可定位的「等级」/箭头")
-            self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字或对象不一致", image=image)
-            self._esc_back_to_grid(hwnd)
-            return False
-        ax, ay = arrow
+        # ===== 临时提速（2026-10-12 老大拍板）：open_preview 之后到点箭头之间只保留等待，
+        # ===== 原判定/定位动作整段注释停用（保留在下方，随时可还原）。
+        # 原逻辑 A：open_preview 就绪轮询——每轮 grab + 判层级/读等级的多次 OCR 判定，
+        #           真机实测 ~1.3s/轮 × 连续 2 帧稳定（慢的是逐轮 OCR 判定，不是模板匹配）。
+        # 原逻辑 B：_zoom_arrow_of 读「等级」行校验等级并定位箭头坐标。
+        # 新逻辑：睡满 open_preview 下限（600+200=800ms，时间表标定值）→ 截一张点击前留档帧
+        #         → 按硬编码设计坐标点「》」箭头（2026-10-12 measure.jsonl call_id=3 实测 (1416,226)）。
+        #
+        # try:
+        #     preview = self._wait_ready("open_preview", release=preview_release, before=before)
+        # except ReadinessTimeout as exc:
+        #     # §6.3：open_preview 超时不重发详情按钮、不点箭头，清理后返回 False。
+        #     self.log.warning("UPGRADE: open_preview 超时（%s）", exc)
+        #     self.trace.fail("zoom", "enter_upgrade", f"未进入预览层：{exc}")
+        #     self._esc_back_to_grid(hwnd)
+        #     return False
+        # image = preview.frame
+        #
+        # # 2) 缩放页「等级」右缘 +110px 的「>>」箭头（用预览完成帧定位）
+        # arrow = self._zoom_arrow_of(image, before)
+        # if arrow is None:
+        #     self.log.warning("UPGRADE: 缩放页没找到可定位的「等级」/箭头")
+        #     self.trace.fail("zoom", "enter_upgrade", "没找到「等级」两字或对象不一致", image=image)
+        #     self._esc_back_to_grid(hwnd)
+        #     return False
+        # ax, ay = arrow
+
+        time.sleep(_READY_FLOOR_MS["open_preview"] / 1000)
+        image, *_ = self._grab(allow_esc=False, need_page=False)
+        ax, ay = scale_point(1416, 226, image.width(), image.height())
 
         # 3) 点箭头进强化页；首次超时最多保留一次第二箭头输入（须重新确认同对象预览）。
         for attempt in (1, 2):
             with self._business_input("open_upgrade"):
                 upgrade_release = click_client(hwnd, ax, ay)
+            if attempt == 1:
+                # 点②前截图留档（image 即睡眠后、点击前的画面）。
+                self.trace.ok("zoom", "step-open-upgrade", "点「》」箭头前截图（固定坐标）", image=image)
             try:
                 entered = self._wait_ready("open_upgrade", release=upgrade_release, before=before)
                 # §6.2 首档接续证据：记录进入强化页确认时刻的暂停代次，供首档 seed 校验。

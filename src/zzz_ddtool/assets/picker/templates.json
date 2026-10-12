@@ -302,16 +302,6 @@
    "match_min_score": 0.98,
    "match_min_gap": 0.03,
    "source_frame": "套装弹窗-三行翻页-底部.png"
-  },
-  {
-   "template_id": "set-18-v1",
-   "name": "啄木鸟电音",
-   "image": "templates/set-18-v1.png",
-   "sha256": "33ef78eae7ed98c93d4f15f05e84dd5de938eb3fc69b5ae291df039dce769c3d",
-   "source_image_sha256": "b731a7e59266a2f790436a95676a98ff30bd214f9434c3d30d9d57fee99c7bcf",
-   "match_min_score": 0.98,
-   "match_min_gap": 0.03,
-   "source_frame": "套装弹窗-低对比度-未选.png"
   }
  ]
 }

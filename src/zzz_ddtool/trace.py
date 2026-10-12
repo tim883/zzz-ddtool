@@ -21,9 +21,9 @@
       这类步骤正是坐标可能偏的地方，图是核对坐标的唯一依据。
 
     容量怎么控（截图 1.5MB 一张，不控会撑爆磁盘）：
-        纯按总张数。超了从最旧的轮次开始整轮删。
+        按**轮数**整轮回收——一轮的日志、报告、统计、性能、截图一起删。
         不做「失败永远保留」——排错靠 debug 重跑复现，不靠翻旧图回溯，
-        留着失败图只会把正常的挤掉。见 retain.py。
+        留着失败图只会把正常的挤掉。见 retain.py 与 loground.py。
 
 耗时怎么量（给运行统计用）：
     Trace 的接口是「干完了再记一笔」，没有显式的 begin，所以单步耗时用
@@ -39,10 +39,9 @@ import logging
 import time
 from pathlib import Path
 
-from zzz_ddtool import scanperf
+from zzz_ddtool import loground, scanperf
 from zzz_ddtool.capture import grab_game_image
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.paths import captures_dir
 from zzz_ddtool.stats import StepSpan
 
 # 页面：程序内部标识 → 日志里给人看的中文
@@ -95,10 +94,15 @@ def action_name(action: str) -> str:
 
 
 class Trace:
-    """一轮运行的步骤跟踪：每步一条日志 + 一张图，容量按策略回收。"""
+    """一轮运行的步骤跟踪：每步一条日志 + 一张图，图存本轮 ``captures/``。"""
 
     def __init__(self, tag: str = "", *, dir: Path | None = None) -> None:
-        self.tag = tag or time.strftime("%Y%m%d-%H%M%S")
+        if tag:
+            self.tag = tag
+        else:
+            round_ = loground.current()
+            # 轮次编号就是一轮的 tag：日志、统计、性能用的是同一个身份。
+            self.tag = round_.id if round_ is not None else time.strftime("%Y%m%d-%H%M%S")
         self._step = 0
         self._dir: Path | None = Path(dir) if dir is not None else None
         self.failed = False
@@ -111,7 +115,7 @@ class Trace:
     @property
     def dir(self) -> Path:
         if self._dir is None:
-            self._dir = captures_dir() / self.tag
+            self._dir = loground.captures_dir()
         self._dir.mkdir(parents=True, exist_ok=True)
         return self._dir
 
@@ -229,21 +233,22 @@ class Trace:
             get_logger("zzz_ddtool.trace").warning("存图失败：%s", exc)
             return None
         self._shots.append(target)
-        return f"{self.tag}/{name}"
+        return name
 
     def finish(self) -> None:
-        """收尾：按总张数回收旧轮次（纯按数量，不做特殊保留）。"""
-        log = get_logger("zzz_ddtool.trace")
-        from zzz_ddtool.retain import get_max_files, retain_captures
+        """收尾：把本轮收成一条摘要。
 
-        removed = retain_captures()
+        回收不在这里做——按轮数清理只由正式入口触发（见 retain.py），
+        免得测试或开发脚本反过来清掉生产日志。
+        """
+        log = get_logger("zzz_ddtool.trace")
+        round_ = loground.current()
+        where = str(round_.root) if round_ is not None else str(self.dir)
         log.info(
-            "本轮结束：共 %d 步，处理 %d 个盘，%s，本轮 %d 张图，截图在 captures/%s",
+            "本轮结束：共 %d 步，处理 %d 个盘，%s，本轮 %d 张图，日志在 %s",
             self._step,
             self._disc_no,
             ("有失败" if self.failed else "无失败"),
             len(self._shots),
-            self.tag,
+            where,
         )
-        if removed:
-            log.info("截图总数超 %d 张，清理了最旧的 %d 张", get_max_files(), len(removed))
