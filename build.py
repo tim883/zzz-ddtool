@@ -25,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PKG_NAME = "zzz-ddtool"  # 必须与 zzz-ddtool.spec 的 COLLECT(name=...) 一致
 DEFAULT_OUTDIR = ROOT / "dist"
-PROTECTED_DIRS = (".git", ".venv", "src", "tests", "scripts", "data", "user", "手册", "dev-docs", "build")
+PROTECTED_DIRS = (".git", ".venv", "src", "tests", "scripts", "data", "user", "log", "log_test", "手册", "dev-docs", "build")
 PRESERVED_MARKERS = (".git", ".zzz-ddtool-root", "pyproject.toml", "user")
 
 

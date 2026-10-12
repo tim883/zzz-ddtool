@@ -1,4 +1,8 @@
-"""步骤跟踪的中文命名与步骤号（日志给人看，错了就白记）。"""
+"""步骤跟踪的中文命名、步骤号与截图落点（日志给人看，错了就白记）。
+
+落点变了：图存**当前轮次**的 ``captures/``，不再拼 ``<tag>/`` 一层；
+日志里的「截图=」只写文件名，同一轮目录里一看就对上。
+"""
 
 import logging
 from pathlib import Path
@@ -11,8 +15,8 @@ from zzz_ddtool import trace as trace_module
 
 @pytest.fixture(autouse=True)
 def isolated_capture(tmp_path, monkeypatch):
-    """只用临时目录和内存图片，不在日志回归中抓真实桌面或写用户日志。"""
-    monkeypatch.setattr(trace_module, "captures_dir", lambda: tmp_path / "captures")
+    """只用临时目录和内存图片，不在日志回归中抓真实桌面或写会话沙箱。"""
+    monkeypatch.setattr(trace_module.loground, "captures_dir", lambda: tmp_path / "captures")
     monkeypatch.setattr(trace_module, "grab_game_image", lambda: (_FakeImage(tmp_path), "fake", 1))
 
 
@@ -73,14 +77,37 @@ def test_fail_mentions_screenshot_or_explains_why_not(caplog: pytest.LogCaptureF
     assert any("截图=" in m or "截图没成功" in m for m in messages)
 
 
-def test_screenshot_filename_uses_step_number(tmp_path) -> None:
-    """截图名带步骤号，才能和日志那一行对上。"""
+def test_screenshot_lands_in_current_captures_without_a_tag_dir(tmp_path) -> None:
+    """截图名带步骤号，才能和日志那一行对上；目录就是本轮 captures，不再拼 tag。"""
     trace = Trace(tag="tag")
     trace.step_start("detail", "parse")
     name = trace._persist("parse", image=_FakeImage(tmp_path))
-    assert name == "tag/0001-识别盘面.png"
-    assert trace._shots == [trace.dir / "0001-识别盘面.png"]
+    assert trace.dir == tmp_path / "captures"
+    assert name == "0001-识别盘面.png"
+    assert trace._shots == [tmp_path / "captures" / "0001-识别盘面.png"]
     assert trace._shots[0].read_bytes() == b"x"
+
+
+def test_log_line_names_only_the_screenshot_file(tmp_path, caplog) -> None:
+    """日志里的「截图=」只写文件名，不写一长串路径。"""
+    trace = Trace(tag="tag-name")
+    with caplog.at_level(logging.INFO, logger="zzz_ddtool.trace"):
+        trace.ok("detail", "parse", "等级3", image=_FakeImage(tmp_path))
+    messages = [r.getMessage() for r in caplog.records if "截图=" in r.getMessage()]
+    assert len(messages) == 1
+    assert messages[0].endswith("截图=0001-识别盘面.png")
+    assert "captures" not in messages[0]
+
+
+def test_tag_defaults_to_the_round_id(tmp_path) -> None:
+    """不给 tag 时用当前轮次编号：日志、统计、性能共用一个身份。"""
+    root = tmp_path / "log_test"
+    root.mkdir()
+    round_ = trace_module.loground.use_test_context("trace", root=root)
+    try:
+        assert Trace().tag == round_.id
+    finally:
+        trace_module.loground.close_active()
 
 
 def test_decide_does_not_shoot() -> None:
@@ -146,6 +173,24 @@ def test_decide_step_also_records_a_span(tmp_path: Path) -> None:
     assert len(trace.spans) == 1
     assert trace.spans[0].action == "判断"
     assert trace._shots == []
+
+
+def test_finish_logs_one_summary_and_does_not_recycle(tmp_path, monkeypatch, caplog) -> None:
+    """收尾只记一条摘要；回收只由正式入口触发，trace 不反手清生产日志。"""
+    from zzz_ddtool import retain
+
+    calls: list[int] = []
+    monkeypatch.setattr(retain, "retain_rounds", lambda *a, **k: calls.append(1) or [])
+
+    trace = Trace(tag="tag-finish")
+    trace.ok("detail", "parse", "等级3", image=_FakeImage(tmp_path))
+    with caplog.at_level(logging.INFO, logger="zzz_ddtool.trace"):
+        trace.finish()
+
+    assert calls == []
+    summaries = [r.getMessage() for r in caplog.records if "本轮结束" in r.getMessage()]
+    assert len(summaries) == 1
+    assert "共 1 步" in summaries[0]
 
 
 def test_trace_accepts_explicit_dir(tmp_path: Path) -> None:

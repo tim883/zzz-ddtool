@@ -18,13 +18,14 @@ from PySide6.QtGui import QFont, QFontDatabase
 
 from zzz_ddtool.gamedata import SUBSTAT_NAMES
 from zzz_ddtool.gui import MainWindow
-from zzz_ddtool import gui
+from zzz_ddtool import gui, loground
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--outdir", type=Path, required=True)
     args = parser.parse_args()
+    loground.use_test_context("profile-gui")
     args.outdir.mkdir(parents=True, exist_ok=True)
     app = QApplication.instance() or QApplication([])
     font_file = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"

@@ -264,24 +264,27 @@ def _unlock_fd(fd: int) -> None:
 
 
 def _probe_lock(path: Path) -> bool:
-    """别的进程有没有占着这轮？拿不到锁 = 有人在写。"""
+    """别的进程有没有占着这轮？拿不到锁 = 有人在写。
+
+    fd 必须在所有分支都关掉：Windows 上没关的句柄会一直按住 `.active`，
+    本进程以后就再也删不掉这一轮（rmtree 报 WinError 32）。
+    """
     try:
         fd = os.open(str(path), os.O_RDWR)
     except OSError:
         return False
+    occupied = True
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         _lock_fd(fd)
-    except OSError:
-        return True
-    try:
+        occupied = False
         os.lseek(fd, 0, os.SEEK_SET)
         _unlock_fd(fd)
     except OSError:
         pass
     finally:
         os.close(fd)
-    return False
+    return occupied
 
 
 def _pid_alive(pid: int) -> bool:
@@ -438,6 +441,8 @@ def begin(
         write_registry(round_)
         _active, _active_fd = round_, fd
     _attach_logging(round_)
+    # 每轮先留一条身份行：日志文件非空，打开就知道这是哪一轮、谁开的
+    _log().info("本轮日志目录：%s（来源 %s）", round_.root, round_.source)
     if old_round is not None:
         _release_lock(old_fd)
         try:
@@ -450,6 +455,24 @@ def begin(
 def begin_task(source: str = "task", *, config: str = "", task: str = "") -> Round:
     """一次正式任务的轮次：一份 yaml 一个目录，不复用启动轮次。"""
     return begin(source, config=config, task=task, started=True)
+
+
+def claim_task(*, config: str = "", task: str = "") -> Round:
+    """本次任务就用当前这一轮（入口已经为这份 yaml 开好目录时用）。
+
+    入口自己开了一轮、并且还没开过任务（``started_at`` 为空）时直接认领，
+    免得一次 CLI 运行生成"配置装载"和"任务"两个目录；否则照常另开新轮次。
+    """
+    with _state_lock:
+        if _active is not None and _active.state == "open" and not _active.started_at:
+            _active.started_at = _stamp()
+            if config:
+                _active.config = config
+            if task:
+                _active.task = task
+            write_registry(_active)
+            return _active
+    return begin_task("task", config=config, task=task)
 
 
 def use_test_context(source: str = "test", *, root: Path | None = None) -> Round:
@@ -575,6 +598,7 @@ __all__ = [
     "begin",
     "begin_task",
     "captures_dir",
+    "claim_task",
     "close_active",
     "current",
     "current_root",

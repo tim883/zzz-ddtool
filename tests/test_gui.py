@@ -50,17 +50,20 @@ def qapp() -> QApplication:
 
 @pytest.fixture(autouse=True)
 def isolated_user_data(tmp_path, monkeypatch):
-    from zzz_ddtool import paths
+    from zzz_ddtool import loground, paths
 
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
     monkeypatch.setattr(paths, "user_dir", lambda: tmp_path / "user")
     monkeypatch.setattr(paths, "user_data_root", lambda: tmp_path / "application-root")
     monkeypatch.setattr(paths, "legacy_plan_dirs", lambda: (tmp_path / "legacy" / "data",))
-    # 运行时产出（日志/截图/状态/统计）同样要隔离：界面启动会去读 log/run-status.json
-    # 恢复状态行，文件在不在会改变下半区（状态行+日志）的最小高度，进而左右窗口缩放
-    # 类断言的成败。不隔离就会读到开发机上真实的 run-status.json，测试结果不稳定。
-    monkeypatch.setattr(paths, "log_dir", lambda: tmp_path / "log")
-    monkeypatch.setattr(paths, "status_file", lambda: tmp_path / "log" / "run-status.json")
+    # 运行时产出（日志/截图/状态/统计）同样要隔离：界面启动会去读当前轮次的
+    # run-status.json 恢复状态行，文件在不在会改变下半区（状态行+日志）的最小高度，
+    # 进而左右窗口缩放类断言的成败。不隔离就会读到开发机上真实的 run-status.json，
+    # 测试结果不稳定。上下文按用例各开一轮，状态指针与本轮日志都落在 tmp_path。
+    # 收尾释放占用：不把活动轮次留给后面的用例。
+    loground.use_test_context("gui-test", root=tmp_path / "log_test")
+    yield
+    loground.close_active()
 
 
 def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
@@ -100,6 +103,17 @@ def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     preset = window.collect_preset()
     assert preset.weights == {"暴击率": 1.0}
     assert preset.accepted is None  # Ungenerated tasks stay invalid until a list is established.
+    window.close()
+
+
+def test_hard_filter_has_no_require_s_rank_checkbox(qapp: QApplication, tmp_path) -> None:
+    """「跳过非S级」开关已删除（2026-10-12）：界面没有该控件，配置里也没有该字段。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert not hasattr(window, "require_s")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    preset = window.collect_preset()
+    assert not hasattr(preset, "require_s_rank")
     window.close()
 
 
@@ -605,25 +619,31 @@ def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatc
     window.close()
 
 
-def test_log_panel_updates_rotates_and_shows_failure(qapp, tmp_path, monkeypatch):
-    from zzz_ddtool import paths
+def test_log_panel_updates_rotates_and_shows_failure(qapp, tmp_path):
+    """日志面板读当前轮次的 ddtool.log：正文跟随追加；换轮次时重载新文件并刷新路径提示。"""
+    from zzz_ddtool import loground
 
-    monkeypatch.setattr(paths, "logs_dir", lambda: tmp_path)
-    monkeypatch.setattr(paths, "status_file", lambda: tmp_path / "status.json")
-    logfile = tmp_path / "ddtool.log"
-    logfile.write_text("02:42:06 [信息] 点开格子\n", encoding="utf-8")
+    first = loground.use_test_context("gui-log", root=tmp_path / "log_test")
+    first.log_path.write_text("02:42:06 [信息] 点开格子\n", encoding="utf-8")
     window = MainWindow(config_path=tmp_path / "t.yaml")
     try:
         assert "点开格子" in window.run_log.toPlainText()
-        with logfile.open("a", encoding="utf-8") as stream:
+        assert str(first.log_path) in window.log_path.text()
+        with first.log_path.open("a", encoding="utf-8") as stream:
             stream.write("02:42:13 [错误] 识别失败：重试耗尽\n")
         window._refresh_run_status()
         assert "重试耗尽" in window.run_log.toPlainText()
         window._show_run_status({"phase": "failed", "message": "识别失败", "processed": 0, "max_discs": 2})
         assert "识别失败" in window.run_status_label.text()
-        logfile.write_text("新一轮日志\n", encoding="utf-8")
+        # 换轮次（下一个任务）：面板重新加载新一轮的日志，不残留上一轮正文；路径提示跟着走。
+        second = loground.use_test_context("gui-log", root=tmp_path / "log_test")
+        assert second.log_path != first.log_path
+        second.log_path.write_text("新一轮日志\n", encoding="utf-8")
         window._refresh_run_status()
         assert window.run_log.toPlainText() == "新一轮日志"
+        assert window._log_path_shown == second.log_path
+        assert str(second.log_path) in window.log_path.text()
+        assert str(first.log_path) not in window.log_path.text()
     finally:
         window.close()
 
@@ -635,12 +655,15 @@ def test_task_buttons_and_close_share_controller(qapp, tmp_path, monkeypatch):
 
     entered = threading.Event()
     controllers = []
+    config_paths = []
     monkeypatch.setattr(hotkeys.user32, "GetAsyncKeyState", lambda key: 0)
 
     class FakeRunner:
-        def __init__(self, preset, *, controller, on_status):
+        def __init__(self, preset, *, controller, on_status, config_path=""):
             self.controller, self.on_status = controller, on_status
+            self.config_path = config_path
             controllers.append(controller)
+            config_paths.append(config_path)
 
         def run(self):
             entered.set()
@@ -657,6 +680,8 @@ def test_task_buttons_and_close_share_controller(qapp, tmp_path, monkeypatch):
     refresh_cards(window, qapp)
     window.start_btn.click()
     assert entered.wait(3)
+    # 本轮跑的是哪份 yaml，要一路带到 Runner（它按这个开轮次并登记 config）。
+    assert config_paths == [str(window._path)]
     window._on_start_clicked()  # 防重复启动
     assert len(controllers) == 1
     assert not window.start_btn.isEnabled()
@@ -2008,9 +2033,10 @@ def test_unsaved_counts_start_yaml_and_execution_share_the_same_snapshot(qapp, t
         status_changed = Signal(dict)
         finished = Signal()
 
-        def __init__(self, preset, controller):
+        def __init__(self, preset, controller, config_path=""):
             super().__init__()
             self.preset = preset
+            self.config_path = config_path
 
         def start(self):
             executed.append(self.preset)
@@ -2661,6 +2687,33 @@ def test_run_status_swaps_to_result_stats_when_finished(qapp: QApplication, tmp_
     shown = window.run_stats_path_label.text()
     assert str(report) in shown
     assert "总览" not in shown
+
+    # 本次收尾同时写了 report_path 与 stats_path（同一个文件）：优先按 report_path 展示
+    window._show_run_status(
+        {
+            "phase": "completed",
+            "stats_path": str(tmp_path / "旧版写下的.json"),
+            "report_path": str(report),
+            "stats_headline": "共计耗时 1 分 00 秒，处理了 0 个盘，升满成功 0 件，判定弃置 0 件。",
+        }
+    )
+    preferred = window.run_stats_path_label.text()
+    assert str(report) in preferred
+    assert str(tmp_path / "旧版写下的.json") not in preferred
+
+    # 报告随整轮回收：记录里的路径已经不存在 → 写明缘由，不给死链接
+    report.unlink()
+    window._show_run_status(
+        {
+            "phase": "completed",
+            "stats_path": str(report),
+            "report_path": str(report),
+            "stats_headline": "共计耗时 1 分 00 秒，处理了 0 个盘，升满成功 0 件，判定弃置 0 件。",
+        }
+    )
+    recycled = window.run_stats_path_label.text()
+    assert "该轮报告已回收" in recycled
+    assert "<a href" not in recycled
 
     # 下一轮开始：结果统计区必须收起来，别把上一轮的留在屏上
     window._show_run_status(running)

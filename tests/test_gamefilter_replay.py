@@ -167,7 +167,7 @@ def test_pre_click_failure_saves_the_rejected_frame_without_recapturing(monkeypa
     ref = _click_box((1188, 491, 1266, 517))
     image.setPixelColor(0, 0, QColor(180, 220, 0))
     monkeypatch.setattr(gf, "identity_matches", lambda *_: False)
-    monkeypatch.setattr(gf, "debug_dir", lambda: tmp_path)
+    monkeypatch.setattr(gf.loground, "diagnostics_dir", lambda: tmp_path)
     monkeypatch.setattr(gf, "get_logger", lambda _: Mock())
     monkeypatch.setattr(gf, "_grab", Mock(side_effect=AssertionError("诊断不能重新截图")))
     assert gf._pre_click_state(image, ref, object()) is False

@@ -4,6 +4,7 @@
 不发送任何真实游戏输入。
 """
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import ANY, Mock, call
@@ -14,6 +15,7 @@ from PySide6.QtGui import QImage
 import zzz_ddtool.ocr as ocr_module
 import zzz_ddtool.runner as runner_module
 import zzz_ddtool.screen as screen_module
+from zzz_ddtool import loground
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
 from zzz_ddtool.decide import decide
@@ -83,6 +85,39 @@ def _release_timing_stub(monkeypatch):
     真实计时/分片/暂停语义由 tests/test_actionwait.py 与 tests/test_runner_waits.py 覆盖。
     """
     monkeypatch.setattr(runner_module, "wait_release", lambda *args, **kwargs: None)
+
+
+@pytest.fixture(autouse=True)
+def round_sandbox(tmp_path):
+    """把日志上下文钉在临时目录：run() 会真的开一个轮次目录。
+
+    一轮 = 一个时间戳目录（本轮日志、统计、报告、性能、截图都在里面）。
+    直接跑 run() 的用例若不管上下文，会把轮次开进真实 ``log_test/``，所以每个
+    用例先在这里开一轮测试上下文，run() 之后产生的轮次就落在 tmp_path 里。
+    收尾释放占用：不把活动轮次留给后面的用例。
+    """
+    loground.use_test_context("pytest-runner", root=tmp_path / "log_test")
+    yield loground.current()
+    loground.close_active()
+
+
+@pytest.fixture(autouse=True)
+def direct_call_artifacts(monkeypatch):
+    """轮次、步骤跟踪与运行统计由 run() 建立；直接调内部方法的用例仍需它们在场。
+
+    这里按 run() 开头那两步给每个执行器补上替身 Trace 与真实统计，但不建轮次目录：
+    用例只验证单步行为时，不该被“没有 trace/stats”挡住。
+    """
+    from zzz_ddtool.stats import RunStats
+
+    original = Runner.__init__
+
+    def patched(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.trace = Mock()
+        self.stats = RunStats(tag="direct")
+
+    monkeypatch.setattr(Runner, "__init__", patched)
 
 
 def make_cell(global_row0, col, screen_row0, level=0):
@@ -2704,3 +2739,116 @@ def test_derived_substat_arguments(offline_runner, monkeypatch):
 
     runner._run_job(replace(job, accepted=None))  # 未生成任务：跳过，不注入筛选
     assert len(captured) == 1
+
+
+# ---------------------------------------------------------------- 轮次收尾产物
+#
+# 一轮 = 一个时间戳目录：本轮日志、统计、报告、性能、成功盘图都在它里面，
+# 回收也整轮走。这里用「任务未生成卡片名单」的执行器跑完整的 run()：主循环只记一条
+# 跳过，零游戏输入、零处理，但收尾路径与真实运行完全相同。
+
+
+def _zero_disc_runner(**kwargs) -> Runner:
+    return Runner(Preset(task_chain=(TaskJob(slot=4, accepted=None),), **kwargs), hotkeys=False)
+
+
+def test_one_run_keeps_every_artifact_in_one_round(round_sandbox, monkeypatch):
+    """一次 run() 的日志、统计、报告、性能都在同一个轮次目录里，且统计挂的就是本轮编号。"""
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    runner = _zero_disc_runner()
+    runner.run()
+
+    round_ = loground.current()
+    assert round_ is not None and round_.root.parent == round_sandbox.root.parent
+    assert runner.outcome == "completed" and runner.processed_disc_count == 0
+    for name in ("ddtool.log", "stats.json", "report.md", "perf.jsonl"):
+        path = round_.root / name
+        assert path.is_file() and path.stat().st_size > 0, name
+    assert json.loads(round_.stats_path.read_text(encoding="utf-8"))["tag"] == round_.id
+    report_text = round_.report_path.read_text(encoding="utf-8")
+    assert round_.id in report_text  # 报告标题就是本轮编号
+    assert "处理了 0 个盘" in report_text
+
+
+def test_finished_status_pointer_carries_round_and_report_paths(round_sandbox, monkeypatch):
+    """收尾写的运行状态要能自己交代：报告在哪、本轮编号、本轮日志在哪。"""
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    runner = _zero_disc_runner()
+    runner.run()
+
+    round_ = loground.current()
+    status_path = round_sandbox.root.parent / "run-status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["phase"] == "completed"
+    assert status["round_id"] == round_.id
+    assert status["log_path"] == str(round_.log_path)
+    # 报告路径两个键名都写（界面按各自的读法取），值都是本轮 report.md
+    assert status["report_path"] == status["stats_path"] == str(round_.report_path)
+    # 状态指针留在上下文根上，不在轮次目录里面：整轮回收不会把它一起删掉
+    assert status_path.parent == round_.root.parent
+    assert round_.root not in status_path.parents
+
+
+def test_kept_disc_screenshot_lands_in_the_round(round_sandbox, monkeypatch):
+    """升满保留的截图存到本轮 success/：报告里的链接就是同一轮目录下的相对路径。"""
+    image = blank_image()
+    monkeypatch.setattr(runner_module, "grab_game_image", lambda hwnd=None: (image, "test", 1))
+    runner = Runner(Preset(), hotkeys=False)
+    runner._hwnd = 1
+    slot = runner.stats.disc_begin("j", 12, 15)
+
+    appended = runner._kept_image_path(slot)
+
+    assert appended == "success/disc12.png"
+    assert (round_sandbox.success_dir / "disc12.png").is_file()
+
+
+def test_two_runs_get_two_rounds_and_do_not_share_logs(round_sandbox, monkeypatch):
+    """一次任务 = 一个轮次目录：连着跑两次是两个目录，各自的日志只写自己那一轮。"""
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    runner = _zero_disc_runner()
+    runner.run()
+    first = loground.current()
+    first_log = first.log_path.read_text(encoding="utf-8")
+
+    runner.preset = replace(runner.preset, name="第二轮")
+    runner.run()
+    second = loground.current()
+
+    assert second.root != first.root
+    assert str(first.root) in first_log  # 每轮开头都记着本轮目录在哪
+    second_log = second.log_path.read_text(encoding="utf-8")
+    assert str(second.root) in second_log
+    # 换轮次后日志文件跟着切：第二轮的内容不会写进第一轮的文件
+    assert str(second.root) not in first.log_path.read_text(encoding="utf-8")
+    assert str(first.root) not in second_log
+
+
+def test_failed_run_still_registers_a_round(round_sandbox):
+    """max_pages 非法直接收工（零游戏输入）：轮次目录与登记仍要留下，日志有处可查。"""
+    runner = Runner(
+        Preset(max_pages=0, task_chain=(TaskJob(slot=4, accepted=()),)), hotkeys=False
+    )
+    runner.run()
+
+    round_ = loground.current()
+    record = loground.read_registry(round_.root)
+    assert round_.root.is_dir() and round_.log_path.is_file()
+    assert record["id"] == round_.id
+    assert record["state"] == "closed" and record["outcome"] == "failed"
+    assert "max_pages 非法" in record["end_reason"]
+
+
+def test_exception_path_still_registers_a_round(round_sandbox, monkeypatch):
+    """任务中途抛异常：轮次与登记同样留下，登记写明失败原因。"""
+    monkeypatch.setattr(runner_module.time, "sleep", lambda seconds: None)
+    runner = Runner(Preset(task_chain=(TaskJob(slot=4, accepted=()),)), hotkeys=False)
+    monkeypatch.setattr(runner, "_run_job", Mock(side_effect=RuntimeError("模拟炸链")))
+    runner.run()
+
+    round_ = loground.current()
+    record = loground.read_registry(round_.root)
+    assert runner.outcome == "failed"
+    assert record["state"] == "closed" and record["outcome"] == "failed"
+    assert "模拟炸链" in record["end_reason"]
+    assert json.loads(round_.stats_path.read_text(encoding="utf-8"))["tag"] == round_.id

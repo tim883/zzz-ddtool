@@ -103,16 +103,16 @@ def _download(url: str, dest) -> None:
 
 
 def _strip_protected(root: Path) -> list[str]:
-    """删除暂存树顶层的 user/、log/，返回被删除的条目名。
+    """删除暂存树顶层的 user/、log/、log_test/，返回被删除的条目名。
 
     xcopy 只把暂存树内容铺到程序目录，所以只需处理顶层。这一步是
-    "更新绝不改写用户的 user/ 与 log/" 的硬保证：即使发布方失误
+    "更新绝不改写用户的 user/ 与 log/、log_test/" 的硬保证：即使发布方失误
     （把跑过的包拿去打 zip），用户侧也不会被覆盖。
     """
     import shutil
 
     removed: list[str] = []
-    for name in ("user", "log"):
+    for name in ("user", "log", "log_test"):
         target = root / name
         if not target.exists():
             continue
@@ -125,18 +125,18 @@ def _strip_protected(root: Path) -> list[str]:
 
 
 def _log_stripped(removed: list[str]) -> None:
-    """更新包混进 user//log/ 是发布方失误：记一条日志，但不打断更新。"""
+    """更新包混进 user//log//log_test/ 是发布方失误：记一条日志，但不打断更新。"""
     if removed:
         from zzz_ddtool.logutil import get_logger
 
         get_logger(__name__).warning(
-            "更新包内含 %s，已忽略：更新不会改写用户的 user/ 与 log/",
+            "更新包内含 %s，已忽略：更新不会改写用户的 user/ 与 log/、log_test/",
             "、".join(removed),
         )
 
 
 def apply_data_update(url: str) -> None:
-    """数据更新：下载数据包 zip，剥离 user//log/ 后覆盖 data/（只碰 data，不碰 user）。"""
+    """数据更新：下载数据包 zip，剥离 user//log//log_test/ 后覆盖 data/（只碰 data）。"""
     import shutil
     import tempfile
     import zipfile

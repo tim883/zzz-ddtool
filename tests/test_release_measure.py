@@ -650,15 +650,16 @@ def test_final_run_rejects_no_speedup_keeps_report(tmp_path, monkeypatch):
     """T13：§7.2 实测全不降 → 自身判定失败退 1、保留失败报告、不复制固定名、不再操作游戏。"""
     from final_evidence_fixture import minimal_events
 
+    from zzz_ddtool import loground
+
     config = tmp_path / "preset.yaml"
     config.write_text(_MINIMAL_YAML, encoding="utf-8")
-    perf_dir = tmp_path / "perf"
-    perf_dir.mkdir()
-    (perf_dir / "run.jsonl").write_text(
+    # 本轮性能文件由当前轮次直接给出（不再按目录里最新的 jsonl 猜）。
+    round_ = loground.use_test_context("release-measure", root=tmp_path / "log_test")
+    round_.perf_path.write_text(
         "\n".join(json.dumps(event, ensure_ascii=False) for event in minimal_events("run-final")) + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("zzz_ddtool.scanperf.perf_dir", lambda: perf_dir)
     monkeypatch.setattr(measure, "_probe_environment", lambda: {
         "machine_id": "m", "client_width": 1920, "client_height": 1080, "window_dpi": 96,
         "game_exe_path": "c:/game.exe", "game_build": "b1",
@@ -667,9 +668,10 @@ def test_final_run_rejects_no_speedup_keeps_report(tmp_path, monkeypatch):
     class FakeRunner:
         instances: list = []
 
-        def __init__(self, preset, hotkeys=True):
+        def __init__(self, preset, *, hotkeys=True, claim_round=False):
             self.preset = preset
             self.hotkeys = hotkeys
+            self.claim_round = claim_round
             self.ran = False
             FakeRunner.instances.append(self)
 
@@ -686,10 +688,13 @@ def test_final_run_rejects_no_speedup_keeps_report(tmp_path, monkeypatch):
 
     assert code == 1
     assert FakeRunner.instances and FakeRunner.instances[0].ran
+    assert FakeRunner.instances[0].claim_round is True  # 入口先开好轮次，Runner 认领它
     assert copied_calls == []  # 自身判定失败：不复制固定名
     report = common.read_json(output)
     assert report["passed"] is False and report["speedup"] == []
     assert report["stage"] == "final"
+    assert Path(report["raw_jsonl_path"]) == round_.perf_path  # 复算用的是本轮 perf
+    loground.close_active()  # 收尾释放占用：不把活动轮次留给后面的用例
 
 
 @pytest.mark.parametrize("visible,usable,expected", [(True, True, True), (False, True, False), (True, False, False)])

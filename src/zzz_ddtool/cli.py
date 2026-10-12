@@ -36,12 +36,16 @@ def main(argv: list[str] | None = None) -> int:
     decide_p.add_argument("--discarded", action="store_true")
     decide_p.add_argument("--min-useful", type=int, help="Override min_useful_types")
 
-    cap_p = sub.add_parser("capture", help="Grab the game window into log/captures")
-    cap_p.add_argument("--out", type=Path, help="Directory, default project log/captures")
+    cap_p = sub.add_parser("capture", help="Grab the game window into log_test 当前轮次的 captures/")
+    cap_p.add_argument(
+        "--out", type=Path, help="Directory, default current round captures under log_test/"
+    )
 
     read_p = sub.add_parser("read-disc", help="读取已保存的盘面截图，不操作游戏")
     read_p.add_argument("image", type=Path)
-    read_p.add_argument("--out", type=Path, help="识别结果 JSON，默认 log/debug/disc-reading.json")
+    read_p.add_argument(
+        "--out", type=Path, help="识别结果 JSON，默认当前 log_test 轮次目录下的 disc-reading.json"
+    )
 
     nav_p = sub.add_parser("goto-warehouse", help="Esc to menu if needed, then click 仓库")
     sub.add_parser("snapshot-pages", help="Click home / menu / warehouse and save named shots")
@@ -81,16 +85,19 @@ def main(argv: list[str] | None = None) -> int:
     list_p.add_argument(
         "--chunk", type=int, default=4, metavar="ROWS", help="每次滚动的行数，默认 4（一屏）"
     )
-    list_p.add_argument("--out", type=Path, help="存图目录，默认 log/captures")
+    list_p.add_argument("--out", type=Path, help="存图目录，默认当前 log_test 轮次的 captures/")
     list_p.add_argument("--name", default="list", help="截图文件名前缀，默认 list")
     preview_p = sub.add_parser("preview", help="Enumerate 3/4-line patterns into HTML cards")
     preview_p.add_argument("--config", type=Path, required=True)
-    preview_p.add_argument("--out", type=Path, help="HTML path, default log/pattern-cards.html")
+    preview_p.add_argument(
+        "--out", type=Path, help="HTML path, default current log_test round pattern-cards.html"
+    )
     preview_p.add_argument("--show-junk-bonus", action="store_true", help="Also show rolls that landed on junk")
 
     args = parser.parse_args(argv)
     from zzz_ddtool.logutil import setup
 
+    _enter_context(args)
     setup("DEBUG" if args.verbose else "INFO", console=True)
     if args.cmd in (None, "gui"):
         return _cmd_gui(getattr(args, "config", None))
@@ -113,6 +120,53 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
+#: 手动诊断子命令：回放、标定与预览用，日志走 log_test/。
+_DIAGNOSTIC_COMMANDS = (
+    "capture",
+    "read-disc",
+    "goto-warehouse",
+    "snapshot-pages",
+    "snapshot-list",
+    "preview",
+    "decide",
+)
+
+
+def _enter_context(args: argparse.Namespace) -> None:
+    """按入口分类定下日志上下文，先定归属再配日志。
+
+    正式 ``run`` 走生产根 ``log/``；非默认 ``--start-index`` / ``--material-slot``
+    是已有测试入口，手动诊断子命令也是测试/开发用途，一并走 ``log_test/``。
+    ``gui`` 与无子命令不在这里建轮次：GUI 启动会自己开启动轮次，免得一次启动两个目录。
+    """
+    from zzz_ddtool import loground
+    from zzz_ddtool.logutil import get_logger
+
+    try:
+        if args.cmd in (None, "gui"):
+            return
+        if args.cmd == "run":
+            if getattr(args, "start_index", 0) or getattr(args, "material_slot", 0):
+                loground.use_test_context("cli-run-test")
+            else:
+                loground.use_production_context("cli-run", config=str(args.config))
+            return
+        if args.cmd in _DIAGNOSTIC_COMMANDS:
+            loground.use_test_context(args.cmd)
+    except OSError as exc:
+        # 日志目录建不出来（只读盘、权限不足）：报一声，命令照常往下走
+        get_logger("zzz_ddtool.cli").warning("日志轮次建不出来，本轮只写控制台：%s", exc)
+
+
+def _round_output(name: str) -> Path:
+    """当前轮次目录下的默认输出路径；轮次没建起来时退回当前上下文根。"""
+    from zzz_ddtool import loground
+
+    round_ = loground.current()
+    root = round_.root if round_ is not None else loground.current_root()
+    return root / name
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
     from zzz_ddtool.capture import CaptureError, capture_game
 
@@ -129,10 +183,9 @@ def _cmd_read_disc(args: argparse.Namespace) -> int:
     from dataclasses import asdict
     from PySide6.QtGui import QImage
     from zzz_ddtool.ocr import parse_disc
-    from zzz_ddtool.paths import debug_dir
     from zzz_ddtool.logutil import get_logger
 
-    dest = args.out or debug_dir() / "disc-reading.json"
+    dest = args.out or _round_output("disc-reading.json")
     try:
         image = QImage(str(args.image))
         if image.isNull():
@@ -314,6 +367,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     import logging
     import sys
 
+    from zzz_ddtool import loground, retain
+    from zzz_ddtool.logutil import get_logger
     from zzz_ddtool.runner import Runner, RunnerError
 
     # 日志实时打到控制台，运行过程随时可见
@@ -321,14 +376,36 @@ def _cmd_run(args: argparse.Namespace) -> int:
     handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
     logging.getLogger("zzz_ddtool").addHandler(handler)
 
+    # 保留轮数跟界面设置一致：CLI 不读设置的话，会用默认值把用户想留的轮次删掉
+    try:
+        from zzz_ddtool.logprefs import load as load_prefs
+        from zzz_ddtool.retain import set_max_rounds
+
+        _, keep_rounds = load_prefs()
+        set_max_rounds(keep_rounds)
+    except Exception as exc:  # 设置读不出来就按默认保留轮数，不影响任务
+        get_logger("zzz_ddtool.cli").warning("读取日志设置失败，按默认保留轮数回收：%s", exc)
+
     preset = load_preset(args.config)
+    # claim_round：本次 CLI 运行只产生一个轮次，涵盖配置装载、任务准备、执行与收尾
     runner = Runner(
         preset,
         start_index=getattr(args, "start_index", 0) or 0,
         material_slot=getattr(args, "material_slot", 0) or 0,
+        config_path=str(args.config),
+        claim_round=True,
     )
     try:
-        results = runner.run()
+        try:
+            results = runner.run()
+        finally:
+            # 成功与异常都要收尾：登记结果、释放本轮占用，再按轮数回收旧日志
+            loground.finish(runner.outcome, reason=runner.end_reason)
+            loground.close_active()
+            try:
+                retain.retain_rounds()
+            except Exception as exc:  # 回收失败不改写命令结果
+                get_logger("zzz_ddtool.cli").warning("历史轮次回收失败：%s", exc)
     except RunnerError as exc:
         print(exc)
         return 2
@@ -362,7 +439,6 @@ def _load_preset(args: argparse.Namespace):
             "stage_require": {key: dict(val) for key, val in preset.stage_require.items()},
             "min_useful_types": args.min_useful,
             "filters": {
-                "require_s_rank": preset.require_s_rank,
                 "skip_locked": preset.skip_locked,
                 "skip_equipped": preset.skip_equipped,
                 "skip_discarded": preset.skip_discarded,
@@ -384,9 +460,7 @@ def _load_preset(args: argparse.Namespace):
 
 
 def _default_preview_path() -> Path:
-    from zzz_ddtool.paths import log_dir
-
-    return log_dir() / "pattern-cards.html"
+    return _round_output("pattern-cards.html")
 
 
 if __name__ == "__main__":

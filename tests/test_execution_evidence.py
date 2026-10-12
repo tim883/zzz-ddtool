@@ -4,11 +4,18 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtGui import QImage
 
-from zzz_ddtool import runevidence, runner as rm, scanperf, wininput
+from zzz_ddtool import loground, runevidence, runner as rm, scanperf, wininput
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import LabelPolicy, Preset
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.traversal import GridCell, TraversalState
+
+
+@pytest.fixture(autouse=True)
+def close_round_after_test():
+    """用例收尾释放轮次占用：run() 真的开了轮次，别把它留给后面的用例。"""
+    yield
+    loground.close_active()
 
 
 @pytest.mark.parametrize("mode", ["already_discarded", "label_success", "label_failure"])
@@ -25,13 +32,12 @@ def test_real_runner_records_selection_and_failed_label_without_fabricated_ids(
     skipped = TaskJob(slot=2, job_id="j2", accepted=None)
     preset = Preset(task_chain=(job, skipped), skip_discarded=not needs_label, ocr_retry=1,
                     labels=LabelPolicy(discard=True, save=False))
+    # run() 自己开轮次并建 trace/stats：把日志根钉在临时目录，性能文件即本轮 perf.jsonl。
+    loground.use_test_context("execution-evidence", root=tmp_path / "log_test")
     runner = rm.Runner(preset, hotkeys=False)
-    runner.trace = Mock(tag="offline-evidence", dir=tmp_path)
-    runner.stats = Mock()
     runner._hwnd, runner._pid = 1, 123
     monkeypatch.setattr(runner, "_set_status", Mock())
     monkeypatch.setattr(runner, "_finish_stats", lambda *_a: "")
-    monkeypatch.setattr(scanperf, "perf_dir", lambda: tmp_path)
     begin_session = scanperf.begin_session
     monkeypatch.setattr(scanperf, "begin_session", lambda *a, **k: begin_session(*a, clock=sim_time.now, **k))
     monkeypatch.setattr(rm, "client_size", lambda _h: (1920, 1080))
@@ -84,7 +90,9 @@ def test_real_runner_records_selection_and_failed_label_without_fabricated_ids(
 
     monkeypatch.setattr(runner, "_run_job", job_body)
     runner.run()
-    path = next(tmp_path.glob("*.jsonl"))
+    path = loground.current().perf_path
+    assert path.parent.parent == tmp_path / "log_test"  # 性能文件落在本轮目录里
+    assert path.is_file()
     read = scanperf.read_perf_file(path)
     assert read.evidence_complete
     events = list(read.events)

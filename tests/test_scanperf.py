@@ -3,6 +3,9 @@
 覆盖：顶层字段固定、run_id/JSONL 写读、父子关联与计数回流、模拟计时、
 无活动会话 no-op、记录失败不改变调用方、截断/损坏读取判定，以及依赖方向。
 真实 Runner 的退出/输入关联由步骤 6 覆盖，本文件只验基础。
+
+性能文件不再由模块自己挑「最新文件」：``begin_session`` 的 ``path`` 必填，
+由调用方给本轮目录里的 ``perf.jsonl``。
 """
 
 from __future__ import annotations
@@ -41,13 +44,12 @@ def _lines(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def test_no_session_record_is_noop(tmp_path, monkeypatch) -> None:
-    """没有活动会话时不凭空创建残缺 run 记录。"""
-    monkeypatch.setattr(scanperf, "log_dir", lambda: tmp_path / "log")
+def test_no_session_record_is_noop(tmp_path) -> None:
+    """没有活动会话时不凭空创建残缺 run 记录，也不落任何文件。"""
     assert scanperf.current_session() is None
     assert scanperf.record_event(scanperf.PerfEvent("capture", 1.0)) is None
     assert scanperf.new_event_id() is None
-    assert not (tmp_path / "log").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_no_session_timed_span_is_detached() -> None:
@@ -276,13 +278,10 @@ def test_run_id_is_unique_per_session(tmp_path) -> None:
     assert scanperf.current_session() is second
 
 
-def test_default_session_path_sits_under_log_perf(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(scanperf, "log_dir", lambda: tmp_path / "log")
-    assert scanperf.perf_dir() == tmp_path / "log" / "perf"
-    session = scanperf.begin_session("tag-default")
-    assert session.path.parent == tmp_path / "log" / "perf"
-    assert session.path.name == f"{session.run_id}.jsonl"
-    scanperf.end_session()
+def test_begin_session_requires_an_explicit_path() -> None:
+    """路径必填：没了「从全局目录里挑最新文件」的猜测，调用方必须给出本轮路径。"""
+    with pytest.raises(TypeError):
+        scanperf.begin_session("tag-required")
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +543,6 @@ def test_capture_and_png_save_wired(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(capture, "_restore_window", lambda hwnd: None)
     monkeypatch.setattr(capture, "_print_window", lambda hwnd: image)
     monkeypatch.setattr(capture, "_looks_unusable", lambda img: False)
-    monkeypatch.setattr(capture, "retain_captures", lambda: [])
     got_image, method, target = capture.grab_game_image(123)
     assert (method, target) == ("printwindow", 123)
     dest = capture.save_image(image, 123, "printwindow", name="probe", dest_dir=tmp_path / "cap")
@@ -559,11 +557,11 @@ def test_capture_and_png_save_wired(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 依赖方向（§2.2）：scanperf 只依赖标准库与 paths
+# 依赖方向（§2.2）：scanperf 只依赖标准库
 # ---------------------------------------------------------------------------
 
 
-def test_scanperf_dependencies_are_stdlib_and_paths() -> None:
+def test_scanperf_dependencies_are_stdlib_only() -> None:
     source = Path(scanperf.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     allowed_std = {
@@ -589,8 +587,6 @@ def test_scanperf_dependencies_are_stdlib_and_paths() -> None:
             module = node.module or ""
             root = module.split(".")[0]
             if root in allowed_std:
-                continue
-            if module == "zzz_ddtool.paths":
                 continue
             offenders.append(module)
     assert offenders == [], f"scanperf 不应依赖：{offenders}"

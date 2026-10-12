@@ -4,7 +4,7 @@
     py -3.11 scripts/filter_probe.py [输出名]
 
 步骤：点漏斗 -> 点「点击选择」-> 等 0.8s 截图保存 -> Esc Esc 收场。
-只截图不勾选，用来标定弹层布局。
+只截图不勾选，用来标定弹层布局。样张写进本轮测试日志目录的 captures/。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from zzz_ddtool import loground
 from zzz_ddtool.capture import grab_game_image
 from zzz_ddtool.gamefilter import FILTER_SETS_BAR, _find_and_click
 from zzz_ddtool.layout import FILTER_BTN, scale_point
@@ -22,10 +23,11 @@ from zzz_ddtool.wininput import VK_ESCAPE, click_client, press_key
 
 
 def main() -> int:
+    loground.use_test_context("filter-probe")
     name = sys.argv[1] if len(sys.argv) > 1 else "setpicker-live"
     image, _method, hwnd = grab_game_image()
     width, height = image.width(), image.height()
-    out = Path("log/captures")
+    out = loground.captures_dir()
     out.mkdir(parents=True, exist_ok=True)
 
     # 不在驱动盘页就先导航过去

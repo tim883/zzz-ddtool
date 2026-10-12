@@ -51,6 +51,19 @@ def test_refuses_package_with_log_dir(tmp_path: Path, monkeypatch) -> None:
     assert not list((tmp_path / "out").glob("*.zip"))
 
 
+def test_refuses_package_with_log_test_dir(tmp_path: Path, monkeypatch) -> None:
+    """log_test/ 是测试、探测、回放等入口的运行时产出，和 log/ 一样不许进包。"""
+    assert pr.FORBIDDEN_TOP == ("user", "log", "log_test")
+    pkg = _clean_pkg(tmp_path)
+    (pkg / "log_test").mkdir()
+    monkeypatch.setattr(pr, "_project_version", lambda: "1.2.3")
+
+    with pytest.raises(SystemExit):
+        pr.main(["--pkg", str(pkg), "--outdir", str(tmp_path / "out")])
+
+    assert not list((tmp_path / "out").glob("*.zip"))
+
+
 def test_refuses_when_version_txt_mismatches_project(tmp_path: Path, monkeypatch) -> None:
     pkg = _clean_pkg(tmp_path)
     monkeypatch.setattr(pr, "_project_version", lambda: "9.9.9")

@@ -1455,6 +1455,8 @@ class MainWindow(QMainWindow):
 
         # 底部操作栏里的 _refresh_run_status() 会读它，得先有。
         self._log_tail = None
+        # 上次显示的日志文件：换轮次时据此重置读取缓存和路径提示。
+        self._log_path_shown = None
         log_box = QFrame()
         log_box.setObjectName("logPanel")
         log_layout = QVBoxLayout(log_box)
@@ -1474,11 +1476,10 @@ class MainWindow(QMainWindow):
         self.log_toggle.setFixedWidth(22)
         self.log_toggle.setToolTip("收起运行日志")
         self.log_toggle.toggled.connect(self._toggle_run_log)
-        from zzz_ddtool.paths import logs_dir
-
-        self.log_path = QLabel(f"日志文件：{logs_dir() / 'ddtool.log'}")
+        self.log_path = QLabel()
         self.log_path.setObjectName("hint")
         self.log_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._refresh_log_path_label()
         log_head.addWidget(self.log_title)
         log_head.addWidget(self.log_toggle)
         log_head.addSpacing(28)
@@ -1533,7 +1534,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._main_splitter, 1)
         self._refresh_run_status()
         self._load_path(self._path)
-        for box in (self.require_s, self.skip_locked, self.skip_equipped, self.skip_discarded):
+        for box in (self.skip_locked, self.skip_equipped, self.skip_discarded):
             box.toggled.connect(self._mark_unsaved)
         self.max_discs.valueChanged.connect(self._mark_unsaved)
         # 恢复上次的窗口大小/位置、三栏比例。放在最后：控件都建好了才动。
@@ -1820,12 +1821,11 @@ class MainWindow(QMainWindow):
 
         flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
-        self.require_s = QCheckBox("跳过非S级")
         self.skip_locked = QCheckBox("跳过有锁定标记")
         self.skip_equipped = QCheckBox("跳过已装备")
         self.skip_discarded = QCheckBox("跳过有弃置标记")
-        for box in (self.require_s, self.skip_equipped, self.skip_locked, self.skip_discarded):
-            # 弃置标记默认不勾，其余三项默认勾。
+        for box in (self.skip_equipped, self.skip_locked, self.skip_discarded):
+            # 弃置标记默认不勾，其余两项默认勾。
             box.setChecked(box is not self.skip_discarded)
             flags.addWidget(box)
         layout.addWidget(flags_box)
@@ -2869,7 +2869,8 @@ class MainWindow(QMainWindow):
         self._controller = HotkeyController()
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
-        self._run_thread = _RunThread(deepcopy(preset), self._controller)
+        # 带上打开的 yaml：Runner 按它开本轮轮次并登记这轮用的是哪份配置。
+        self._run_thread = _RunThread(deepcopy(preset), self._controller, config_path=str(self._path))
         self._run_thread.status_changed.connect(self._on_task_status)
         self._run_thread.finished.connect(self._on_run_finished)
         self._run_thread.start()
@@ -2890,6 +2891,13 @@ class MainWindow(QMainWindow):
         self._run_thread.deleteLater()
         self._run_thread = None
         self._refresh_run_status()
+        # 任务收尾后按轮数回收一次；回收失败不影响界面收尾，下次触发再试。
+        from zzz_ddtool.retain import retain_rounds
+
+        try:
+            retain_rounds()
+        except Exception:
+            pass
         if self._close_after_run:
             self.close()
 
@@ -2904,15 +2912,31 @@ class MainWindow(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
 
+    @staticmethod
+    def _path_exists(path: str) -> bool:
+        """记录里的路径还在不在。路径本身坏掉（空值、非法字符）也当不在。"""
+        try:
+            return Path(path).exists()
+        except (OSError, ValueError):
+            return False
+
     def _show_stats(self, headline: str, path: str) -> None:
-        """跑完：状态栏换成结果统计——一行摘要 + 详细日志路径（正文不进界面）。"""
+        """跑完：状态栏换成结果统计——一行摘要 + 详细日志路径（正文不进界面）。
+
+        报告随整轮一起回收，记录里的旧路径可能已经没有文件：只给已存在的文件
+        可点击链接，被清理过的写明原因，不指向不存在的东西。
+        """
         self.run_status_label.setText(headline or "运行结束")
         self.run_status_label.setWordWrap(True)
-        if path:
+        if not path:
+            self.run_stats_path_label.setText("详细结果统计：本轮未生成报告文件")
+        elif self._path_exists(path):
             uri = Path(path).as_uri()
             self.run_stats_path_label.setText(f'详细结果统计：<a href="{uri}">{path}</a>')
         else:
-            self.run_stats_path_label.setText("详细结果统计：本轮未生成报告文件")
+            self.run_stats_path_label.setText(
+                f"详细结果统计：{path}（该轮报告已回收：历史日志清理）"
+            )
         # 判据用 isHidden（显式隐藏标志）：isVisible 在窗口还没 show 时恒为 False。
         if self.run_stats_path_label.isHidden():
             self.run_stats_path_label.setVisible(True)
@@ -2923,8 +2947,10 @@ class MainWindow(QMainWindow):
             self.run_stats_path_label.setVisible(False)
 
     def _show_run_status(self, data: dict) -> None:
-        if data.get("stats_path") or data.get("stats_headline"):
-            self._show_stats(data.get("stats_headline", ""), data.get("stats_path", ""))
+        # 报告路径优先用 report_path，旧的 run-status.json 只写了 stats_path。
+        report = data.get("report_path") or data.get("stats_path") or ""
+        if report or data.get("stats_headline"):
+            self._show_stats(data.get("stats_headline", ""), report)
             return
         self._hide_stats()
         row, col = data.get("global_row"), data.get("global_col")
@@ -2954,7 +2980,7 @@ class MainWindow(QMainWindow):
         self._show_run_status(data)
 
     def open_settings(self) -> None:
-        """日志设置：级别 + 截图容量。"""
+        """日志设置：级别 + 历史日志保留轮数。"""
         from zzz_ddtool.logsettings import LogSettingsDialog
 
         dialog = LogSettingsDialog(self)
@@ -3079,6 +3105,17 @@ class MainWindow(QMainWindow):
                 self._dragging_main_splitter = False
         self._remember_lower_height(target)
 
+    def _refresh_log_path_label(self) -> None:
+        """标题行显示当前轮次的 ddtool.log；没有在建轮次就直说，不指向别的目录。"""
+        from zzz_ddtool import loground
+
+        round_ = loground.current()
+        self._log_path_shown = round_.log_path if round_ is not None else None
+        if self._log_path_shown is None:
+            self.log_path.setText("日志文件：尚无日志目录")
+        else:
+            self.log_path.setText(f"日志文件：{self._log_path_shown}")
+
     def _refresh_run_status(self) -> None:
         """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
         import json
@@ -3090,10 +3127,10 @@ class MainWindow(QMainWindow):
                 self.stop_btn.setEnabled(False)
                 self.pause_btn.setEnabled(False)
 
-        from zzz_ddtool.paths import status_file as _status_file_path
+        from zzz_ddtool import loground, logutil
 
         text = "运行状态：—（还没有运行记录）"
-        status_file = _status_file_path()
+        status_file = loground.status_file()
         if status_file.exists():
             try:
                 data = json.loads(status_file.read_text(encoding="utf-8"))
@@ -3104,13 +3141,20 @@ class MainWindow(QMainWindow):
         self.run_status_label.setText(text)
         if self._task_status is not None:
             self._show_run_status(self._task_status)
-        # 读取统一日志文件，覆盖导航、OCR、执行器等模块；日志轮转/设置重建也能继续读取。
+        # 读取当前轮次的主日志，覆盖导航、OCR、执行器等模块。
         if not hasattr(self, "run_log"):
             return
-        from zzz_ddtool.paths import logs_dir
-
+        # 换了轮次（任务开始、下一任务）：路径提示和读取缓存都跟着新文件走，
+        # 别接着上一轮的正文和滚动位置显示。
+        round_ = loground.current()
+        if (round_.log_path if round_ is not None else None) != self._log_path_shown:
+            self._log_tail = None
+            self._refresh_log_path_label()
+        log_path = logutil.current_log_path()
+        if log_path is None:
+            return
         try:
-            with (logs_dir() / "ddtool.log").open("rb") as stream:
+            with log_path.open("rb") as stream:
                 size = stream.seek(0, 2)
                 offset = max(0, size - 128 * 1024)
                 stream.seek(offset)
@@ -3153,7 +3197,6 @@ class MainWindow(QMainWindow):
         self._loading = True
         self._label_policy = preset.labels
         self.name_edit.setText(preset.name)
-        self.require_s.setChecked(preset.require_s_rank)
         self.skip_locked.setChecked(preset.skip_locked)
         self.skip_equipped.setChecked(preset.skip_equipped)
         self.skip_discarded.setChecked(preset.skip_discarded)
@@ -3431,7 +3474,6 @@ class MainWindow(QMainWindow):
                 },
                 "task_chain": [job.to_dict() for job in self._jobs],
                 "filters": {
-                    "require_s_rank": self.require_s.isChecked(),
                     "skip_locked": self.skip_locked.isChecked(),
                     "skip_equipped": self.skip_equipped.isChecked(),
                     "skip_discarded": self.skip_discarded.isChecked(),
@@ -3721,16 +3763,23 @@ class _RunThread(QThread):
 
     status_changed = Signal(dict)
 
-    def __init__(self, preset: Preset, controller) -> None:
+    def __init__(self, preset: Preset, controller, config_path: str = "") -> None:
         super().__init__()
         self._preset = preset
         self._controller = controller
+        self._config_path = config_path
 
     def run(self) -> None:
         try:
             from zzz_ddtool.runner import Runner
 
-            Runner(self._preset, controller=self._controller, on_status=self.status_changed.emit).run()
+            # 每个任务在 Runner 里自己开一轮，不和启动轮次或上一个任务合并。
+            Runner(
+                self._preset,
+                controller=self._controller,
+                on_status=self.status_changed.emit,
+                config_path=self._config_path,
+            ).run()
         except Exception as exc:
             from zzz_ddtool.logutil import get_logger
 
@@ -3741,9 +3790,11 @@ class _RunThread(QThread):
 
 
 def run_gui(config: Path | None = None) -> int:
-    # 先把上次存的日志级别 / 截图上限装回去。放在最前：get_logger 首次调用会懒
+    # 先把上次存的日志级别 / 历史轮数装回去。放在最前：get_logger 首次调用会懒
     # setup() 按默认级别配置，restore 越早，启动最早那批日志的级别越准。
+    from zzz_ddtool import loground
     from zzz_ddtool.logprefs import restore
+    from zzz_ddtool.retain import retain_rounds
     from zzz_ddtool.singleinstance import LockUnavailable, acquire, release
 
     restore()
@@ -3760,6 +3811,14 @@ def run_gui(config: Path | None = None) -> int:
         QMessageBox.information(None, "zzz-ddtool", "程序已在运行。")
         return 0
     try:
+        # 开一轮启动日志：配置装载和界面阶段的日志有处可去，只开窗口不跑任务也留下它。
+        # 任务各自在 Runner 里另开新轮次，不和这轮合并；目录建不出来就只写控制台，照常启动。
+        try:
+            loground.begin("gui")
+        except OSError as exc:
+            from zzz_ddtool.logutil import get_logger
+
+            get_logger("zzz_ddtool.gui").warning("启动轮次没建起来，本次不写日志文件：%s", exc)
         apply_light_style(app)
         window = MainWindow(config)
         if hint:
@@ -3767,6 +3826,15 @@ def run_gui(config: Path | None = None) -> int:
         window.show()
         return app.exec()
     finally:
+        # 退出：先关本轮文件、释放占用，再按轮数回收一次。回收失败也不挡退出，下次触发再试。
+        try:
+            loground.close_active()
+        except Exception:
+            pass
+        try:
+            retain_rounds()
+        except Exception:
+            pass
         if lock is not None:
             release(lock)
 

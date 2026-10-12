@@ -38,6 +38,43 @@ def pytest_collection_modifyitems(items):
 
 
 # --------------------------------------------------------------------------
+# 日志隔离：测试一律写 log_test/，绝不碰真实 log/ 与用户日志设置
+# --------------------------------------------------------------------------
+#: 本次 pytest 会话的沙箱轮次目录（log_test/<时间戳>/）。
+SANDBOX = None
+_SAVED_PATHS: dict = {}
+
+
+def pytest_configure(config):  # noqa: ARG001 - pytest hook 签名
+    """在收集测试前把日志上下文钉在 log_test/。
+
+    三件事，缺一个测试就可能污染用户环境：
+    1. 开一轮测试上下文：日志、截图、统计、性能、故障取证都落 ``log_test/<时间戳>/``；
+    2. 把``paths.log_root()``也指到沙箱里：漏声明上下文的代码即使在“生产模式”
+       下写日志，也只写沙箱，真实 ``log/`` 一个字节都不会变；
+    3. 把日志设置文件指到沙箱：测试不会改写 ``user/log-settings.json``。
+    """
+    global SANDBOX
+    from zzz_ddtool import loground, paths
+
+    SANDBOX = loground.use_test_context("pytest").root
+    _SAVED_PATHS["log_root"] = paths.log_root
+    _SAVED_PATHS["log_settings_file"] = paths.log_settings_file
+    paths.log_root = lambda: SANDBOX / "_production" / "log"
+    paths.log_settings_file = lambda: SANDBOX / "log-settings.json"
+
+
+def pytest_unconfigure(config):  # noqa: ARG001 - pytest hook 签名
+    """收尾：释放轮次占用，把被替换的路径函数装回去。"""
+    from zzz_ddtool import loground, paths
+
+    loground.close_active()
+    for name, original in _SAVED_PATHS.items():
+        setattr(paths, name, original)
+    _SAVED_PATHS.clear()
+
+
+# --------------------------------------------------------------------------
 # 模拟时钟 / 控制器（Spec §8：必须由用例显式请求，不设全局 autouse）
 # --------------------------------------------------------------------------
 class SimClock:

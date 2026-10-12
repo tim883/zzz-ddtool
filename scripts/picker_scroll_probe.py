@@ -1,4 +1,7 @@
-"""受限单步标定：不导航、不重置、不选项、不确认、不处理盘；仅显式 main 才操作游戏。"""
+"""受限单步标定：不导航、不重置、不选项、不确认、不处理盘；仅显式 main 才操作游戏。
+
+标定目录写进本轮测试日志目录（``log_test/<时间戳>/picker-scroll/<时间戳>/``）。
+"""
 from __future__ import annotations
 
 import json
@@ -13,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from PySide6.QtGui import QGuiApplication
-from zzz_ddtool import gamefilter as gf, wininput
+from zzz_ddtool import gamefilter as gf, loground, wininput
 from zzz_ddtool.capture import find_game_hwnd, grab_game_image, window_pid
 from zzz_ddtool.control import controlled_inputs, validated_inputs
 from zzz_ddtool.filter_replay import SetPickerKey
@@ -206,8 +209,9 @@ class Probe:
 
 def main(argv=None):
     command, delta = parse_command(sys.argv[1:] if argv is None else argv)
+    loground.use_test_context("picker-scroll-probe")
     app = QGuiApplication.instance() or QGuiApplication([])
-    directory = ROOT / "log/debug/picker-scroll" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    directory = loground.current().root / "picker-scroll" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     directory.mkdir(parents=True, exist_ok=False)
     controller = HotkeyController()
     probe = None

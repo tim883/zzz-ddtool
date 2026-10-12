@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 
-from zzz_ddtool.paths import log_settings_file
+from zzz_ddtool import paths
 from zzz_ddtool.retain import (
     DEFAULT_MAX_ROUNDS,
     MAX_KEEP_ROUNDS,
@@ -57,7 +57,7 @@ def load() -> tuple[int, int]:
     读不出来顶多回到常规 / 默认轮数，绝不能让程序起不来。
     """
     try:
-        raw = json.loads(log_settings_file().read_text(encoding="utf-8"))
+        raw = json.loads(paths.log_settings_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return DEFAULT_LEVEL, DEFAULT_KEEP_ROUNDS
     if not isinstance(raw, dict):
@@ -73,7 +73,7 @@ def load() -> tuple[int, int]:
 def save(level: int, keep_rounds: int) -> None:
     """落盘。写失败不影响使用——顶多下次回到默认档。"""
     try:
-        target = log_settings_file()
+        target = paths.log_settings_file()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
             json.dumps(

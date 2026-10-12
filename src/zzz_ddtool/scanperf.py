@@ -1,12 +1,12 @@
 """扫描提速：性能事件记录与区间关联（Spec §7.1、§7.1.1）。
 
 职责单一：把「一段耗时区间」记成一行 JSONL，并能把子事件挂到父事件上。
-- 只依赖标准库和 ``paths``（§2.2）：不反向导入 capture/trace/ocr/discocr/runner。
+- 只依赖标准库（§2.2）：不反向导入 paths/capture/trace/ocr/discocr/runner。
   调用方通过模块级会话与上下文管理器上报，scanperf 不认识它们。
 
 一次运行（一轮 ``Runner.run`` 或一次离线基准）一个会话：
     - ``run_id = f"{trace_tag}-{uuid4().hex}"``，一个 run_id 只对应一个 trace_tag；
-    - 事件逐行写入 ``log_dir()/"perf"/"<run_id>.jsonl"``；
+    - 事件逐行写入调用方明确给出的路径（本轮目录里的 ``perf.jsonl``）；
     - 没有活动会话时，所有上报都是 no-op：不创建残缺 run 记录，也不改调用方返回值。
 
 事件 ID 在区间**开始前**预分配（§7.1.1），区间结束才写记录，所以子事件可以引用
@@ -24,8 +24,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
-
-from zzz_ddtool.paths import log_dir
 
 #: JSONL 每行的 schema 版本。
 SCHEMA_VERSION = 1
@@ -107,11 +105,6 @@ class _Inherit:
 
 
 _INHERIT = _Inherit()
-
-
-def perf_dir() -> Path:
-    """性能记录根目录：``log/perf``（由 ``paths.log_dir()`` 解析）。"""
-    return log_dir() / "perf"
 
 
 def make_run_id(trace_tag: str) -> str:
@@ -439,20 +432,23 @@ def current_session() -> PerfSession | None:
 def begin_session(
     trace_tag: str,
     *,
+    path: Path | str,
     run_id: str | None = None,
-    path: Path | str | None = None,
     capture_dir: str | None = None,
     stats_path: str | None = None,
     clock=time.monotonic,
 ) -> PerfSession:
-    """开启一轮记录；已有会话先关闭（不抛错）。"""
+    """开启一轮记录；已有会话先关闭（不抛错）。
+
+    ``path`` 是本轮的性能文件（本轮目录里的 ``perf.jsonl``），由调用方明确给出：
+    不再从全局目录里挑「最新文件」认本轮。
+    """
     global _SESSION
     rid = run_id or make_run_id(trace_tag)
-    target = Path(path) if path is not None else perf_dir() / f"{rid}.jsonl"
     session = PerfSession(
         rid,
         trace_tag,
-        target,
+        Path(path),
         capture_dir=capture_dir,
         stats_path=stats_path,
         clock=clock,
@@ -654,7 +650,6 @@ __all__ = [
     "PerfSession",
     "PerfSpan",
     "PerfReadResult",
-    "perf_dir",
     "make_run_id",
     "current_session",
     "begin_session",

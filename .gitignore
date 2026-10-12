@@ -15,8 +15,9 @@ dist/
 build/
 *.egg-info/
 
-# Runtime output (text log + screenshots), not committed
+# Runtime output (text log + screenshots) and developer/test output, not committed
 log/
+log_test/
 
 # Nutstore (坚果云) 闪电下载的云端占位标记（0 字节，非真实文件），不入库
 *.nssyncsc

@@ -35,10 +35,9 @@ from zzz_ddtool.layout import (
     scale_point,
     scale_rect,
 )
+from zzz_ddtool import loground, picker_names
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.paths import debug_dir
 from zzz_ddtool.ocr import OcrLine, read_name_bands, read_name_span, read_rect
-from zzz_ddtool import picker_names
 from zzz_ddtool.actionwait import InputRelease, wait_release
 from zzz_ddtool.wininput import (
     VK_ESCAPE,
@@ -1000,12 +999,12 @@ def _picker_stage_matches(image: QImage, layout) -> bool | None:
 
 
 def _save_picker_pre_click_failure(image, click, identity_ok) -> None:
-    """DEBUG 下保存导致拒绝的原帧，避免事后截图丢失瞬时误判证据。"""
+    """DEBUG 下把导致拒绝的原帧存进本轮 ``diagnostics/``，避免事后截图丢失瞬时误判证据。"""
     log = get_logger("zzz_ddtool.gamefilter")
     if not log.isEnabledFor(logging.DEBUG) or (image.width(), image.height()) != (1920, 1080):
         return
     try:
-        folder = debug_dir() / "picker-failures"
+        folder = loground.diagnostics_dir() / "picker-failures"
         folder.mkdir(parents=True, exist_ok=True)
         stem = f"pre-click-{time.time_ns()}"
         path = folder / f"{stem}.png"

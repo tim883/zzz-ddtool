@@ -6,10 +6,8 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-from zzz_ddtool import scanperf
+from zzz_ddtool import loground, scanperf
 from zzz_ddtool.logutil import get_logger
-from zzz_ddtool.paths import captures_dir
-from zzz_ddtool.retain import retain_captures
 
 PROCESS_NAME = "ZenlessZoneZero.exe"
 WINDOW_TITLES = ("ZenlessZoneZero", "绝区零")
@@ -385,7 +383,9 @@ def grab_game_image(hwnd: int | None = None):
 
 
 def save_image(image, hwnd: int, method: str, name: str | None = None, dest_dir: Path | None = None) -> Path:
-    folder = dest_dir or captures_dir()
+    """存图。默认落当前上下文的 ``captures/``（本轮步骤截图）；``dest_dir`` 显式给出时存到那里
+    （成功盘图传本轮的 ``success/``）。"""
+    folder = dest_dir or loground.captures_dir()
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / f"{name}.png" if name else folder / f"zzz-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
     # 性能记录：只包裹这一次 image.save（§7.1），不改调用顺序/返回值/错误处理。
@@ -394,15 +394,13 @@ def save_image(image, hwnd: int, method: str, name: str | None = None, dest_dir:
         span.set(saved=bool(saved))
     if not saved:
         raise CaptureError(f"写文件失败：{dest}")
-    removed = retain_captures()
     get_logger("zzz_ddtool.capture").info(
-        "captured %s (%sx%s) hwnd=%s method=%s removed=%s",
+        "captured %s (%sx%s) hwnd=%s method=%s",
         dest.name,
         image.width(),
         image.height(),
         hwnd,
         method,
-        len(removed),
     )
     return dest
 

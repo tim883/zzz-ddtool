@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtGui import QImage
 
-from zzz_ddtool import readiness, runevidence, scanperf
+from zzz_ddtool import loground, readiness, runevidence, scanperf
 from zzz_ddtool.capture import CaptureError, client_size, find_game_hwnd, grab_game_image, save_image, window_pid
 from zzz_ddtool.chain import TaskJob
 from zzz_ddtool.config import Preset
@@ -62,7 +62,6 @@ from zzz_ddtool.navigation import (
     anchor_screen_rows,
 )
 from zzz_ddtool.ocr import OcrError, parse_disc, read_action_state_fast
-from zzz_ddtool.paths import stats_dir
 from zzz_ddtool.readiness import (
     MATERIAL_REFUND,
     ReadinessInterrupted,
@@ -198,6 +197,17 @@ class MaterialShortfall(RunnerError):
         )
 
 
+def _round() -> loground.Round:
+    """本轮的日志轮次；写产物一律落在它里面。
+
+    run() 之前或轮次已被收掉时取用是调用错误，报清楚而不是让路径拼到别处。
+    """
+    round_ = loground.current()
+    if round_ is None:
+        raise RunnerError("本轮日志目录还没建立，不能写统计、报告或成功盘截图")
+    return round_
+
+
 @dataclass(frozen=True)
 class RunResult:
     job_id: str
@@ -247,6 +257,8 @@ class Runner:
         on_status=None,
         start_index: int = 0,
         material_slot: int = 0,
+        config_path: str = "",
+        claim_round: bool = False,
     ) -> None:
         self.preset = preset
         # 测试入口：>0 时跳过前 start_index 个内部序号直接从它开始（见 _seed_start_index）。
@@ -257,9 +269,15 @@ class Runner:
         # 只在 CLI --material-slot 显式给出时非零，预设文件不带这个字段。
         self.material_slot = max(0, int(material_slot))
         self.log = get_logger("zzz_ddtool.runner")
-        self.trace = Trace(tag=time.strftime("%Y%m%d-%H%M%S"))
-        # 运行统计：收尾时写成 log/stats/<tag>.json + 一段中文摘要进文本日志。
-        self.stats = RunStats(tag=self.trace.tag)
+        #: 这份预设的 yaml 路径，记进轮次登记，交代本轮是谁在跑。
+        self.config_path = str(config_path or "")
+        #: 入口已经为这份 yaml 开好轮次时认领它，否则每次 run() 各自开一轮。
+        self.claim_round = bool(claim_round)
+        # 轮次、步骤跟踪和运行统计都在 run() 里与轮次绑定：造 Runner 对象不算开始任务，
+        # 就不该建目录。这里先给出**未绑定轮次**的实例，好让直接驱动内部方法的调用方
+        # （测试、_jobs() 探针）拿得到对象；真正的 tag 与截图目录由 run() 重新绑定到本轮。
+        self.trace: Trace = Trace()
+        self.stats: RunStats = RunStats()
         self.results: list[RunResult] = []
         self._processed = 0
         self._job_started_at = 0
@@ -359,7 +377,8 @@ class Runner:
 
         report_path：跑完后的结果统计详细日志（.md）路径。只在收尾那一次带上，
         界面据此把状态栏换成结果统计的一行摘要 + 详细日志路径；运行中的状态不带它，
-        界面照旧显示进度。界面**不显示**详细日志正文，只给路径。
+        界面照旧显示进度。界面**不显示**详细日志正文，只给路径。收尾那次顺带写上
+        本轮编号和本轮 ``ddtool.log`` 的路径，界面不必自己猜文件在哪。
         """
         stamp = time.strftime("%H:%M:%S")
         line = " ".join(x for x in (stamp, cell, phase, message) if x)
@@ -379,18 +398,23 @@ class Runner:
             payload.update(self._state.status_payload())
         if report_path:
             payload["stats_path"] = report_path
+            # report_path 和 stats_path 是同一个路径，两个键名都写，界面按各自的读法取。
+            payload["report_path"] = report_path
             payload["stats_headline"] = self.stats.headline()
+            round_ = loground.current()
+            if round_ is not None:
+                payload["round_id"] = round_.id
+                payload["log_path"] = str(round_.log_path)
         if self.on_status is not None:
             self.on_status(dict(payload))
         try:
             import json
 
-            from zzz_ddtool.paths import status_file
-
-            status_file().parent.mkdir(parents=True, exist_ok=True)
-            temp = status_file().with_suffix(".tmp")
+            status_path = loground.status_file()
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = status_path.with_suffix(".tmp")
             temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            temp.replace(status_file())
+            temp.replace(status_path)
         except Exception:
             self.log.exception("运行状态写入失败")
         self.log.info("状态 %s：%s %s", phase, cell, message)
@@ -1296,7 +1320,6 @@ class Runner:
             filter_mainstats=job.mainstats,
             stage_require=job.stage_require,
             min_useful_types=job.min_useful_types,
-            require_s_rank=self.preset.require_s_rank,
             skip_locked=self.preset.skip_locked,
             skip_equipped=self.preset.skip_equipped,
             skip_discarded=self.preset.skip_discarded,
@@ -1308,10 +1331,23 @@ class Runner:
     def run(self) -> list[RunResult]:
         """跑完整轮任务链，返回处理结果。F10 停止时返回已处理部分。
 
+        每次调用各开一轮日志：一次任务 = 一个时间戳目录。入口已经为这份 yaml 开好
+        轮次时（``claim_round``）认领它，否则另开一轮，绝不复用上一轮的目录。
+
         §7.1：run_total 在入口建会话后即开始，早于 ``_run`` 的 max_pages 校验及主
         try/finally，覆盖任务准备与所有真实退出；零盘退出仍产生且只产生一个根事件。
         """
         import uuid
+
+        # 先建轮次：零盘、max_pages 非法、F10 停止和异常都靠它兜住日志去处。
+        round_ = (
+            loground.claim_task(config=self.config_path, task=self.preset.name)
+            if self.claim_round
+            else loground.begin_task(config=self.config_path, task=self.preset.name)
+        )
+        self.trace = Trace(tag=round_.id, dir=round_.captures_dir)
+        self.stats = RunStats(tag=round_.id)
+        self.log.info("本轮日志目录：%s", round_.root)
 
         # §9.2：入口清空终止类型，避免上一轮的 completed/user_stopped 残留到本轮，
         # 尤其是 _run 在主 try/finally 之前直接返回 [] 的分支。
@@ -1327,17 +1363,15 @@ class Runner:
         self._job_records = []
         self._label_inputs = []
         self._shortfall_exception = None
-        tag = getattr(self.trace, "tag", None)
-        if not isinstance(tag, str) or not tag:
-            tag = "run"
-        run_id = f"{tag}-{uuid.uuid4().hex}"
-        capture_dir = getattr(self.trace, "dir", None)
-        stats_target = stats_dir() / f"{tag}.json"
+        run_id = f"{round_.id}-{uuid.uuid4().hex}"
+        capture_dir = round_.captures_dir
+        stats_target = round_.stats_path
         scanperf.begin_session(
-            tag,
+            round_.id,
             run_id=run_id,
-            capture_dir=(str(capture_dir) if capture_dir is not None else None),
+            capture_dir=str(capture_dir),
             stats_path=str(stats_target),
+            path=round_.perf_path,
         )
         run_started = time.monotonic()
         try:
@@ -1380,6 +1414,9 @@ class Runner:
                 )
             )
             scanperf.end_session()
+            # 统计、报告、最终状态和性能根事件都已落盘刷新，这时才把轮次登记改成
+            # closed（超龄回收只看这个状态；当前轮次的文件继续写空闲日志）。
+            loground.finish(self.outcome, reason=self.end_reason)
 
     def _run(self) -> list[RunResult]:
         if not self._valid_max_pages():
@@ -1543,8 +1580,9 @@ class Runner:
         return list(self.results)
 
     def _kept_image_path(self, disc_slot: int) -> str:
-        """成功盘（升满保留）截图存到 log/stats/<tag>/success/，返回相对 .md 的路径。
+        """成功盘（升满保留）截图存到本轮 ``success/``，返回相对报告文件的路径。
 
+        报告与本目录的 ``success/`` 同级，所以链接就是 ``success/discN.png``。
         截不到（窗口最小化、游戏不在前台、统计对象被 mock 等）就返回空串，不影响主流程。
         截什么界面由调用时机决定（目前截判定成功那一刻的游戏画面，后续可调成切到详情页再截）。
         """
@@ -1553,7 +1591,7 @@ class Runner:
                 return ""
             disc = self.stats.discs[disc_slot]
             image, _method, _hwnd = grab_game_image(self._hwnd)
-            dest = stats_dir() / str(self.stats.tag) / "success"
+            dest = _round().success_dir
             path = save_image(image, self._hwnd, "printwindow", name=f"disc{disc.index}", dest_dir=dest)
             return f"success/{path.name}"
         except Exception:
@@ -1561,21 +1599,22 @@ class Runner:
             return ""
 
     def _finish_stats(self, run_started: float) -> str:
-        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 JSON + 执行结果总结。
+        """收尾统计：并入 Trace 的步骤耗时 → 写日志摘要 → 落 stats.json + report.md。
 
-        返回执行结果总结（.md）的绝对路径，供界面显示「详细日志在哪」；
+        返回执行结果总结（report.md）的绝对路径，供界面显示「详细日志在哪」；
         写不出去就返回空串。统计出问题不影响任务结果，只记一条警告。
         """
         try:
+            round_ = _round()
             self.stats.seconds = time.monotonic() - run_started
             self.stats.absorb_steps(self.trace.spans)
             self.stats.log_summary(self.log)
-            target = self.stats.write(stats_dir() / f"{self.stats.tag}.json")
+            target = self.stats.write(round_.stats_path)
             if target is not None:
                 self.log.info("统计已写入 %s", target)
             else:
                 self.log.warning("结构化统计写入失败（不影响本轮结果）")
-            report_path = self.stats.write_report(stats_dir() / f"{self.stats.tag}.md")
+            report_path = self.stats.write_report(round_.report_path)
             if report_path is not None:
                 self.log.info("执行结果总结已写入 %s", report_path)
                 return str(report_path)

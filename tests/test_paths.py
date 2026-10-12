@@ -1,7 +1,27 @@
+"""公共根定位：开发态 = 仓库根，打包态 = 有根标记的公共根。
+
+``log/``（正式运行）与 ``log_test/``（测试、探测、回放、标定）走同一条规则，
+彼此分开：换版本目录不丢日志，测试也不进生产计数。
+
+注意：tests/conftest.py 为了隔离会把 ``paths.log_root`` / ``log_settings_file``
+临时换成沙箱替身，所以这里取一份未被替换的 ``paths`` 模块来验定位规则本身。
+"""
+
+import importlib.util
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from zzz_ddtool import paths
+
+
+@pytest.fixture(scope="module")
+def real_paths():
+    spec = importlib.util.spec_from_file_location("paths_pristine", paths.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _app_dir():
@@ -13,49 +33,46 @@ def _app_dir():
     return tempfile.TemporaryDirectory()
 
 
-def test_standalone_program_uses_its_own_root(monkeypatch):
+def _fake_exe(monkeypatch, module, exe: Path) -> None:
+    monkeypatch.setattr(module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(module.sys, "executable", str(exe))
+
+
+def test_standalone_program_uses_its_own_root(real_paths, monkeypatch):
     with _app_dir() as base:
         tmp = Path(base)
-        monkeypatch.setattr(paths.sys, "frozen", True, raising=False)
-        monkeypatch.setattr(paths.sys, "executable", str(tmp / "zzz-ddtool.exe"))
-        assert paths.user_dir() == tmp / "user"
-        assert paths.plans_dir() == tmp / "user" / "plan"
+        _fake_exe(monkeypatch, real_paths, tmp / "zzz-ddtool.exe")
+        assert real_paths.user_dir() == tmp / "user"
+        assert real_paths.plans_dir() == tmp / "user" / "plan"
 
 
-def test_log_dir_follows_shared_root(tmp_path, monkeypatch):
-    """打包态有根标记时 log/ 落在公共根 —— 换版本目录不丢日志。"""
+def test_log_roots_follow_shared_root(real_paths, tmp_path, monkeypatch):
+    """打包态有根标记时两个日志根都落在公共根 —— 换版本目录不丢日志。"""
     root = tmp_path / "root"
     app = root / "dist" / "v2" / "zzz-ddtool"
     app.mkdir(parents=True)
     (root / ".zzz-ddtool-root").write_text("zzz-ddtool", encoding="utf-8")
-    monkeypatch.setattr(paths.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(paths.sys, "executable", str(app / "zzz-ddtool.exe"))
+    _fake_exe(monkeypatch, real_paths, app / "zzz-ddtool.exe")
 
-    assert paths.log_dir() == root / "log"
-    assert paths.user_dir() == root / "user"  # 与 user/ 同一条规则
+    assert real_paths.log_root() == root / "log"
+    assert real_paths.test_log_root() == root / "log_test"
+    assert real_paths.user_dir() == root / "user"  # 与 user/ 同一条规则
 
 
-def test_log_dir_falls_back_to_app_dir_without_marker(monkeypatch):
-    """独立放置（周围无根标记）时 log/ 仍在 exe 同级 —— 与 user/ 同一条限制。"""
+def test_log_roots_fall_back_to_app_dir_without_marker(real_paths, monkeypatch):
+    """独立放置（周围无根标记）时两个根仍在 exe 同级，且彼此分开。"""
     with _app_dir() as base:
         app = Path(base) / "standalone"
         app.mkdir()
-        monkeypatch.setattr(paths.sys, "frozen", True, raising=False)
-        monkeypatch.setattr(paths.sys, "executable", str(app / "zzz-ddtool.exe"))
+        _fake_exe(monkeypatch, real_paths, app / "zzz-ddtool.exe")
 
-        assert paths.log_dir() == app / "log"
+        assert real_paths.log_root() == app / "log"
+        assert real_paths.test_log_root() == app / "log_test"
 
 
-def test_runtime_subdirs_hang_off_log_dir(tmp_path, monkeypatch):
-    """captures / text / stats / debug / run-status 都跟随 log_dir，不各自定位。"""
-    app = tmp_path / "standalone"
-    app.mkdir()
-    monkeypatch.setattr(paths.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(paths.sys, "executable", str(app / "zzz-ddtool.exe"))
-
-    log = paths.log_dir()
-    assert paths.captures_dir() == log / "captures"
-    assert paths.logs_dir() == log / "text"
-    assert paths.stats_dir() == log / "stats"
-    assert paths.debug_dir() == log / "debug"
-    assert paths.status_file() == log / "run-status.json"
+def test_dev_tree_puts_both_log_roots_under_repo(real_paths):
+    """开发态（非打包）两个根都落在仓库根，和 user/ 同一层，互不重名。"""
+    assert not getattr(real_paths.sys, "frozen", False)
+    assert real_paths.log_root() == real_paths.repo_root() / "log"
+    assert real_paths.test_log_root() == real_paths.repo_root() / "log_test"
+    assert real_paths.log_settings_file() == real_paths.user_dir() / "log-settings.json"

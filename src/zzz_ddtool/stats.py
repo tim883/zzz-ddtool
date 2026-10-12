@@ -21,13 +21,13 @@
 格位计数按**任务**分开算：每个任务有自己的筛选条件和独立序号空间，
 跨任务求和只会得到没有意义的数字。
 
-产物三处（收尾时一次性写出）：
-    log/text/ddtool.log          一段中文摘要（给人看的，可 grep）
-    log/stats/<tag>.json         结构化数据（给脚本/后续报表用）
-    log/stats/<tag>.md           执行结果总结；客户端的结果统计界面展示的就是它
+产物三处，都在本轮目录里（收尾时一次性写出）：
+    <轮次>/ddtool.log            一段中文摘要（给人看的，可 grep）
+    <轮次>/stats.json            结构化数据（给脚本/后续报表用）
+    <轮次>/report.md             执行结果总结；客户端的结果统计界面展示的就是它
 
-**为什么放 log/stats 而不是 captures/<tag>/**：截图目录按张数整轮回收，
-统计文件虽然不匹配 ``*.png`` 删不掉，但跟着截图走容易被误清理。
+轮次目录由 ``loground`` 管理，按轮数整轮回收：日志、报告、统计、性能、截图
+一起删，统计文件不会落单。
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ class DiscStat:
     slot: int = 0
     sets: tuple[str, ...] = ()
     line_count: int = 0  # 副词条条数（词条数）
-    # 升满成功盘的截图相对路径（相对 log/stats/<tag>/，如 "success/disc12.png"）。
+    # 升满成功盘的截图相对路径（相对本轮的 report.md，如 "success/disc12.png"）。
     # 由 runner 在判定成功时存好；截不到就留空，报告里不贴图。
     image: str = ""
     level_end: int = 0
@@ -257,7 +257,7 @@ class RunStats:
                   image: str = "") -> None:
         """收尾一件盘。重复调用以第一次为准（一件盘有多个出口，别重复记账）。
 
-        image：成功盘截图相对路径（相对 log/stats/<tag>/），由 runner 在判定成功时传入。
+        image：成功盘截图相对路径（相对本轮的 report.md），由 runner 在判定成功时传入。
         """
         if not (0 <= slot < len(self.discs)):
             return
@@ -579,7 +579,7 @@ class RunStats:
         return out
 
     def report_text(self) -> str:
-        """Markdown 报告：写进 ``log/stats/<tag>.md``，客户端结果统计栏展示的也是它。"""
+        """Markdown 报告：写进本轮 ``report.md``，客户端结果统计栏展示的也是它。"""
         data = self.summary()
         counts = data["outcomes"]
         totals = data["totals"]
@@ -654,7 +654,8 @@ class RunStats:
             lines.append(
                 "- 套装名取所属任务的过滤套装（任务未限定套装时显示「未知」）；部位号 = 任务号位；"
                 "词条数 = 副词条条数。这几项帮你看清「升满成功的到底是哪几件盘」。"
-                "每张图是对应盘升满成功时的界面截图（存于 log/stats/<tag>/success/）。"
+                "每张图是对应盘升满成功时的界面截图（存于与本报告同目录的 success/，"
+                "链接即 success/discN.png）。"
             )
         else:
             lines.append("（无：本轮没有升满 15 级且判定保留的盘）")

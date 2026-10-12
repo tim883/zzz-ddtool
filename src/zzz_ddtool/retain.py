@@ -92,10 +92,12 @@ def iter_rounds(root: Path | None = None) -> list[Path]:
 
 
 def is_history(root: Path) -> bool:
-    """已关闭、且没有进程在写的轮次 = 可以回收的历史记录。"""
-    record = loground.read_registry(root)
-    if record is None or record.get("state") != "closed":
-        return False
+    """可以回收的轮次 = 没有任何进程在写它。
+
+    不收尾的崩溃轮次也算可回收：占用看锁，不看 ``round.json`` 里留着什么状态，
+    否则一次崩溃就能让目录永久占着名额。反过来，只要锁还在（或登记的进程还活着），
+    无论状态写成什么都不动。
+    """
     return not loground.is_occupied(Path(root))
 
 

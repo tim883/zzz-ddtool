@@ -5,7 +5,7 @@
 - **程序包** ``zzz-ddtool-v<version>.zip``：根 = 包目录内容（exe / ``_internal/`` / ``data/`` / ``version.txt``）
 - **数据包** ``data.zip``：根 = ``data/`` 里的内容
 
-出包前校验：包目录必须存在且顶层含程序文件、**不得含顶层 ``user/`` 与 ``log/``**、
+出包前校验：包目录必须存在且顶层含程序文件、**不得含顶层 ``user/``、``log/`` 与 ``log_test/``**、
 ``version.txt`` 必须与 ``pyproject.toml`` 一致。任一不满足即非零退出、**不产出任何 zip**。
 
 更新器侧还有一层剥离兜底（``updater._strip_protected``）；这一层的作用是"别让脏包出门"。
@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PKG_NAME = "zzz-ddtool"
-FORBIDDEN_TOP = ("user", "log")
+FORBIDDEN_TOP = ("user", "log", "log_test")
 REQUIRED_TOP = ("zzz-ddtool.exe", "_internal", "data", "version.txt")
 
 

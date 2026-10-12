@@ -7,6 +7,7 @@ import time
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
+from zzz_ddtool import loground
 from zzz_ddtool.capture import CaptureError, grab_game_image, save_image
 from zzz_ddtool.gamefilter import _refuse_dismantle
 from zzz_ddtool.layout import FILTER_BTN, FILTER_RESET, scale_point
@@ -54,6 +55,7 @@ def orange_reset_hits(image: QImage) -> int:
 
 
 def main() -> int:
+    loground.use_test_context("live-filter-only")
     QApplication.instance() or QApplication([])
     try:
         image, page, method, hwnd = grab()
