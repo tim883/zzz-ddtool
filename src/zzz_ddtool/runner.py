@@ -451,7 +451,7 @@ class Runner:
         if blocked:
             raise RunnerError(blocked)
         # §3.4：绑定与权限检查通过后、返回 hwnd 前探测环境并进入 release_waits 作用域，
-        # 使首个 _ensure_profile 的 reset_game_filter 也使用本机策略。
+        # 使后续输入（含显式重标定时的 reset_game_filter）都使用本机策略。
         env = probe_environment(self._hwnd)
         self._env = env
         self._enter_release_scope(env)
