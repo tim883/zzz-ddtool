@@ -1,4 +1,4 @@
-"""执行器回归：全局格位遍历、扫描跳过、进度提交、白名单与失败传播。
+﻿"""执行器回归：全局格位遍历、扫描跳过、进度提交、白名单与失败传播。
 
 替身网格模拟 4 行视口、可配置总行数的仓库；真实 OCR/输入/窗口接口全部替换，
 不发送任何真实游戏输入。
@@ -1083,7 +1083,7 @@ def test_run_calls_real_upgrade_buttons_then_rejudges(offline_runner, monkeypatc
     assert offline_runner["click_client"].call_args_list == [
         call(1, 166, 267),
         call(1, 1280, 860),
-        call(1, 1510, 860),
+        call(1, *Runner.UPGRADE_BUTTON_CENTER),
     ]
     assert parser.call_count == 1
     discard.assert_called_once_with(1)
@@ -1142,14 +1142,23 @@ def test_upgrade_page_fails_when_both_layouts_unreadable(offline_runner, monkeyp
     assert "升级结果" in runner.end_reason
 
 
-@pytest.mark.parametrize("missing, click_count", [("stage", 0), ("confirm", 1)])
-def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch, missing, click_count):
+@pytest.mark.parametrize("missing, clicks, expected", [("stage", 0, False), ("confirm", 2, True)])
+def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch, missing, clicks, expected):
+    """2026-10-12 改动：素材区没有「阶段添加」→ 不发任何输入、返回 False。
+
+    「升级」自本次改动起**直接点硬编码中心**（不抓帧、不 OCR，作者裁定），所以
+    ``missing="confirm"`` 不再是"不点"的守卫，而是照点：阶段添加 1 次 + 升级 1 次。
+    """
     runner = Runner(Preset(), hotkeys=False)
     button_lines(runner, monkeypatch, missing=missing)
-    assert runner._upgrade_once(99, before=sample_disc()) is False
-    assert offline_runner["click_client"].call_count == click_count
-    if click_count:
-        offline_runner["click_client"].assert_called_once_with(99, 1280, 860)
+    assert runner._upgrade_once(99, before=sample_disc()) is expected
+    assert offline_runner["click_client"].call_count == clicks
+    if clicks == 0:
+        return
+    # 阶段添加点 OCR 文字中心；升级点硬编码中心。
+    assert offline_runner["click_client"].call_args_list == [
+        call(99, 1280, 860), call(99, *Runner.UPGRADE_BUTTON_CENTER),
+    ]
 
 
 def test_missing_upgrade_button_stops_later_jobs(offline_runner, monkeypatch):
@@ -1895,7 +1904,7 @@ def test_material_slot_entry_clicks_slot_not_stage_add(offline_runner, monkeypat
     monkeypatch.setattr(ocr_module, "read_rect", read_rect)
 
     assert runner._upgrade_once(99, 3, before=sample_disc()) is True
-    assert offline_runner["click_client"].call_args_list == [call(99, 1405, 677), call(99, 1510, 860)]
+    assert offline_runner["click_client"].call_args_list == [call(99, 1405, 677), call(99, *Runner.UPGRADE_BUTTON_CENTER)]
 
 
 def test_material_slot_scales_with_window_size(offline_runner, monkeypatch):

@@ -282,40 +282,51 @@ def test_w2_material_bar_descriptor_survives_fill_brightness_pulse():
     )
 
 
-def test_w2_material_wait_starts_from_input_release(monkeypatch, sim_time):
-    """§4.3：material_ready 的等待起点必须是素材点击的真实释放点，不是点击返回时刻。"""
+def test_w2_stage_add_to_upgrade_uses_fixed_bounded_interval(monkeypatch, sim_time):
+    """2026-10-12 改动：素材输入后不再消费 material_ready，只等固定间隔再点「升级」。
+
+    原用例 ``test_w2_material_wait_starts_from_input_release`` 验的是"等待起点等于素材点击
+    的真实释放点"；该等待已按作者裁定删除（阶段添加后的动画不必等稳定，点「升级」会让动画
+    立刻结束），因此改为验新行为：不触发 material_ready、间隔固定且有界、素材释放点仍被记录。
+    """
     runner = Runner(Preset(), hotkeys=False)
     runner.trace = Mock()
     clock = sim_time
     released: list[float] = []
+    sleeps: list[float] = []
+    clicks: list[tuple[int, int]] = []
 
-    def click(_hwnd, _x, _y):
+    def _click(hwnd, x, y):
         released.append(clock.now())
+        clicks.append((x, y))
         clock.t = 1.100  # 点击返回到调用方时时钟已走到 1.100 s
         return InputRelease("click_client", 1_000_000_000)  # 真实释放点 1.000 s
 
-    monkeypatch.setattr(runner_module, "click_client", click)
-    frames = Frames([{"image": image()}])
-    bind_grab(monkeypatch, runner, frames)
-    waits: list[InputRelease] = []
-
-    def fake_wait(kind, *, release, **_kwargs):
-        assert kind == "material_ready"
-        waits.append(release)
-        raise timeout("素材未就绪")
-
-    monkeypatch.setattr(runner, "_wait_ready", fake_wait)
-    patch_regions(monkeypatch, {Runner.STAGE_ADD_AREA: [line("阶段添加")]})
+    monkeypatch.setattr(runner_module, "click_client", _click)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda s: sleeps.append(s))
+    # 关键断言：生产路径不得再触发 material_ready 等待。
+    monkeypatch.setattr(
+        runner, "_wait_ready",
+        Mock(side_effect=AssertionError("阶段添加后不得再做 material_ready 就绪等待")),
+    )
+    # 「阶段添加」仍走 OCR 找文字；「升级」已改硬编码直接点，不再读该区域。
+    monkeypatch.setattr(
+        ocr_module, "read_rect",
+        lambda image, area: [line("阶段添加")] if area == Runner.STAGE_ADD_AREA else [],
+    )
 
     clock.t = 1.000
-    with pytest.raises(RunnerError, match="素材准备就绪超时"):
-        runner._upgrade_once(1, 0, before=disc(0))
+    assert runner._upgrade_once(1, 0, before=disc(0)) is True
 
-    assert released == [1.000]
+    assert released[0] == 1.000, "素材点击仍从真实释放点起算"
     assert runner._material_release == InputRelease("click_client", 1_000_000_000)
-    assert waits == [InputRelease("click_client", 1_000_000_000)]
-    assert runner._upgrade_release is None      # 升级输入 0
-    assert frames.index == 1                    # 没有走到「升级」定位帧
+    # 固定间隔：作者要求整段（含抓帧与 OCR 找「升级」）不超过 500 ms；
+    # 现在「升级」不再抓帧、不 OCR，整段只剩点击内部耗时 + 这个间隔。
+    assert sleeps == [runner_module._STAGE_ADD_TO_UPGRADE_S]
+    assert runner_module._STAGE_ADD_TO_UPGRADE_S <= 0.2
+    # 第二次点击必须是「升级」的硬编码中心，且**没有**任何针对升级区的识别。
+    assert clicks[1] == Runner.UPGRADE_BUTTON_CENTER
+    assert runner._upgrade_release is not None
 
 
 # --------------------------------------------------------------------------

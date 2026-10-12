@@ -152,7 +152,17 @@ _RETURN_EDGE_FLOOR_MS: dict[str, int] = {
     "preview_warehouse": 680,
 }
 
+#: 「阶段添加」→「升级」之间的固定间隔（秒）。2026-10-12 作者裁定：阶段添加后的动画
+#: 不必等画面稳定，直接点「升级」会让动画立刻结束，结果一样；素材是否到位也不用确认
+#: （点下去没反应会在后面的 upgrade_result 等待里超时暴露）。原 `material_ready` 就绪等待
+#: （下限 947 ms、实测间隔约 2 s）改为这个固定间隔，作者要求整段不超过 500 ms；
+#: 残留成本是“抓一帧 + OCR 找「升级」文字”（约 180 ms 量级），故这里取 0.1 s 留余量，
+#: 真机确认稳定后可再压到 0.05 s。
+_STAGE_ADD_TO_UPGRADE_S = 0.1
+
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
+# 2026-10-12：`_upgrade_once` 生产路径已不再调用该等待（见 _STAGE_ADD_TO_UPGRADE_S）。
+# 仍在用的是 `_pick_material`（测试入口）触发的那次 material_ready；阈值与探针保留。
 # 描述子＝经验/预计等级条 ROI 的「饱和度」（max(R,G,B)-min(R,G,B)）再按各帧自身 p85 归一化。
 # 空条与底色是灰（饱和度恒为 0），只有填充色像素有饱和度 → 彩色掩码天然排掉灰区；
 # 按本帧 p85 归一化又抵消了填充色上那层亮度呼吸动画。变化阈值必须大于稳定阈值。
@@ -3124,6 +3134,11 @@ class Runner:
     # 「阶段添加」中心≈(1282,866)，「升级」中心≈(1511,866)。旧区 y=860 起把按钮拦腰切断导致 OCR 认不出。
     STAGE_ADD_AREA = (1150, 800, 1420, 940)
     UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
+    #: 「升级」按钮的**硬编码点击中心**（设计坐标，`scale_point` 按客户区缩放）。
+    #: 2026-10-12 作者裁定：阶段添加后不必等动画，**直接点**，不再抓帧 + OCR 找文字。
+    #: 取值用 2026-09-06 实拍标定的按钮中心 (1511,866)；真机日志里按 OCR 文字中心点出的
+    #: 实际坐标是 (1532,867)，两者相差 21px，同在按钮内。按钮位置固定，无需每次识别。
+    UPGRADE_BUTTON_CENTER = (1511, 866)
 
     def _read_label_state(self, hwnd: int, context: _LabelContext) -> tuple[dict, QImage]:
         """只检查绑定窗口、仓库和提示行；仅暂停代次改变时复验核心盘面。"""
@@ -3530,10 +3545,18 @@ class Runner:
     def _upgrade_once(self, hwnd: int, material_slot: int = 0, *, before: Disc) -> bool:
         """强化页选好素材 →「升级」，升一阶。返回两步是否都走完。
 
-        §6.2/§4.3：调用开始清空素材/升级释放回执；素材输入前取得 before_frame，素材输入后
-        按释放点执行 material_ready；随后定位并点击一次「升级」，其释放点供
-        ``_upgrade_loop`` 的 upgrade_result 使用。不保留原 1.5 秒等待。
-        material_slot>0 是测试入口，走 _pick_material。
+        §6.2/§4.3：调用开始清空素材/升级释放回执；素材输入前取得 before_frame。
+
+        **2026-10-12 改动（作者裁定）**：素材输入（「阶段添加」）后**不再做 `material_ready`
+        就绪等待**，只等固定 `_STAGE_ADD_TO_UPGRADE_S` 就去找并点「升级」。理由：阶段添加
+        后的动画不必等画面稳定，点「升级」会让动画立刻结束、结果一样；素材是否到位也不用
+        确认。原文"按释放点执行 material_ready、完成后才定位并点击一次「升级」"已作废。
+        该动作的释放点仍供 ``_upgrade_loop`` 的 upgrade_result 使用。
+        material_slot>0 是测试入口，走 _pick_material（那条路径仍消费 material_ready）。
+
+        2026-10-12 追加（作者裁定）：「升级」改为**直接点硬编码中心**
+        ``UPGRADE_BUTTON_CENTER``，不再抓帧 + OCR 找「升级」文字——按钮位置固定。
+        至此阶段添加与升级之间只剩 ``_STAGE_ADD_TO_UPGRADE_S`` 一个固定间隔。
         """
         from zzz_ddtool.ocr import read_rect
 
@@ -3553,22 +3576,17 @@ class Runner:
                 return False
         if self._material_release is None:
             raise RunnerError("素材输入未成功发出，无法确认素材准备就绪，停止任务链")
-        try:
-            self._wait_ready(
-                "material_ready", release=self._material_release,
-                before=before, before_frame=before_frame,
-            )
-        except ReadinessTimeout as exc:
-            raise RunnerError(f"素材准备就绪超时：{exc}，停止任务链")
-        # material_ready 完成后才定位并点击一次「升级」。
-        image, *_ = self._grab(allow_esc=False, need_page=False)
+        # 固定间隔替代原 material_ready 就绪等待：不等动画、不等素材条变化。
+        time.sleep(_STAGE_ADD_TO_UPGRADE_S)
+        # 「升级」直接点硬编码中心：不抓帧、不做 OCR 找文字。按钮位置固定，
+        # 2026-10-12 作者裁定（阶段添加后动画不必等稳定，点下去动画即刻结束）。
+        ux, uy = scale_point(
+            *self.UPGRADE_BUTTON_CENTER, before_frame.width(), before_frame.height()
+        )
         with self._business_input("upgrade_result", target={
             "before_level": before.level, "expected_level": next_stage_level(before.level),
         }):
-            self._upgrade_release = self._click_text(
-                hwnd, read_rect(image, self.UPGRADE_CONFIRM_AREA), "升级", "「升级」",
-                "step-upgrade-confirm", image=image,
-            )
+            self._upgrade_release = click_client(hwnd, ux, uy)
         if self._upgrade_release is None:
             return False
         self._upgrade_input_id = self._last_input_id
