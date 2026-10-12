@@ -138,9 +138,11 @@ def test_w1_select_returns_only_after_bound_and_two_stable_target_frames(monkeyp
     )
 
     assert result.disc == target
-    # 前 3 帧旧格选中；下限 680 ms 内不累计候选，到 700/750 ms 才凑满两个 50 ms 独立稳定帧（第 16 次采样）。
-    assert result.samples == 16
-    assert frames.index == 16
+    # 当前表值：选盘实测 320 ms + 200 ms 余量；550/600 ms 才得到两帧稳定目标。
+    assert runner_module._READY_FLOOR_MS["select_disc"] == 520
+    assert result.active_ms == pytest.approx(600)
+    assert result.samples == 13
+    assert frames.index == 13
     assert click.call_count == 0
     assert press.call_count == 0
 
@@ -580,9 +582,11 @@ def test_w7_return_to_warehouse_single_esc_real_wait_default_bound(monkeypatch, 
 
     assert runner._esc_back_to_grid(1) is True
     assert esc.call_count == 1
-    # 下限 1180 ms：候选在 1200/1250 ms 才凑满两个 50 ms 稳定帧；
-    # 加上 _esc_back_to_grid 进入循环前的那一次认层抓帧，共 27 次。
-    assert frames.index == 27
+    # 当前表值：返回实测 1411 ms + 200 ms 余量；1650/1700 ms 得到两帧稳定目标。
+    # 加上进入循环前的那一次认层抓帧，共 36 次。
+    assert runner_module._READY_FLOOR_MS["return_warehouse"] == 1611
+    assert sim_time.now() == pytest.approx(10_001.7)
+    assert frames.index == 36
 
 
 def test_w7_return_two_layer_edges_esc_twice(monkeypatch, sim_time):

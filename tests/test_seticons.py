@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import QApplication
 
+from zzz_ddtool import seticons
 from zzz_ddtool.seticons import _fit_font, paint_set_icon
 
 SETS_FILE = pathlib.Path(__file__).resolve().parents[1] / "data" / "sets.json"
@@ -56,8 +57,9 @@ def test_font_fits_every_set_name(qapp: QApplication) -> None:
         assert width <= 64 - 6, f"{name} 字号仍超标：{width}px"
 
 
-def test_full_name_drawn_not_truncated(qapp: QApplication) -> None:
-    """4 字及以上的名字必须画满，且不触到块边缘。"""
+def test_full_name_drawn_not_truncated(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """后备文字色块的完整套装名不截断；真实 PNG 不参与墨迹判断。"""
+    monkeypatch.setattr(seticons, "set_icon_path", lambda name: tmp_path / f"{name}.png")
     for name in _names():
         if len(name) < 4:
             continue
@@ -66,3 +68,18 @@ def test_full_name_drawn_not_truncated(qapp: QApplication) -> None:
         lo, hi = span
         assert hi - lo + 1 > 40, f"{name} 墨迹仅 {hi - lo + 1}px，疑似仍被截断"
         assert lo >= 2 and hi <= 61, f"{name} 文字触到边缘（{lo}~{hi}），可能溢出"
+
+
+def test_existing_png_is_used_instead_of_fallback_text(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    from PySide6.QtGui import QColor, QImage
+
+    path = tmp_path / "icon.png"
+    source = QImage(32, 32, QImage.Format.Format_RGB32)
+    source.fill(QColor(20, 30, 200))
+    assert source.save(str(path), "PNG")
+    monkeypatch.setattr(seticons, "set_icon_path", lambda name: path)
+
+    result = paint_set_icon("测试套装", 64).toImage()
+
+    assert (result.width(), result.height()) == (64, 64)
+    assert result.pixelColor(32, 32) == QColor(20, 30, 200)

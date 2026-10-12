@@ -43,7 +43,10 @@ class _Clock:
         return self.t
 
     def sleep(self, seconds: float) -> None:
-        self.t += float(seconds)
+        import math
+
+        advanced = self.t + float(seconds)
+        self.t = math.nextafter(self.t, math.inf) if seconds > 0 and advanced <= self.t else advanced
 
 
 def _offline_report(tmp_path: Path) -> Path:
@@ -137,7 +140,8 @@ def test_measure_evidence_rows_and_action_status():
     sample = measure.build_sample_row(
         sample_id="s1", action_id="slot", input_call_ids=[7], released_at_ns=1_000_000_000,
         binding=binding, before_frame=None, layout_id=None, return_edge=None,
-        t_ready_ns=1_050_000_000, t_stable_ns=1_100_000_000, stable_ms=100,
+        t_reach_ns=1_080_000_000, t_last_change_ns=1_100_000_000,
+        wait_lower_ms=80, wait_upper_ms=120, sample_interval_ms=20,
         next_step_call_id=8, next_step_captured_at_ns=1_400_000_000, next_step_verified=True,
         valid=True, invalid_reason=None,
     )
@@ -150,16 +154,19 @@ def test_measure_evidence_rows_and_action_status():
     )
     assert set(observation) == set(gate.OBSERVATION_FIELDS)
 
-    valid_rows = [dict(sample, sample_id=f"s{i}", stable_ms=90 + i) for i in range(10)]
-    invalid_row = dict(sample, sample_id="bad", valid=False, invalid_reason="窗口内未稳定", stable_ms=None)
-    rows = measure.action_rows([*valid_rows, invalid_row], ["slot", "reset"])
+    valid_rows = [dict(sample, sample_id=f"s{i}", wait_lower_ms=80 + i, wait_upper_ms=100 + i)
+                  for i in range(10)]
+    invalid_row = dict(sample, sample_id="bad", valid=False, invalid_reason="窗口内未稳定",
+                       wait_lower_ms=None, wait_upper_ms=None)
+    rows = measure.action_rows([*valid_rows, invalid_row], ["slot", "reset"], {"slot": True})
     by_action = {row["action_id"]: row for row in rows}
     assert by_action["slot"]["status"] == "measured"
     assert by_action["slot"]["sample_count"] == 10
-    assert by_action["slot"]["max_stable_ms"] == 99
-    import zzz_ddtool.actionwait as actionwait
-
-    assert by_action["slot"]["floor_ms"] == actionwait.compute_floor_ms([99])
+    assert by_action["slot"]["max_wait_lower_ms"] == 89
+    assert by_action["slot"]["max_wait_upper_ms"] == 109
+    assert by_action["slot"]["sample_interval_ms"] == 20
+    assert by_action["slot"]["verified"] is True
+    assert by_action["slot"]["floor_ms"] == 130  # 109 + max(20, ceil(10.9))，向上取整到 10 ms
     assert by_action["reset"]["status"] == "not_observed"
     assert by_action["reset"]["sample_ids"] == []
 
@@ -198,11 +205,26 @@ def _session(tmp_path, monkeypatch, script):
                      "window_dpi": 96, "game_exe_path": "c:/game.exe", "game_build": "b1"},
         hotkeys=False, clock=clock.now,
     )
-    image = QImage(8, 8, QImage.Format.Format_RGB32)
-    image.fill(QColor(3, 3, 3))
+    # 真实像素序列驱动签名/区间计算，只隔离抓图和最终视觉判读边界。
+    tones: dict[tuple, int] = {}
+    states: dict[int, tuple] = {}
+    frames = []
+    for ready, key in script:
+        state = (ready, json.dumps(key))
+        if state not in tones:
+            tone = 40 + 80 * len(tones)
+            tones[state] = tone
+            states[tone] = (ready, key)
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        tone = tones[state]
+        image.fill(QColor(tone, tone, tone))
+        frames.append(image)
+    index = {"n": 0}
 
     def grab(**_kwargs):
         clock.sleep(0.001)
+        image = frames[min(index["n"], len(frames) - 1)]
+        index["n"] += 1
         return image, "unknown", "stub", 1
 
     session.runner = SimpleNamespace(
@@ -210,17 +232,25 @@ def _session(tmp_path, monkeypatch, script):
         _env=SimpleNamespace(client_width=1920, client_height=1080, window_dpi=96),
         _grab=grab,
     )
-    index = {"n": 0}
+    session._last_grab = (frames[0], clock.now())
+    monkeypatch.setattr(measure, "_FAST_GRAB", False)
+    monkeypatch.setattr(measure, "_PANEL_WINDOW_S", 0.12)
 
     class _Judge:
         def __call__(self, image_arg):
-            step = min(index["n"], len(script) - 1)
-            index["n"] += 1
-            ready, key = script[step]
+            ready, key = states[image_arg.pixelColor(0, 0).red()]
             return _StubResult(ready, key)
 
     monkeypatch.setattr(measure.judge, "StreamJudge", lambda action_id, ctx: _Judge())
+    monkeypatch.setattr(measure.judge, "evaluate", lambda action_id, image_arg, ctx: _Judge()(image_arg))
     return session, clock
+
+
+def _join_next_step_verification(session) -> None:
+    """下一步判读已改为后台线程；断言等待该实际线程收尾，不替换验证逻辑。"""
+    for thread in session._verify_threads:
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
 
 
 def _note_input(session, call_id: int, role: str, released_ns: int) -> None:
@@ -242,11 +272,12 @@ def test_measure_sampling_records_stable_pair_and_hold(tmp_path, monkeypatch):
     sample = session.samples[0]
     assert sample["valid"] is True and sample["invalid_reason"] is None
     assert sample["input_call_ids"] == [11]
-    assert sample["t_ready_ns"] is not None and sample["t_stable_ns"] is not None
-    assert sample["stable_ms"] >= 50
+    assert sample["t_reach_ns"] is not None and sample["t_last_change_ns"] is not None
+    assert sample["wait_lower_ms"] == sample["wait_upper_ms"] == 50
+    assert sample["sample_interval_ms"] == 21  # 抓图 1 ms + 20 ms 帧间隔
     assert sample["next_step_verified"] is False  # 尚未发生下一步输入
     rows = [row for row in session.evidence.observations if row["sample_id"] == sample["sample_id"]]
-    assert len(rows) >= 5
+    assert len(rows) == 1  # 计时环只抓图，窗口末才判读一次
     assert all(set(row) == set(gate.OBSERVATION_FIELDS) for row in rows)
     assert all(Path(session.round_dir / row["frame_path"]).is_file() for row in rows)
 
@@ -259,21 +290,75 @@ def test_measure_sampling_records_stable_pair_and_hold(tmp_path, monkeypatch):
     assert any(row.get("type") == "observation" for row in lines)
 
 
-def test_measure_sampling_marks_hold_violation_invalid(tmp_path, monkeypatch):
+def test_measure_sampling_rejects_unconfirmed_final_state(tmp_path, monkeypatch):
     key = ["filter_panel", 5, [], [], None]
-    script = [(False, None)] + [(True, key)] * 2 + [(True, ["filter_panel", 6, [], [], None])] * 8
+    script = [(False, None)] + [(True, key)] * 2 + [(False, None)] * 8
     session, clock = _session(tmp_path, monkeypatch, script)
     _note_input(session, 12, "open_panel", int(clock.now() * 1e9))
     session._measure_panel_action("open_panel", InputRelease("click_client", int(clock.now() * 1e9)))
     sample = session.samples[0]
     assert sample["valid"] is False
-    assert "保持期" in sample["invalid_reason"]
+    assert sample["invalid_reason"] == "窗口末判读未确认最终态"
+
+
+def test_measure_sampling_reaches_final_reference_after_intermediate_change(tmp_path, monkeypatch):
+    initial_key = ["filter_panel", 5, [], [], None]
+    final_key = ["filter_panel", 6, [], [], None]
+    session, clock = _session(tmp_path, monkeypatch,
+                              [(False, None)] + [(True, initial_key)] * 2 + [(True, final_key)] * 8)
+    released = int(clock.now() * 1e9)
+    _note_input(session, 11, "open_panel", released)
+
+    session._measure_panel_action("open_panel", InputRelease("click_client", released))
+
+    sample = session.samples[0]
+    assert sample["valid"] is True
+    # 首次变化在 22 ms，但最终态直到 64 ms 才出现；不能把动画起点当成就绪时间。
+    assert sample["t_reach_ns"] == sample["t_last_change_ns"] == released + 64 * _MS
+    assert (sample["wait_lower_ms"], sample["wait_upper_ms"]) == (64, 85)
+
+
+@pytest.mark.parametrize("tones,reach_ms,bounds", [
+    ([40, 120, 200, 200], 41, (41, 61)),
+    ([200, 200, 200, 200], 1, (50, 50)),
+], ids=["intermediate-state", "completed-before-first-frame"])
+def test_executor_fast_sample_uses_confirmed_reference(tmp_path, monkeypatch, tones, reach_ms, bounds):
+    session, clock = _session(tmp_path, monkeypatch, [(False, None), (True, ["warehouse"])])
+    released = int(clock.now() * 1e9)
+    before = QImage(8, 8, QImage.Format.Format_RGB32)
+    before.fill(QColor(40, 40, 40))
+    before_frame = session.evidence.save_frame(before)
+    frames = []
+    images = []
+    for index, tone in enumerate(tones):
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor(tone, tone, tone))
+        crop = measure._observation_crop(image)
+        frames.append((released + (1 + index * 20) * _MS, measure._signature_of(crop), crop))
+        images.append(image)
+
+    session._finalize_executor_sample(
+        "s001-select_disc", "select_disc", InputRelease("click_client", released),
+        measure.judge.JudgeContext(), SimpleNamespace(frame=images[-1]), None, [11],
+        before_frame=before_frame, fast_series=frames,
+    )
+
+    sample = session.samples[0]
+    assert sample["valid"] is True
+    assert sample["t_reach_ns"] == sample["t_last_change_ns"] == released + reach_ms * _MS
+    assert (sample["wait_lower_ms"], sample["wait_upper_ms"]) == bounds
+    series = gate._signature_series(session.evidence.dir / "s001-select_disc-frames.csv")
+    assert next(row for row in series if row["matches_reference"])["t_ns"] == sample["t_reach_ns"]
+    assert next(row for row in reversed(series) if row["changed"])["t_ns"] == sample["t_last_change_ns"]
+    for suffix in ("reach", "lastchange"):
+        assert (session.evidence.dir / f"s001-select_disc-{suffix}.png").is_file()
 
 
 def test_panel_plan_done_uses_samples_and_attempts():
     session = object.__new__(measure.MeasureSession)
     session.samples = []
     session._attempts = {}
+    session._probe = {}
     session.evidence = SimpleNamespace(inputs=[])
     assert measure._panel_plan_done(session) is False
 
@@ -293,6 +378,9 @@ def test_panel_plan_done_uses_samples_and_attempts():
     ] + [
         {"action_id": "reset", "valid": True, "next_step_call_id": 2} for _ in range(10)
     ]
+    assert measure._panel_plan_done(session) is False  # 样本够，但还没有真探测验证
+    session._probe = {action_id: {"pending": False, "verified": True}
+                      for action_id in measure._PANEL_DRIVEN}
     assert measure._panel_plan_done(session) is True
 
     session.samples = []
@@ -354,51 +442,42 @@ def test_drive_panel_cycles_alternates_and_stops(monkeypatch):
     assert calls == []  # 计划已达成：一个周期都不跑
 
 
-def test_drive_select_cycles_escape_and_menu_recovery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("next_page", ["drive_disc", "menu"], ids=["warehouse", "wrong-page"])
+def test_drive_select_cycles_uses_production_processing_without_extra_keys(monkeypatch, next_page):
     from zzz_ddtool import wininput
 
-    clicks: list[tuple] = []
-    presses: list[int] = []
-    waits: list[tuple] = []
-    monkeypatch.setattr(wininput, "click_client", lambda hwnd, x, y: clicks.append((x, y)) or "r")
-    monkeypatch.setattr(wininput, "press_key", lambda hwnd, vk=None, *a, **k: presses.append(vk))
-    monkeypatch.setattr(wininput, "focus_window", lambda hwnd: None)
-    monkeypatch.setattr("zzz_ddtool.nav.goto_warehouse", lambda hwnd: None)
+    processed: list[int] = []
+    monkeypatch.setattr(wininput, "click_client", lambda *a, **k: pytest.fail("驱动不能额外点击"))
+    monkeypatch.setattr(wininput, "press_key", lambda *a, **k: pytest.fail("驱动不能额外按 Esc"))
+    monkeypatch.setattr(measure, "_ensure_foreground", lambda hwnd: None)
+    monkeypatch.setattr(measure, "_load_profile_readonly", lambda runner, hwnd: None)
     monkeypatch.setattr(measure, "_ensure_panel_closed", lambda runner, hwnd: None)
     monkeypatch.setattr("zzz_ddtool.gamefilter._panel_present", lambda image: False)
-    monkeypatch.setattr("zzz_ddtool.gamefilter._picker_popup_closed", lambda image: True)
-    monkeypatch.setattr(measure.time, "sleep", lambda seconds: None)
     cells = [
-        SimpleNamespace(global_index=3, center_x=100, center_y=200),
-        SimpleNamespace(global_index=4, center_x=300, center_y=200),
+        SimpleNamespace(global_index=3, center_x=100, center_y=200, level=0),
+        SimpleNamespace(global_index=4, center_x=300, center_y=200, level=0),
     ]
-    pages = iter(["drive_disc", "menu", "drive_disc", "drive_disc"])
+    pages = iter(["drive_disc", "drive_disc", next_page])
     runner = SimpleNamespace(
         _grab=lambda **kwargs: (object(), next(pages), "m", 1),
-        _scan_cells=lambda state, image=None: (cells, [], []),
-        _business_input=lambda kind, target=None: _cm(),
-        _wait_ready=lambda kind, release=None, cell=None: waits.append((kind, cell.global_index)),
+        _row_pitch=175,
+        _sub_preset=lambda job: object(),
+        _prepare_navigation=lambda hwnd, state: SimpleNamespace(scan=(cells, [], [])),
+        _process_cell=lambda hwnd, job, state, cell, preset, accepted, counts: processed.append(cell.global_index),
     )
-    monkeypatch.setattr(measure, "_action_done", lambda session, action_id: False)
-    monkeypatch.setattr(measure, "_MAX_ATTEMPTS_PER_ACTION", 2)
-    job = SimpleNamespace(job_id="j", slot=5, sets=("甲",), mainstats=())
+    monkeypatch.setattr(measure, "_action_done", lambda session, action_id: len(processed) == 2)
+    job = SimpleNamespace(job_id="j", slot=5, sets=("甲",), mainstats=(), accepted=[])
     preset = SimpleNamespace(max_pages=4)
     session = object.__new__(measure.MeasureSession)
 
     errors = measure._drive_select_cycles(session, runner, 1, preset, job)
 
-    assert errors == []
-    assert clicks == [(100, 200), (300, 200)]
-    assert waits == [("select_disc", 3), ("select_disc", 4)]
-    assert presses == [wininput.VK_ESCAPE] * 3  # 每次选盘后一次，菜单误开时补一次
-
-
-class _cm:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+    if next_page == "drive_disc":
+        assert errors == []
+        assert processed == [3, 4]
+    else:
+        assert any("当前页面 menu，停止" in message for message in errors)
+        assert processed == [3]  # 错页后不追加输入或调用第二件处理
 
 
 def test_drive_calibration_wires_capture_and_closes_scope(monkeypatch):
@@ -414,7 +493,9 @@ def test_drive_calibration_wires_capture_and_closes_scope(monkeypatch):
     monkeypatch.setattr("zzz_ddtool.actionwait.collect_wait_receipts", lambda: _Ctx())
     monkeypatch.setattr("zzz_ddtool.control.controlled_inputs", lambda *args, **kwargs: _Ctx())
     monkeypatch.setattr("zzz_ddtool.wininput.capture_inputs", lambda sink: _Ctx())
-    monkeypatch.setattr("zzz_ddtool.wininput.focus_window", lambda hwnd: order.append("focus"))
+    monkeypatch.setattr(measure, "_ensure_foreground", lambda hwnd: order.append("foreground"))
+    monkeypatch.setattr(measure, "_EXEC_ONLY", False)
+    monkeypatch.setattr(measure, "_PANEL_ONLY", False)
     monkeypatch.setattr("zzz_ddtool.nav.goto_warehouse", lambda hwnd: order.append("goto"))
     monkeypatch.setattr(measure, "_ensure_panel_closed", lambda runner, hwnd: order.append("clean"))
     monkeypatch.setattr(measure, "_drive_panel_cycles",
@@ -440,7 +521,7 @@ def test_drive_calibration_wires_capture_and_closes_scope(monkeypatch):
     errors = measure.drive_calibration(session, runner, preset)
 
     assert errors == []
-    assert order == ["bind", "focus", "goto", "clean", "profile", "panels", "selects", "close_scope", "finish"]
+    assert order == ["bind", "foreground", "goto", "clean", "profile", "panels", "selects", "close_scope", "finish"]
 
 
 def test_executor_ctx_uses_production_cell_for_select_disc(tmp_path, monkeypatch):
@@ -484,11 +565,12 @@ def test_next_step_esc_only_is_verified_by_page_identity(tmp_path, monkeypatch):
     session, clock = _session(tmp_path, monkeypatch, script)
     image = QImage(8, 8, QImage.Format.Format_RGB32)
     image.fill(QColor(4, 4, 4))
-    session.runner._grab = lambda **_kw: (image, "warehouse", "stub", 1)
     _note_input(session, 11, "substat_count", int(clock.now() * 1e9))
     session._measure_panel_action("substat_count", InputRelease("click_client", int(clock.now() * 1e9)))
     sample = session.samples[0]
+    session.runner._grab = lambda **_kw: (image, "warehouse", "stub", 1)
     _note_key_input(session, 12, "close_panel", int(clock.now() * 1e9))
+    _join_next_step_verification(session)
     assert sample["next_step_call_id"] == 12
     assert sample["next_step_verified"] is True
     assert sample["valid"] is True
@@ -499,11 +581,12 @@ def test_next_step_esc_only_rejects_still_open_panel(tmp_path, monkeypatch):
     session, clock = _session(tmp_path, monkeypatch, script)
     image = QImage(8, 8, QImage.Format.Format_RGB32)
     image.fill(QColor(4, 4, 4))
-    session.runner._grab = lambda **_kw: (image, "filter_panel", "stub", 1)
     _note_input(session, 11, "substat_count", int(clock.now() * 1e9))
     session._measure_panel_action("substat_count", InputRelease("click_client", int(clock.now() * 1e9)))
     sample = session.samples[0]
+    session.runner._grab = lambda **_kw: (image, "filter_panel", "stub", 1)
     _note_key_input(session, 12, "close_panel", int(clock.now() * 1e9))
+    _join_next_step_verification(session)
     assert sample["next_step_verified"] is False
     assert sample["valid"] is False and sample["invalid_reason"] == "下一步未能作用于正确对象"
 
@@ -570,6 +653,7 @@ def test_next_step_input_is_not_absorbed_into_call_ids(tmp_path, monkeypatch):
     session._measure_panel_action("open_panel", InputRelease("click_client", int(clock.now() * 1e9)))
     sample = session.samples[0]
     _note_input(session, 12, "open_panel", int(clock.now() * 1e9))  # 同角色紧随输入＝下一步
+    _join_next_step_verification(session)
     assert sample["input_call_ids"] == [11]
     assert sample["next_step_call_id"] == 12 and sample["next_step_verified"] is True
     assert sample["valid"] is True
@@ -598,14 +682,16 @@ def test_sample_records_before_frame_from_production_grab(tmp_path, monkeypatch)
     image = QImage(8, 8, QImage.Format.Format_RGB32)
     image.fill(QColor(5, 5, 5))
     session._last_grab = (image, clock.now())
-    session._measure_panel_action("open_panel", InputRelease("click_client", int(clock.now() * 1e9)))
+    released = int(clock.now() * 1e9)
+    _note_input(session, 11, "open_panel", released)
+    session._measure_panel_action("open_panel", InputRelease("click_client", released))
     sample = session.samples[0]
     assert sample["before_frame_path"] and sample["before_frame_sha256"]
     assert (session.round_dir / sample["before_frame_path"]).is_file()
 
 
 def test_t4_panel_scroll_events_and_single_tail_budget(tmp_path, monkeypatch):
-    """§4.2/T4：面板 raw 滚轮 8 条 -3、事件间隔 60 ms 不变，仅最后一条后按 310 ms 预算一次。"""
+    """§4.2/T4：8 条 -3、间隔 60 ms，仅末条使用实测 173 ms + 200 ms 余量。"""
     from contextlib import contextmanager
 
     from zzz_ddtool import gamefilter as gf
@@ -643,7 +729,7 @@ def test_t4_panel_scroll_events_and_single_tail_budget(tmp_path, monkeypatch):
     stamps = [int(receipt.released_at_ns) for receipt in receipts]
     deltas = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
     assert deltas == [60 * _MS] * 7  # 事件间 60 ms 不变
-    assert waits == [("substat_scroll", receipts[-1], 310)]  # 仅最后一条后一次预算，不叠加
+    assert waits == [("substat_scroll", receipts[-1], 373)]  # 仅最后一条后一次预算，不叠加
 
 
 def test_final_run_rejects_no_speedup_keeps_report(tmp_path, monkeypatch):

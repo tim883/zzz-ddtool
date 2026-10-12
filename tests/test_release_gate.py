@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import xml.etree.ElementTree as ET
@@ -46,7 +47,6 @@ accepted: []
 """
 
 _KEY = ["filter_panel", None, [], [], None]
-_KEY_CHANGED = ["filter_panel", "changed", [], [], None]
 
 
 # --------------------------------------------------------------------------
@@ -151,22 +151,9 @@ class _StubResult:
         return self._key
 
 
-class _StubJudge:
-    """按调用顺序循环返回脚本化判读结果（ready, state_key），每次实例按本样本模式回放。"""
-
-    def __init__(self, pattern):
-        self.pattern = list(pattern) or [(False, None)]
-        self.index = 0
-
-    def __call__(self, image):
-        ready, key = self.pattern[self.index % len(self.pattern)]
-        self.index += 1
-        return _StubResult(ready, key)
-
-
-def _png(path: Path) -> tuple[str, str]:
+def _png(path: Path, tone: int = 9) -> tuple[str, str]:
     image = QImage(8, 8, QImage.Format.Format_RGB32)
-    image.fill(QColor(9, 9, 9))
+    image.fill(QColor(tone, tone, tone))
     assert image.save(str(path), "PNG")
     return path.as_posix(), common.sha256_file(path)
 
@@ -199,8 +186,8 @@ def _synthetic_calibration(
     config_path = tmp_path / "preset.yaml"
     config_path.write_text(yaml or _MINIMAL_YAML, encoding="utf-8")
 
-    offsets = [0, 50, 100, 150, 250, 300]
-    patterns: dict[str, list[tuple[bool, list | None]]] = {}
+    # 独立给出 20 ms 帧序列：80 ms 首次到达最终态，最后变化也是 80 ms；区间为 [80, 100]。
+    offsets = [0, 20, 40, 60, 80, 100]
     samples: list[dict] = []
     observations: list[dict] = []
     inputs: list[dict] = []
@@ -218,27 +205,37 @@ def _synthetic_calibration(
             binding = {"hwnd": 1, "pid": 2, "client_width": 1920, "client_height": 1080,
                        "window_dpi": 96, "pause_generation": 0}
             before_rel, before_sha = _png(evidence / f"{sample_id}-before.png")
-            frame_script: list[tuple[bool, list | None]] = [(False, None)]
-            for step in range(1, len(offsets)):
-                key = _KEY_CHANGED if (hold_key_change and step >= 3) else _KEY
-                frame_script.append((True, key))
-            for step, (offset, (ready, key)) in enumerate(zip(offsets, frame_script)):
-                rel, sha = _png(evidence / f"{sample_id}-{step}.png")
-                observations.append({
-                    "type": "observation", "sample_id": sample_id, "input_call_id": action_call,
-                    "action_id": action_id, "phase": "after_action",
-                    "captured_at_ns": released + offset * _MS,
-                    "probe_ended_at_ns": released + offset * _MS + 5 * _MS,
-                    "ready": ready, "state_key": key, "binding": binding,
-                    "frame_path": Path(rel).relative_to(round_dir).as_posix(), "frame_sha256": sha,
-                })
-            next_rel, next_sha = _png(evidence / f"{sample_id}-next.png")
+            csv = ["t_ns,sig_sha256,interval_ms,matches_reference,changed"]
+            previous = None
+            for step, offset in enumerate(offsets):
+                tone = 90 if step >= 4 else 9
+                if hold_key_change and step == 5:
+                    tone = 45  # 后续又变了：声明的最后变化时间/上界必须被独立复算拒绝。
+                _png(evidence / f"{sample_id}-{step}.png", tone)
+                signature = hashlib.sha256(bytes([tone]) * 128 * 128).hexdigest()
+                csv.append(f"{released + offset * _MS},{signature},{20 if step else 0},"
+                           f"{str(tone == 90).lower()},{str(previous is not None and tone != previous).lower()}")
+                previous = tone
+            (evidence / f"{sample_id}-frames.csv").write_text("\n".join(csv) + "\n", encoding="utf-8")
+            _png(evidence / f"{sample_id}-reach.png", 90)
+            _png(evidence / f"{sample_id}-lastchange.png", 90)
+            confirm_rel, confirm_sha = _png(evidence / f"{sample_id}-confirm.png", 90)
+            observations.append({
+                "type": "observation", "sample_id": sample_id, "input_call_id": action_call,
+                "action_id": action_id, "phase": "after_action",
+                "captured_at_ns": released + 300 * _MS,
+                "probe_ended_at_ns": released + 305 * _MS,
+                "ready": True, "state_key": _KEY, "binding": binding,
+                "frame_path": Path(confirm_rel).relative_to(round_dir).as_posix(), "frame_sha256": confirm_sha,
+            })
+            next_rel, next_sha = _png(evidence / f"{sample_id}-next.png", 90)
             observations.append({
                 "type": "observation", "sample_id": sample_id, "input_call_id": next_call,
                 "action_id": action_id, "phase": "after_next_step",
                 "captured_at_ns": released + 400 * _MS,
                 "probe_ended_at_ns": released + 405 * _MS,
-                "ready": True, "state_key": _KEY, "binding": binding,
+                "ready": True, "state_key": ["probe_hold_ms", 100] if index == 0 else _KEY,
+                "binding": binding,
                 "frame_path": Path(next_rel).relative_to(round_dir).as_posix(),
                 "frame_sha256": next_sha,
             })
@@ -253,9 +250,6 @@ def _synthetic_calibration(
                     "frame_path": Path(seg_rel).relative_to(round_dir).as_posix(),
                     "frame_sha256": seg_sha,
                 })
-            patterns[action_id] = frame_script + [(True, _KEY)] * (
-                2 if action_id == "reset" and not fabricated_next else 1
-            )
             samples.append({
                 "type": "sample", "sample_id": sample_id, "action_id": action_id,
                 "input_call_id": action_call,
@@ -264,8 +258,8 @@ def _synthetic_calibration(
                 "before_frame_path": Path(before_rel).relative_to(round_dir).as_posix(),
                 "before_frame_sha256": before_sha,
                 "layout_id": None, "return_edge": None,
-                "t_ready_ns": released + 50 * _MS, "t_stable_ns": released + 100 * _MS,
-                "stable_ms": 100,
+                "t_reach_ns": released + 80 * _MS, "t_last_change_ns": released + 80 * _MS,
+                "wait_lower_ms": 80, "wait_upper_ms": 100, "sample_interval_ms": 20,
                 "next_step_call_id": None if missing_next else (999_999 if fabricated_next else next_call),
                 "next_step_captured_at_ns": released + 400 * _MS,
                 "next_step_verified": not (wrong_next or missing_next),
@@ -274,17 +268,18 @@ def _synthetic_calibration(
                 "input_call_ids": [action_call],
             })
 
-    raw_path = round_dir / "measure.jsonl"
+    raw_path = evidence / "measure.jsonl"
     raw_path.write_text(
         "\n".join(json.dumps(row, ensure_ascii=False)
                   for row in inputs + observations + samples) + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(gate.judge, "StreamJudge",
-                        lambda action_id, ctx: _StubJudge(patterns.get(action_id, [(False, None)])))
+    # 只隔离最终 PNG 的视觉判读；区间、输入、CSV、哈希和有效性均由真实门禁复算。
+    monkeypatch.setattr(gate.judge, "evaluate",
+                        lambda action_id, image, ctx: _StubResult(image.pixelColor(0, 0).red() == 90, _KEY))
 
     report = {
-        "schema_version": 1, "stage": "calibration",
+        "schema_version": 2, "stage": "calibration",
         "spec_sha256": common.sha256_file(common.SPEC),
         "execution_identity": common.execution_identity(),
         "environment": {"machine_id": "m", "client_width": 1920, "client_height": 1080,
@@ -299,7 +294,8 @@ def _synthetic_calibration(
     }
     import measure_release_waits as measure
 
-    report["actions"] = measure.action_rows(samples, common.action_ids_in_spec_order())
+    report["actions"] = measure.action_rows(samples, common.action_ids_in_spec_order(),
+                                             {action_id: True for action_id in actions})
     report_path = round_dir / "calibration.json"
     common.write_json(report_path, report)
     return report, report_path
@@ -330,6 +326,21 @@ def test_calibration_self_check_shallow_accepts_and_still_rejects(tmp_path, monk
     )
     checks2 = gate._calibration_checks(report2, report_path2, install_profile=False, deep=False)
     assert checks2.verdict is False
+
+
+@pytest.mark.parametrize("suffix,message", [
+    ("frames.csv", "缺少帧签名 CSV"), ("reach.png", "缺少 t_reach 证据 PNG"),
+])
+def test_calibration_gate_rejects_missing_signature_evidence(tmp_path, monkeypatch, suffix, message):
+    report, report_path = _synthetic_calibration(tmp_path, monkeypatch)
+    evidence = Path(report["raw_jsonl_path"]).parent
+    (evidence / f"open_panel-0-{suffix}").unlink()
+
+    checks = gate._calibration_checks(report, report_path, install_profile=False)
+
+    assert checks.verdict is False
+    check = next(item for item in checks.items if item["id"] == "C7")
+    assert check["passed"] is False and message in str(check["detail"])
 
 
 def test_calibration_gate_rejects_key_change_inside_hold_window(tmp_path, monkeypatch):
