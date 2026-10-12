@@ -42,6 +42,19 @@ TOTAL_BUDGET_S = 2400.0
 SCROLL_CURSOR = (706, 442)
 PROFILE_NAME = "navigation-profile.json"
 
+# ---- 出厂默认滚轮协议（2026-10-12）----
+#: 本机 2026-10-02 真机标定实测（1920x1080 客户区、DPI 100%）：1 条滚轮事件 = 1 行，
+#: 行距 175 px，事件间隔 100 ms，滚动后等画面停稳 100 ms。
+#: 这些是**游戏规则常数**，不会因为筛选或列表长短而变——滚动是按行的。写在这里当默认值，
+#: 开局直接可用，不必每次启动重新标定（标定要来回切页 8 次、还挡着筛选页）。
+#: 文件 `user/navigation-profile.json` 里若有重新标定的结果仍然优先使用。
+#: `origin_center_y` 不在此列：它是"第 1 行图标中心的屏幕 y"，随当前滚到哪而变，
+#: 每个任务开头都由 `measure_layout` 用当前画面重新量，写死必然错位。
+_DEFAULT_EVENTS_PER_ROW = 1
+_DEFAULT_ROW_PITCH_PX = 175.0
+_DEFAULT_EVENT_INTERVAL_MS = 100
+_DEFAULT_SETTLE_WAIT_MS = 100
+
 
 class NavigationError(RuntimeError):
     pass
@@ -248,25 +261,53 @@ class NavProfile:
         return asdict(self)
 
 
+def default_profile(env: Environment) -> NavProfile:
+    """出厂默认滚轮协议：用已知常数构造，开局直接可用，不做标定。
+
+    环境身份照实填入当前 env（``matches`` 仍按六字段全等判断），所以它跟本机档案等价，
+    只是数值来自代码默认而不是历史测量。``origin_center_y=0`` 不参与任何滚动决策：
+    每个任务开头 ``_ensure_profile`` 都会用 ``measure_layout`` 按当前画面重新量出真实值。
+    """
+    return NavProfile(
+        machine_id=env.machine_id or "",
+        client_width=env.client_width,
+        client_height=env.client_height,
+        window_dpi=env.window_dpi or 0,
+        game_exe_path=env.game_exe_path or "",
+        game_build=env.game_build or "",
+        row_pitch_px=_DEFAULT_ROW_PITCH_PX,
+        origin_center_y=0.0,
+        events_per_row=_DEFAULT_EVENTS_PER_ROW,
+        event_interval_ms=_DEFAULT_EVENT_INTERVAL_MS,
+        settle_wait_ms=_DEFAULT_SETTLE_WAIT_MS,
+    )
+
+
 def load_profile(env: Environment) -> NavProfile | None:
-    """读取并校验缓存；损坏/非法/不适用一律返回 None，由调用方重新标定。"""
+    """读取并校验缓存；损坏/非法/不适用时回落到出厂默认值。
+
+    2026-10-12 之前这里返回 None，调用方随即走真机标定（来回切页 8 次 + 挡筛选页），
+    而滚轮协议是游戏规则常数、不会因为筛选或列表长短变化，没必要每次启动重测。
+    现在缺档/坏档/环境不匹配一律给 :func:`default_profile`，开局直接进筛选页；
+    真机标定的结果一旦存进档案，命中时仍然优先使用。
+    """
     log = get_logger("zzz_ddtool.navigation")
     path = profile_path()
     if not path.exists():
-        return None
+        return default_profile(env)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        log.warning("导航缓存不可读（%s），忽略并重新标定", exc)
-        return None
+        log.warning("导航缓存不可读（%s），改用出厂默认协议", exc)
+        return default_profile(env)
     try:
         profile = NavProfile(**raw)
     except TypeError as exc:
-        log.warning("导航缓存字段不符（%s），忽略并重新标定", exc)
-        return None
+        log.warning("导航缓存字段不符（%s），改用出厂默认协议", exc)
+        return default_profile(env)
     if not profile.matches(env):
-        log.info("导航缓存环境不匹配，忽略并重新标定")
-        return None
+        log.info("导航缓存环境不匹配，改用出厂默认协议")
+        return default_profile(env)
     return profile
 
 
@@ -666,11 +707,8 @@ def calibrate(
                 )
                 if events >= ADVISORY_EVENT_COUNT:
                     log.warning("候选事件数较多：%d（spec §5.1 第 2 条只告警不失败）", events)
-                if not _verify_protocol(hwnd, profile, anchor_col):
-                    raise NavigationError(
-                        "一行协议未通过正反向与连续两行验证（spec §5.1 第 3 条）。"
-                    )
-                reset_to_top()
+                # 2026-10-12：原先这里还调 _verify_protocol 逐边复验（8 次 reset_to_top，
+                # 即启动时 8 次来回切页），协议已由候选实测位移直接确定，该复验删除。
                 return profile
             if verdict == CAL_OVER:
                 log.warning("间隔 %dms 下 %d 条事件超过一行，本档无合格整数协议", interval_ms, events)
@@ -692,57 +730,3 @@ def _anchor_click_x(image, col0: int) -> int:
 def _anchor_click_y(origin_center_y: float, row_pitch_px: float) -> int:
     return int(round(origin_center_y + ANCHOR_SCREEN_ROW0 * row_pitch_px))
 
-
-def _verify_protocol(hwnd: int, profile: NavProfile, anchor_col: int) -> bool:
-    """验证正、反向一行与连续两行，各连续两次且未被端点截停（spec §5.1 第 3 条）。
-
-    向上验证必须从已确认的非顶部位置开始：先向下移动 rows 行再向上回移，避免在
-    顶部被截停而误判成协议失败。
-    """
-    from zzz_ddtool.capture import grab_game_image
-    from zzz_ddtool.nav import reset_to_top
-    from zzz_ddtool.wininput import click_client
-
-    log = get_logger("zzz_ddtool.navigation")
-
-    def _prepare(rows: int, direction: int) -> tuple[float, float, int]:
-        reset_to_top()
-        image, _method, _hwnd = grab_game_image(hwnd)
-        origin, pitch = measure_layout(image)
-        click_client(hwnd, _anchor_click_x(image, anchor_col), _anchor_click_y(origin, pitch))
-        time.sleep(0.6)
-        image, _method, _hwnd = grab_game_image(hwnd)
-        base = anchor_screen_rows(
-            image, col0=anchor_col, origin_center_y=origin, row_pitch_px=pitch
-        )
-        if base != [ANCHOR_SCREEN_ROW0]:
-            raise NavigationError(f"验证锚点没选上（读到 {base}）。")
-        if direction < 0:
-            scroll_rows(hwnd, rows, profile)
-            rows_after, _settle, _image = settle_and_read_anchor(
-                hwnd, col0=anchor_col, origin_center_y=origin, row_pitch_px=pitch
-            )
-            if len(rows_after) != 1:
-                raise NavigationError(f"向上验证前锚点不唯一：{rows_after}")
-            return origin, pitch, rows_after[0]
-        return origin, pitch, ANCHOR_SCREEN_ROW0
-
-    for rows, direction in ((1, 1), (1, -1), (2, 1), (2, -1)):
-        for round_index in range(2):
-            origin, pitch, base = _prepare(rows, direction)
-            scroll_rows(hwnd, rows * direction, profile)
-            after_rows, _settle, _image = settle_and_read_anchor(
-                hwnd, col0=anchor_col, origin_center_y=origin, row_pitch_px=pitch
-            )
-            expected = base - rows * direction
-            if after_rows != [expected]:
-                log.warning(
-                    "验证失败 rows=%s dir=%s 第%d次：期望 [%s] 实读 %s",
-                    rows,
-                    direction,
-                    round_index + 1,
-                    expected,
-                    after_rows,
-                )
-                return False
-    return True

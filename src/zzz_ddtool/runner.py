@@ -140,6 +140,18 @@ _LABEL_FLOOR_MS = 135 + _MEASURED_SAFETY_MS
 #: 返还弹窗未接续结果等待时的收尾预算（§4.3 refund_dismiss；与 refund_confirm 共用实测 1277）。
 _REFUND_DISMISS_FLOOR_MS = 1277 + _MEASURED_SAFETY_MS
 
+# ---- return_warehouse 逐边下限（Spec v9 §12）----
+#: 三条允许边各自的下限；`_READY_FLOOR_MS["return_warehouse"]` 只作为三边都缺项时的兜底。
+#: 取自 2026-10-12 真机一轮（log/20261012-202521-215）的运行时证据：
+#: preview→warehouse 第 0 帧即 ready（约 70 ms 起），modal→preview 约 1.4 s 才可见。
+#: 三边共用 1611 ms 时，快边被迫等慢边（每件强化盘两次 Esc 合计约 4.3 s、单轮 17.1 s）。
+#: 逐边实测（每边 ≥5 个有效样本）落档后由 `return_edges` 覆盖，这里的值随之失去作用。
+_RETURN_EDGE_FLOOR_MS: dict[str, int] = {
+    "modal_preview": 1680,
+    "modal_warehouse": 1680,
+    "preview_warehouse": 680,
+}
+
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
 # 描述子＝经验/预计等级条 ROI 的「饱和度」（max(R,G,B)-min(R,G,B)）再按各帧自身 p85 归一化。
 # 空条与底色是灰（饱和度恒为 0），只有填充色像素有饱和度 → 彩色掩码天然排掉灰区；
@@ -504,9 +516,19 @@ class Runner:
             return ()
         return self.hotkeys.pause_intervals(since, until)
 
-    def _wait_policy(self, action_id: str) -> actionwait.ActionWaitPolicy:
-        """§4.3：就绪下限唯一来源（有效实测或该动作保守值）；timeout 见 _READY_TIMEOUT_MS。"""
-        return actionwait.policy_for(action_id, fallback_ms=_READY_FLOOR_MS[action_id])
+    def _wait_policy(self, action_id: str, *, return_edge: str | None = None) -> actionwait.ActionWaitPolicy:
+        """§4.3 下限唯一来源（有效实测或该动作保守值）；timeout 见 _READY_TIMEOUT_MS。
+
+        ``return_edge`` 只用于 ``return_warehouse``（Spec v9 §12）：给了边就取该边下限，
+        三边互不牵连。
+        """
+        fallback_ms = _READY_FLOOR_MS[action_id]
+        if return_edge is not None:
+            # 该边没有条目时回落动作级兜底，不抛 KeyError、也不借用别的边的值。
+            fallback_ms = _RETURN_EDGE_FLOOR_MS.get(return_edge, fallback_ms)
+        return actionwait.policy_for(
+            action_id, fallback_ms=fallback_ms, return_edge=return_edge
+        )
 
     # ---------------------------------------------------------------- 层级与返还（§6.2）
 
@@ -1033,7 +1055,7 @@ class Runner:
         self, kind: str, *, release: InputRelease, before: Disc | None = None,
         before_frame=None, cell: GridCell | None = None, expected_level: int | None = None,
         trigger_input_id: str | None = None, resume_from_wait_id: str | None = None,
-        action_id: str | None = None,
+        action_id: str | None = None, return_edge: str | None = None,
     ) -> WaitResult:
         """§6.1/§4.3：以触发输入的释放点为起点做一次就绪等待，并包装 wait_total/probe 事件。
 
@@ -1042,14 +1064,15 @@ class Runner:
         超时/中断原样抛出（ReadinessTimeout / ReadinessInterrupted），其他异常原样传播；
         无活动性能会话时只做等待、不写事件、不改变返回值。``trigger_input_id``/
         ``resume_from_wait_id`` 供 §6.2.1 的第二次结果等待关联首个等待与确认输入；
-        ``action_id`` 用于返还确认这类 readiness kind 与动作ID不同的等待。
+        ``action_id`` 用于返还确认这类 readiness kind 与动作ID不同的等待；
+        ``return_edge`` 供 ``return_warehouse`` 按当前 Esc 所在层级边取逐边下限（Spec v9 §12）。
         """
         probe = self._make_ready_probe(
             kind, before=before, before_frame=before_frame, cell=cell,
             expected_level=expected_level,
         )
         action_id = action_id or kind
-        policy = self._wait_policy(action_id)
+        policy = self._wait_policy(action_id, return_edge=return_edge)
         ready_policy = readiness.WaitPolicy(
             policy.floor_ms, _READY_TIMEOUT_MS[action_id], readiness.POLL_MS, readiness.STABLE_FRAMES
         )
@@ -1873,27 +1896,30 @@ class Runner:
 
     # ---------------------------------------------------------------- 导航准备
 
-    def _ensure_profile(self, hwnd: int) -> None:
+    def _ensure_profile(self, hwnd: int, *, recalibrate: bool = False) -> None:
         """备好滚轮协议（每次 run 只做一次）。
 
-        **必须在设置筛选之前调用**：标定要选第 3 行的盘做锚点，筛选会把列表裁短
-        （实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点，标定必失败。
-        标定只取决于网格布局、与列表内容无关，满屏时做最稳。
+        正常启动**不标定**：滚轮协议是游戏规则常数（1 条滚轮 = 1 行、行距固定），
+        由 `navigation.default_profile` 直接给值，开局即可进筛选页。用户档案
+        `user/navigation-profile.json` 命中时优先用它。见 2026-10-12 变更。
+
+        ``recalibrate=True`` 是显式重标定入口（游戏更新改了滚动行为、或换分辨率后
+        需要重测时使用）：**必须先于设置筛选调用**，标定要选第 3 行的盘做锚点，
+        筛选会把列表裁短（实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点。
         """
         if self._profile is not None:
             return
-        # 标定要求列表满屏：上一轮可能残留筛选条件把列表裁短（实测只剩 16/3000，
-        # 第 3 行锚点落在空格上），所以先重置一次筛选。只做一次（首个任务）。
         image, _method, _hwnd = grab_game_image(hwnd)
-        reset_game_filter(hwnd, image.width(), image.height())
-        self.trace.ok("drive_disc", "filter", "标定前重置筛选")
         # §3.4：环境探测已移到 _bind_instance（绑定后、reset 之前），此处沿用 self._env，
-        # 导航仍按「重置筛选 → 测量布局 → 加载/标定导航」的原顺序执行；
         # 未绑定直接调用（测试/单步）时退回一次只读探测。
         env = self._env if self._env is not None else probe_environment(hwnd)
-        # 不在这里置顶：calibrate 内部每个候选都会自己 reset_to_top，而 measure_layout
-        # 只看网格几何、与列表滚到哪无关。
-        image, _method, _hwnd = grab_game_image(hwnd)
+        profile = None if recalibrate else load_profile(env)
+        if profile is None:
+            # 重标定要求列表满屏，先清一次筛选；这趟往返只在显式重标定时发生。
+            reset_game_filter(hwnd, image.width(), image.height())
+            self.trace.ok("drive_disc", "filter", "标定前重置筛选")
+            image, _method, _hwnd = grab_game_image(hwnd)
+        # 不在这里置顶：measure_layout 只看网格几何、与列表滚到哪无关。
         origin, pitch = measure_layout(image)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
         if reason:
@@ -1902,7 +1928,6 @@ class Runner:
         self._origin_center_y = float(origin)
         self._row_pitch = float(pitch)
 
-        profile = load_profile(env)
         if profile is None:
             if env.window_dpi is None:
                 raise RunnerError("无法读取游戏窗口 DPI，未开始滚动标定")
@@ -2637,8 +2662,12 @@ class Runner:
             self._last_count, tuple(ordered), dict(skips),
         )
 
-    def _recovery_summary(self, image, state, cache) -> None:
-        """只核对页面、尺寸与标题数量；不读全网格等级/状态。"""
+    def _recovery_summary(self, image, state, cache, lines=None) -> None:
+        """只核对页面、尺寸与标题数量；不读全网格等级/状态。
+
+        lines：调用方已经读过列表区域时传进来，本函数不再补一次数量区识别
+        （``COUNT_AREA`` 整块落在 ``layout.LABEL_SCAN_AREA`` 里）。不传则保持原行为。
+        """
         from zzz_ddtool.ocr import read_rect
 
         if (state.job_id, state.filter_signature) != (cache.job_id, cache.filter_signature):
@@ -2648,8 +2677,10 @@ class Runner:
         if not is_page(image, DRIVE_DISC):
             raise NavigationError("恢复时未确认驱动盘仓库页")
         if cache.total is not None:
+            if lines is None:
+                lines = read_rect(image, COUNT_AREA)
             total = parse_warehouse_count(
-                read_rect(image, COUNT_AREA), width=image.width(), height=image.height()
+                lines, width=image.width(), height=image.height()
             )
             if total is None:
                 raise NavigationError("恢复时标题数量读不清")
@@ -2664,10 +2695,31 @@ class Runner:
 
         return read_rect(image, self.RECOVERY_COLUMN_AREA)
 
-    def _recovery_position_reason(self, image, state) -> str | None:
+    def _recovery_column_lines_from(self, lines):
+        """从整幅列表区域已读到的行里挑出恢复列的行，不再补一次列区域识别。
+
+        ``RECOVERY_COLUMN_AREA`` 整块落在 ``layout.LABEL_SCAN_AREA`` 里，同一帧的
+        那次整幅识别已经包含这些行；按行中心是否落在列区域内挑，等价于单独识别该
+        区域的结果。级别文字之外的装饰、编号行同样落框，最终由 ``startswith("等级")``
+        过滤，与 ``_recovery_position_reason`` 原有口径一致。
+        """
+        left, top, right, bottom = self.RECOVERY_COLUMN_AREA
+        picked = []
+        for line in lines:
+            center_x = (line.left + line.right) / 2.0
+            center_y = (line.top + line.bottom) / 2.0
+            if left <= center_x <= right and top <= center_y <= bottom:
+                picked.append(line)
+        return picked
+
+    def _recovery_position_reason(self, image, state, lines=None) -> str | None:
         metrics = self._metrics(state, image)
         rows = []
-        for line in self._recovery_column_lines(image):
+        column_lines = (
+            self._recovery_column_lines(image) if lines is None
+            else self._recovery_column_lines_from(lines)
+        )
+        for line in column_lines:
             if not line.text.replace(" ", "").startswith("等级"):
                 continue
             icon_y = metrics.icon_center_of_label((line.top + line.bottom) / 2)
@@ -2879,11 +2931,10 @@ class Runner:
             else:
                 self._checkpoint()
                 try:
-                    self._restore_once(hwnd, state, saved, cache=cache)
+                    image, lines = self._restore_once(hwnd, state, saved, cache=cache)
                     self._checkpoint()
-                    image = self._grab(allow_esc=False, need_page=False)[0]
-                    self._recovery_summary(image, state, cache)
-                    reason = self._recovery_position_reason(image, state)
+                    self._recovery_summary(image, state, cache, lines)
+                    reason = self._recovery_position_reason(image, state, lines)
                 except NavigationError as exc:
                     last_reason = str(exc)
                     state.invalidate_position()
@@ -2923,20 +2974,24 @@ class Runner:
         # 第二次仍不匹配：不能再重试（spec §5.3）。
         raise RunnerError(f"恢复保存视口失败（两次尝试）：{last_reason}，停止任务链")
 
-    def _restore_once(self, hwnd: int, state: TraversalState, saved, *, cache=None) -> None:
-        """一次完整的「切页置顶 → 按保存视口批量返回」，并提交保存的实际位置。"""
+    def _restore_once(self, hwnd: int, state: TraversalState, saved, *, cache=None):
+        """一次完整的「切页置顶 → 按保存视口批量返回」，并提交保存的实际位置。
+
+        返回 ``(image, lines)``：置顶后那一帧，以及它已经读过的整幅列表区域行
+        （``layout.LABEL_SCAN_AREA``）。缓存恢复路径的页面/数量核对与单列位置简查
+        都用这一份结果，不再自己抓图重认（同一帧只识别一次）。
+
+        ``cache`` 只用于保持调用签名：页面/尺寸/数量核对与失败重试由调用方
+        ``_restore_position_via_top`` 用本函数返回的帧执行，不在本函数重复做一遍。
+        """
         profile = self._profile
         if profile is None:
             raise RunnerError("没有可用的滚轮协议，无法恢复位置")
 
         with self.stats.timed("导航", "恢复：切页置顶"):
             reset_to_top(hwnd)
-        image, _method, _hwnd = grab_game_image(hwnd)
-        if cache is None:
-            origin, pitch = measure_layout(image)
-        else:
-            self._recovery_summary(image, state, cache)
-            origin, pitch = measure_layout(image, lines=self._recovery_column_lines(image))
+        image, lines = self._grab_label_frame(hwnd)
+        origin, pitch = measure_layout(image, lines=lines)
         reason = check_layout_reference(origin, pitch, image.width(), image.height())
         if reason:
             raise RunnerError(f"恢复前原点复核不通过：{reason}，停止任务链")
@@ -2963,6 +3018,7 @@ class Runner:
             at_bottom=saved.at_bottom,
         )
         state.clear_scroll()
+        return image, lines
 
     def _await_scroll_settle(self, profile: NavProfile) -> None:
         """恢复批量滚动后等列表缓动停稳，再抓图做定位检查或异常校验扫描。
@@ -3307,12 +3363,16 @@ class Runner:
                 raise RunnerError(reason)
             # 通用 press_key 会通过多个输入通道发键，回退必须只发一次。
             before_frame = image
+            # 这次的边由发键前的层与将要到达的层决定；三边下限不同（Spec v9 §12），
+            # 按边取，快边不再等慢边。
+            edge = f"{layer}_preview" if layer == "modal" else f"{layer}_warehouse"
             with self._business_input("return_warehouse", target={"from_layer": layer}):
                 esc_release = press_key_once(hwnd, VK_ESCAPE)
             esc_count += 1
             try:
                 result = self._wait_ready(
-                    "return_warehouse", release=esc_release, before_frame=before_frame
+                    "return_warehouse", release=esc_release, before_frame=before_frame,
+                    return_edge=edge,
                 )
             except ReadinessTimeout as exc:
                 reason = f"返回驱动盘仓库失败：Esc 后未稳定进入更浅层（{exc}），停止任务链"

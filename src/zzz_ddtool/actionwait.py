@@ -64,6 +64,13 @@ _EXECUTOR_ACTIONS = frozenset({
 #: 全部合法动作ID（§4.2 + §4.3）。
 ACTION_IDS = _PANEL_ACTIONS | _EXECUTOR_ACTIONS
 
+#: `return_warehouse` 的三条允许边（Spec v9 §12）。与 ``readiness.RETURN_EDGES`` 逐字相同：
+#: 本模块不反向导入 readiness，避免把屏幕判读依赖带进纯等待层。
+RETURN_EDGE_IDS = ("modal_preview", "modal_warehouse", "preview_warehouse")
+
+#: 逐边档案挂在哪个动作下；键名进档案，不能随意改。
+RETURN_EDGE_ACTION = "return_warehouse"
+
 #: Spec §4.3 表列 timeout（ms）；其余 §4.2 动作按 §4.2 段首的 3000 ms 活动窗口校验。
 _TIMEOUT_MS: dict[str, int] = {
     "select_disc": 3180,
@@ -79,7 +86,11 @@ _PANEL_FLOOR_BOUND_MS = 3000
 #: 等待分片的浮点残差容差（秒）：remaining 小于它即视为已满足，避免空转。
 _WAIT_EPS_S = 1e-6
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+#: 动作级实测项的最少样本数；逐边项用 :data:`RETURN_EDGE_MIN_COUNT`。
+_POLICY_MIN_COUNT = 10
+#: Spec v9 §12：逐边实测项的最少样本数。
+RETURN_EDGE_MIN_COUNT = 5
 _TIME_ORIGIN = "native_release"
 _PREDICATE_VERSION = 2
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -113,6 +124,7 @@ class ActionWaitPolicy:
 class _WaitContext(NamedTuple):
     policies: Mapping[str, ActionWaitPolicy]
     measure_action: str | None
+    return_edges: Mapping[str, ActionWaitPolicy]
 
 
 _active: ContextVar[_WaitContext | None] = ContextVar("ddtool_release_waits", default=None)
@@ -169,8 +181,10 @@ def release_waits(environment: "Environment", *, measure_action: str | None = No
     """
     if measure_action is not None and measure_action not in ACTION_IDS:
         raise ValueError(f"measure_action 必须是 §4 动作ID：{measure_action!r}")
-    policies = load_policies(environment)
-    token = _active.set(_WaitContext(policies=policies, measure_action=measure_action))
+    policies, return_edges = load_policies_with_edges(environment)
+    token = _active.set(_WaitContext(
+        policies=policies, measure_action=measure_action, return_edges=return_edges
+    ))
     try:
         yield
     finally:
@@ -182,14 +196,25 @@ def policy_for(
     *,
     fallback_ms: int,
     allow_measured: bool = True,
+    return_edge: str | None = None,
 ) -> ActionWaitPolicy:
-    """解析某动作的下限策略；未知动作、非法 fallback 或非布尔开关抛 ValueError。"""
+    """解析某动作的下限策略；未知动作、非法 fallback 或非布尔开关抛 ValueError。
+
+    ``return_edge`` 只对 ``return_warehouse`` 有意义（Spec v9 §12）：传三条允许边之一时先取
+    该边的逐边实测；该边无有效实测（或本轮传 None）再回落到动作级实测，最后才是
+    ``fallback_ms``。逐边与动作级取样分开，快边不再被慢边的值拖住。
+    """
     if action_id not in ACTION_IDS:
         raise ValueError(f"未知动作ID：{action_id!r}")
     if isinstance(fallback_ms, bool) or not isinstance(fallback_ms, int) or fallback_ms < 0:
         raise ValueError(f"fallback_ms 必须是非负整数：{fallback_ms!r}")
     if not isinstance(allow_measured, bool):
         raise ValueError(f"allow_measured 必须是布尔：{allow_measured!r}")
+    if return_edge is not None:
+        if action_id != RETURN_EDGE_ACTION:
+            raise ValueError(f"只有 {RETURN_EDGE_ACTION} 支持 return_edge：{action_id!r}")
+        if return_edge not in RETURN_EDGE_IDS:
+            raise ValueError(f"未知 return_edge：{return_edge!r}")
     ctx = _active.get()
     if ctx is not None and ctx.measure_action == action_id:
         if not allow_measured:
@@ -199,6 +224,10 @@ def policy_for(
         # 测量会话里其余动作一律走保守值，不消费档案。
         return ActionWaitPolicy(floor_ms=fallback_ms, source="default")
     if ctx is not None and allow_measured:
+        if return_edge is not None:
+            policy = ctx.return_edges.get(return_edge)
+            if policy is not None:
+                return policy
         policy = ctx.policies.get(action_id)
         if policy is not None:
             return policy
@@ -211,13 +240,17 @@ def wait_release(
     *,
     fallback_ms: int,
     allow_measured: bool = True,
+    return_edge: str | None = None,
 ) -> None:
     """从真实释放点计时，按剩余预算分片睡满下限（§3.2）。
 
     每片请求睡眠不超过 20 ms，片前后检查停止/暂停；只调用控制回调，
     不触发输入前的业务校验。返回只表示下限到达，不表示业务就绪。
     """
-    policy = policy_for(action_id, fallback_ms=fallback_ms, allow_measured=allow_measured)
+    policy = policy_for(
+        action_id, fallback_ms=fallback_ms, allow_measured=allow_measured,
+        return_edge=return_edge,
+    )
     release_s = release.released_at_ns / 1_000_000_000
     floor_s = policy.floor_ms / 1000.0
     requested_ms = 0.0
@@ -299,10 +332,14 @@ def _floor_bound_ms(action_id: str) -> int | None:
     return None
 
 
-def _valid_policy_item(action_id: str, item: object) -> tuple[ActionWaitPolicy | None, str | None]:
+def _valid_policy_item(
+    action_id: str, item: object, *, min_count: int = _POLICY_MIN_COUNT
+) -> tuple[ActionWaitPolicy | None, str | None]:
     """校验单个策略项；返回 (策略, None) 或 (None, 整档失效原因)。
 
     越界（floor >= timeout）不在本函数处理，由调用方按逐动作拒收。
+    ``min_count`` 供逐边项使用：Spec v9 §12 要求每条边至少 5 个有效样本，
+    低于动作级要求的 10。
     """
     if not isinstance(item, dict):
         return None, f"{action_id} 的策略不是对象"
@@ -313,7 +350,7 @@ def _valid_policy_item(action_id: str, item: object) -> tuple[ActionWaitPolicy |
     max_stable_ms = item["max_stable_ms"]
     floor_ms = item["floor_ms"]
     report_sha256 = item["report_sha256"]
-    if isinstance(count, bool) or not isinstance(count, int) or count < 10:
+    if isinstance(count, bool) or not isinstance(count, int) or count < min_count:
         return None, f"{action_id} count 非法：{count!r}"
     if isinstance(max_stable_ms, bool) or not isinstance(max_stable_ms, int) or max_stable_ms < 0:
         return None, f"{action_id} max_stable_ms 非法：{max_stable_ms!r}"
@@ -330,55 +367,97 @@ def _valid_policy_item(action_id: str, item: object) -> tuple[ActionWaitPolicy |
     return ActionWaitPolicy(floor_ms=floor_ms, source="measured"), None
 
 
-def load_policies(environment: "Environment", *, path: Path | str | None = None) -> dict[str, ActionWaitPolicy]:
-    """读取并校验实测档案，只返回有效实测项；任何整档失效条件返回空字典。
+def _load_policies_impl(
+    environment: "Environment", *, path: Path | str | None = None
+) -> tuple[dict[str, ActionWaitPolicy], dict[str, ActionWaitPolicy]]:
+    """读取并校验实测档案，返回 (动作级 policies, 逐边 return_edges)。任何整档失效返回两个空字典。
 
     整档失效（§5）：未知键、非法类型（含 bool 冒充数字）、负数、版本/环境不一致、
-    公式复算不一致、count<10、非法摘要、损坏 JSON。逐动作拒收：floor >= 对应 timeout
-    的项按下限缺项处理，不影响其余动作。
+    公式复算不一致、count 不足、非法摘要、损坏 JSON。逐动作拒收：floor >= 对应 timeout
+    的项按下限缺项处理，不影响其余动作。逐边项（Spec v9 §12）单独校验、单独拒收：
+    某条边非法只丢该边，不牵连动作级项，也不使整档失效。
     """
     profile = Path(path) if path is not None else profile_path()
+    empty: tuple[dict[str, ActionWaitPolicy], dict[str, ActionWaitPolicy]] = ({}, {})
     try:
         raw = json.loads(profile.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return empty
     if not isinstance(raw, dict):
-        return {}
-    if set(raw) != {"schema_version", "time_origin", "predicate_version", "environment", "policies"}:
-        return {}
-    if raw["schema_version"] != _SCHEMA_VERSION or isinstance(raw["schema_version"], bool):
-        return {}
+        return empty
+    if raw.get("schema_version") != _SCHEMA_VERSION or isinstance(raw.get("schema_version"), bool):
+        return empty
+    allowed_root = {"schema_version", "time_origin", "predicate_version", "environment", "policies"}
+    if set(raw) == allowed_root | {"return_edges"}:
+        pass
+    elif set(raw) != allowed_root:
+        return empty
     if raw["time_origin"] != _TIME_ORIGIN:
-        return {}
+        return empty
     if (
         isinstance(raw["predicate_version"], bool)
         or raw["predicate_version"] != _PREDICATE_VERSION
     ):
-        return {}
+        return empty
     file_env = raw["environment"]
     current_env = _environment_block(environment)
     if current_env is None or not isinstance(file_env, dict):
-        return {}
+        return empty
     if set(file_env) != set(_ENVIRONMENT_FIELDS):
-        return {}
+        return empty
     for field in _ENVIRONMENT_FIELDS:
         if file_env[field] != current_env[field]:
-            return {}
+            return empty
     policies = raw["policies"]
     if not isinstance(policies, dict):
-        return {}
+        return empty
     valid: dict[str, ActionWaitPolicy] = {}
     for action_id, item in policies.items():
         if action_id not in ACTION_IDS:
-            return {}
+            return empty
         policy, error = _valid_policy_item(action_id, item)
         if error is not None:
-            return {}
+            return empty
         bound = _floor_bound_ms(action_id)
         if bound is not None and policy.floor_ms >= bound:
             continue  # 逐动作拒收：按缺项 fallback，不使整份档案失效
         valid[action_id] = policy
+    valid_edges = _valid_return_edges(raw.get("return_edges"))
+    return valid, valid_edges
+
+
+def _valid_return_edges(raw_edges: object) -> dict[str, ActionWaitPolicy]:
+    """逐边项：整段必须是对象、键只能是三条允许边，单边非法只丢该边。"""
+    if raw_edges is None:
+        return {}
+    if not isinstance(raw_edges, dict):
+        return {}
+    bound = _floor_bound_ms(RETURN_EDGE_ACTION)
+    valid: dict[str, ActionWaitPolicy] = {}
+    for edge, item in raw_edges.items():
+        if edge not in RETURN_EDGE_IDS:
+            continue
+        policy, error = _valid_policy_item(edge, item, min_count=RETURN_EDGE_MIN_COUNT)
+        if error is not None:
+            continue
+        if bound is not None and policy.floor_ms >= bound:
+            continue
+        valid[edge] = policy
     return valid
+
+
+def load_policies(
+    environment: "Environment", *, path: Path | str | None = None
+) -> dict[str, ActionWaitPolicy]:
+    """动作级实测项；逐边项见 :func:`load_policies_with_edges`。"""
+    return _load_policies_impl(environment, path=path)[0]
+
+
+def load_policies_with_edges(
+    environment: "Environment", *, path: Path | str | None = None
+) -> tuple[dict[str, ActionWaitPolicy], dict[str, ActionWaitPolicy]]:
+    """(动作级实测项, 逐边实测项)；档案失效时两者都是空字典。"""
+    return _load_policies_impl(environment, path=path)
 
 
 def write_profile(
@@ -386,8 +465,14 @@ def write_profile(
     measurements: Mapping[str, Mapping[str, object]],
     *,
     path: Path | str | None = None,
+    return_edges: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """写出实测档案（§5）；输出且仅输出 status、sha256、error。
+
+    ``return_edges`` 是 Spec v9 §12 的逐边实测项：键只能是三条允许边，值为与
+    ``measurements`` 同构的对象。给了非空映射就写进根字段 ``return_edges``。
+    **只由独立门禁传**——`return_warehouse` 按边分别测，装进动作级会把三边压成
+    一个值，反过来让快边被慢边拖住。
 
     环境身份不完整返回 not_persistable；写入失败保留原档案并返回 write_failed；
     成功返回 written 与写出文件字节的 SHA256。
@@ -398,13 +483,20 @@ def write_profile(
     for action_id in measurements:
         if action_id not in ACTION_IDS:
             return {"status": "write_failed", "sha256": None, "error": f"未知动作ID：{action_id!r}"}
-    payload = {
+    edges_block: dict[str, dict[str, object]] = {}
+    for edge, item in (return_edges or {}).items():
+        if edge not in RETURN_EDGE_IDS:
+            return {"status": "write_failed", "sha256": None, "error": f"未知 return_edge：{edge!r}"}
+        edges_block[edge] = dict(item)
+    payload: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
         "time_origin": _TIME_ORIGIN,
         "predicate_version": _PREDICATE_VERSION,
         "environment": env_block,
         "policies": {action_id: dict(item) for action_id, item in measurements.items()},
     }
+    if edges_block:
+        payload["return_edges"] = edges_block
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     sha = hashlib.sha256(data).hexdigest()
     dest = Path(path) if path is not None else profile_path()

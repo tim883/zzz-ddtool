@@ -559,40 +559,95 @@ def test_refund_invalidated_at_real_click_or_focus_checkpoint_sends_no_mouse(
 # --------------------------------------------------------------------------
 # W7：return_warehouse 逐层 Esc 循环
 # --------------------------------------------------------------------------
-def _layer_runner(monkeypatch, sim_time, layers: dict, min_wait_ms: int):
+def _layer_runner(monkeypatch, sim_time, layers: dict,
+                  min_wait_ms: int | None = None, edge_floors: dict | None = None):
+    """Esc 回退替身；``min_wait_ms`` 强制单一策略，``edge_floors`` 只覆盖逐边表。"""
     runner = Runner(Preset(), hotkeys=False)
     runner.trace = Mock()
     esc = Mock(side_effect=lambda *a, **k: release("press_key_once"))
     monkeypatch.setattr(runner_module, "press_key_once", esc)
     monkeypatch.setattr(runner, "_return_layer", lambda img: layers[id(img)])
-    if min_wait_ms != runner_module._READY_FLOOR_MS["return_warehouse"]:
+    if edge_floors is not None:
+        merged = dict(runner_module._RETURN_EDGE_FLOOR_MS)
+        merged.update(edge_floors)
+        monkeypatch.setattr(runner_module, "_RETURN_EDGE_FLOOR_MS", merged, raising=False)
+    if min_wait_ms is not None:
         monkeypatch.setattr(
             runner, "_wait_policy",
-            lambda kind: actionwait.ActionWaitPolicy(min_wait_ms, "default"),
+            lambda kind, *, return_edge=None: actionwait.ActionWaitPolicy(min_wait_ms, "default"),
         )
     return runner, esc
 
 
 def test_w7_return_to_warehouse_single_esc_real_wait_default_bound(monkeypatch, sim_time):
     modal, warehouse = image(), image()
-    runner, esc = _layer_runner(monkeypatch, sim_time, {id(modal): "modal", id(warehouse): "warehouse"},
-                                runner_module._READY_FLOOR_MS["return_warehouse"])
+    runner, esc = _layer_runner(
+        monkeypatch, sim_time, {id(modal): "modal", id(warehouse): "warehouse"},
+        edge_floors={"modal_warehouse": runner_module._READY_FLOOR_MS["return_warehouse"]},
+    )
     frames = Frames([{"image": modal}] * 9 + [{"image": warehouse}])
     bind_grab(monkeypatch, runner, frames)
 
     assert runner._esc_back_to_grid(1) is True
     assert esc.call_count == 1
-    # 当前表值：返回实测 1411 ms + 200 ms 余量；1650/1700 ms 得到两帧稳定目标。
-    # 加上进入循环前的那一次认层抓帧，共 36 次。
+    # 本边用动作级兜底：实测 1411 ms + 200 ms 余量。下限到点后还要两帧稳定确认，
+    # 因此比只等下限多一轮抓帧；加上进入循环前的那一次认层抓帧。
     assert runner_module._READY_FLOOR_MS["return_warehouse"] == 1611
-    assert sim_time.now() == pytest.approx(10_001.7)
-    assert frames.index == 36
+    # 兜底下限 1611 ms 到点后还需两帧稳定确认，总活动时间见下。
+    assert sim_time.now() == pytest.approx(10_001.75, abs=0.01)
+    assert frames.index == 37
+
+
+def test_w7_return_each_edge_uses_its_own_floor(monkeypatch, sim_time):
+    """逐边取下限：三条允许边各自一条策略，快边不被慢边的值拖住（Spec v9 §12）。"""
+    modal, warehouse = image(), image()
+    runner, esc = _layer_runner(
+        monkeypatch, sim_time, {id(modal): "modal", id(warehouse): "warehouse"},
+        edge_floors={"modal_warehouse": 600},
+    )
+    assert runner._wait_policy("return_warehouse", return_edge="modal_warehouse").floor_ms == 600
+    # 未被覆盖的边用自己的运行时常量，不回落、也不借别的边的值。
+    assert runner._wait_policy("return_warehouse", return_edge="preview_warehouse").floor_ms == (
+        runner_module._RETURN_EDGE_FLOOR_MS["preview_warehouse"]
+    )
+    # 不传边时仍是动作级兜底（旧口径保留给三边都缺项的场合）。
+    assert runner._wait_policy("return_warehouse").floor_ms == (
+        runner_module._READY_FLOOR_MS["return_warehouse"]
+    )
+
+
+def test_w7_measured_edge_overrides_runtime_constant(monkeypatch, sim_time):
+    """档案里的逐边实测要盖过运行时常量；没有该边才回落常量。"""
+    from zzz_ddtool.actionwait import ActionWaitPolicy, _WaitContext, _active
+
+    token = _active.set(_WaitContext(
+        policies={}, measure_action=None,
+        return_edges={"preview_warehouse": ActionWaitPolicy(90, "measured")},
+    ))
+    try:
+        runner = Runner(Preset(), hotkeys=False)
+        assert runner._wait_policy("return_warehouse", return_edge="preview_warehouse").floor_ms == 90
+        assert runner._wait_policy("return_warehouse", return_edge="modal_preview").floor_ms == (
+            runner_module._RETURN_EDGE_FLOOR_MS["modal_preview"]
+        )
+    finally:
+        _active.reset(token)
+
+
+def test_w7_preview_edge_floor_is_lower_than_modal_edges():
+    """运行时常量表必须体现实测差异：preview→仓库明显快于两条 modal 边。"""
+    floors = runner_module._RETURN_EDGE_FLOOR_MS
+    assert set(floors) == set(actionwait.RETURN_EDGE_IDS)
+    assert floors["preview_warehouse"] < floors["modal_preview"]
+    assert floors["preview_warehouse"] < floors["modal_warehouse"]
+    for value in floors.values():
+        assert 0 < value < runner_module._READY_TIMEOUT_MS["return_warehouse"]
 
 
 def test_w7_return_two_layer_edges_esc_twice(monkeypatch, sim_time):
     modal, preview, warehouse = image(), image(), image()
     layers = {id(modal): "modal", id(preview): "preview", id(warehouse): "warehouse"}
-    runner, esc = _layer_runner(monkeypatch, sim_time, layers, 0)
+    runner, esc = _layer_runner(monkeypatch, sim_time, layers, min_wait_ms=0)
     # Esc#1：modal 两帧未就绪 → preview 两帧完成；Esc#2：preview → warehouse 两帧完成。
     frames = Frames([
         {"image": modal}, {"image": modal}, {"image": preview}, {"image": preview},
@@ -606,7 +661,7 @@ def test_w7_return_two_layer_edges_esc_twice(monkeypatch, sim_time):
 
 def test_w7_already_warehouse_sends_no_esc(monkeypatch, sim_time):
     warehouse = image()
-    runner, esc = _layer_runner(monkeypatch, sim_time, {id(warehouse): "warehouse"}, 0)
+    runner, esc = _layer_runner(monkeypatch, sim_time, {id(warehouse): "warehouse"}, min_wait_ms=0)
     frames = Frames([{"image": warehouse}])
     bind_grab(monkeypatch, runner, frames)
 
@@ -632,7 +687,7 @@ def test_w7_unknown_layers_fail_without_blind_esc(monkeypatch, sim_time):
 def test_w7_max_esc_one_stops_before_second_esc(monkeypatch, sim_time):
     modal, preview = image(), image()
     runner, esc = _layer_runner(
-        monkeypatch, sim_time, {id(modal): "modal", id(preview): "preview"}, 0
+        monkeypatch, sim_time, {id(modal): "modal", id(preview): "preview"}, min_wait_ms=0
     )
     frames = Frames([{"image": modal}, {"image": preview}, {"image": preview}])
     bind_grab(monkeypatch, runner, frames)

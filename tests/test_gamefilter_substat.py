@@ -288,7 +288,9 @@ def test_no_substats_evidence_on_failure(monkeypatch):
 def test_apply_game_filter_applies_substats_before_closing(monkeypatch):
     calls = []
     monkeypatch.setattr(gf, "click_client", lambda *a: None)
-    monkeypatch.setattr(gf, "_click_reset", lambda *a: calls.append("reset"))
+    # 「开面板 + 点重置（读不到就再点一次漏斗）」有自己的用例
+    # （tests/test_gamefilter_reset_reopen.py）；本用例只验调用顺序，替身掉它避免走真实抓图。
+    monkeypatch.setattr(gf, "_open_panel_and_reset", lambda *a, **kw: calls.append("reset"))
     monkeypatch.setattr(gf, "_click_slot", lambda *a: calls.append("slot"))
     monkeypatch.setattr(gf, "apply_sets_mainstats", lambda *a, **kw: calls.append("main"))
     monkeypatch.setattr(gf, "apply_substat_filter", lambda *a, **kw: calls.append((kw["names"], kw["counts"])))

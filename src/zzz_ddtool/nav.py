@@ -145,12 +145,17 @@ def _switch_tab(
 
     同一页签最多点 ``clicks`` 次；每次点击后的认页最多取 ``max(1, ocr_retry)``
     张截图（含首次）。仍认不出就存现场图并抛错，不盲点更多次。
+
+    点完立刻认页，不用固定等待兜底：页签切换的可见结果就是 ``is_page`` 命中的
+    那一帧，认页循环本身就是就绪判据（认不出会连续重拍，必要时按 ``clicks``
+    续点）。原先每次点击后固定 ``sleep(1.1)`` 是纯保险，实测两跳合计硬等 2.2 秒，
+    与是否真的切好无关；改为逐帧确认后，切页成功那一刻即返回，动画未完成时靠
+    后续帧或下一次点击收敛。
     """
     log = get_logger("zzz_ddtool.nav")
     last = image
     for i in range(max(1, clicks)):
         _click(hwnd, last, point)
-        time.sleep(1.1)
         for shot in range(max(1, ocr_retry)):
             img, _page, method, target = _grab(hwnd)
             if is_page(img, page):

@@ -255,7 +255,6 @@ def offline_runner(monkeypatch, fast_wait):
         for name in (
             "goto_warehouse",
             "apply_game_filter",
-            "reset_game_filter",
             "click_client",
             "press_key",
             "press_key_once",
@@ -359,11 +358,12 @@ def test_stop_during_preparation_blocks_next_input(offline_runner, monkeypatch, 
 
 
 def test_calibration_preserves_user_stop(offline_runner, monkeypatch):
+    """显式重标定时用户按停止仍要原样抛出（面板往返另有用例，这里替身掉）。"""
+    monkeypatch.setattr(runner_module, "reset_game_filter", lambda *a: None)
     runner = Runner(Preset(), hotkeys=False)
-    monkeypatch.setattr(runner_module, "load_profile", lambda env: None)
     monkeypatch.setattr(runner_module, "calibrate", Mock(side_effect=RunnerStopped("user stop")))
     with pytest.raises(RunnerStopped):
-        runner._ensure_profile(1)
+        runner._ensure_profile(1, recalibrate=True)
 
 
 
@@ -749,15 +749,70 @@ def test_navigation_profile_is_prepared_before_filter(offline_runner, monkeypatc
     assert order[:2] == ["profile", "filter"], order
 
 
-def test_ensure_profile_resets_filter_before_calibrating(offline_runner, monkeypatch):
-    """标定前必须先重置筛选：残留筛选会裁短列表（实测 16/3000），第 3 行锚点落在
-    空格上就选不中，标定必失败。标定要求列表满屏。"""
-    calls = []
-    monkeypatch.setattr(runner_module, "reset_game_filter", lambda *a: calls.append("reset"))
+def test_ensure_profile_needs_no_calibration_and_no_panel_roundtrip(offline_runner, monkeypatch):
+    """出厂默认协议：_ensure_profile 一次筛选面板往返都不做，也不再要求标定。
+
+    2026-10-12：滚轮协议是游戏规则常数（1 条滚轮=1 行、行距固定），缺档时由
+    ``navigation.default_profile`` 直接给值。原先那句无条件「打开筛选面板→重置→Esc 关闭」
+    只服务标定，是启动反复切页与变慢的来源，已随标定一并删除。
+    """
+    panel_calls = []
+    monkeypatch.setattr(runner_module, "reset_game_filter",
+                        lambda *a: panel_calls.append("reset"), raising=False)
     runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
     runner._profile = None
     runner._ensure_profile(1)
-    assert calls == ["reset"]
+    assert panel_calls == []
+    assert runner._profile is not None
+
+
+def test_ensure_profile_uses_default_protocol_when_profile_missing(offline_runner, monkeypatch):
+    """缺档时用出厂默认的 events_per_row / 行距 / 时序；布局仍按当前画面实测覆盖。"""
+    from zzz_ddtool import navigation as navigation_module
+
+    seen = {}
+
+    def fake_load(env):
+        seen["env"] = env
+        return navigation_module.default_profile(env)
+
+    monkeypatch.setattr(runner_module, "load_profile", fake_load)
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner._profile = None
+    runner._ensure_profile(1)
+
+    assert seen["env"].client_width == 1920
+    assert runner._profile.events_per_row == navigation_module._DEFAULT_EVENTS_PER_ROW
+    assert runner._profile.event_interval_ms == navigation_module._DEFAULT_EVENT_INTERVAL_MS
+    # 每任务以本轮实测布局为准：原点与行距来自 measure_layout，不采用默认里的占位值。
+    assert runner._profile.origin_center_y == runner._origin_center_y
+    assert runner._profile.row_pitch_px == runner._row_pitch
+
+
+def test_ensure_profile_never_calibrates(offline_runner, monkeypatch):
+    """正常启动不再有标定入口：_ensure_profile 默认路径不得调用 calibrate。"""
+    monkeypatch.setattr(runner_module, "calibrate",
+                        Mock(side_effect=AssertionError("已改用出厂默认协议，启动不得标定")))
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner._profile = None
+    runner._ensure_profile(1)
+    assert runner._profile is not None
+
+
+def test_explicit_recalibration_resets_filter_first(offline_runner, monkeypatch):
+    """显式重标定必须先把筛选清掉、再标定：残留筛选会把列表裁短，第 3 行锚点选不中。
+
+    这条往返只在 ``recalibrate=True`` 时发生，正常启动不会有。
+    """
+    order = []
+    monkeypatch.setattr(runner_module, "reset_game_filter", lambda *a: order.append("reset"))
+    monkeypatch.setattr(runner_module, "calibrate",
+                        lambda hwnd, env=None: order.append("calibrate") or fake_profile())
+    monkeypatch.setattr(runner_module, "save_profile", lambda *a, **kw: None)
+    runner = Runner(Preset(max_discs=1, accepted=None), hotkeys=False)
+    runner._profile = None
+    runner._ensure_profile(1, recalibrate=True)
+    assert order == ["reset", "calibrate"]
     assert runner._profile is not None
 
 
@@ -2115,12 +2170,54 @@ def test_recovery_column_position_replay():
     assert runner._recovery_position_reason(image, state) is None
 
 
+def test_recovery_position_reason_reuses_given_lines(monkeypatch):
+    """给定整幅列表区域的行时，位置简查不得再补一次 OCR（同一帧只识别一次）。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner._origin_center_y = 268.5
+    runner._row_pitch = 174.5
+    state = _single_screen_state(34, active_index=32)
+    lines = _position_column(0)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("已提供列表区域行时不得再次识别")
+
+    monkeypatch.setattr(ocr_module, "read_rect", boom)
+    assert runner._recovery_position_reason(blank_image(), state, lines) is None
+    # 不传行时仍走原路径（读一次列区域），行为没有丢。
+    monkeypatch.setattr(ocr_module, "read_rect", lambda image, area: lines)
+    assert runner._recovery_position_reason(blank_image(), state) is None
+
+
+def test_recovery_summary_reuses_given_lines(monkeypatch):
+    """数量核对复用整幅列表区域的行；不传时才补读数量区。"""
+    from zzz_ddtool.navigation import NavigationError as NavErr
+
+    runner = Runner(Preset(), hotkeys=False)
+    state, _cells, cache = _cached_recovery(runner)
+    monkeypatch.setattr(runner_module, "is_page", lambda image, page: True)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("已提供行时不得再补一次数量区识别")
+
+    monkeypatch.setattr(ocr_module, "read_rect", boom)
+    runner._recovery_summary(blank_image(), state, cache, fake_label_lines(cache.total))
+
+    monkeypatch.setattr(ocr_module, "read_rect", lambda image, area: [])
+    with pytest.raises(NavErr, match="数量读不清"):
+        runner._recovery_summary(blank_image(), state, cache)
+
+
 def test_long_recovery_reuses_candidates_and_half_row_position(offline_runner, monkeypatch):
     runner = Runner(Preset(), hotkeys=False)
     state, cells, cache = _cached_recovery(runner, long=True)
     monkeypatch.setattr(runner, "_recovery_summary", Mock())
-    columns = iter([_position_column(0), _position_column(50)])
-    monkeypatch.setattr(runner, "_recovery_column_lines", lambda image: next(columns))
+    # 恢复只抓一帧并读一次列表区域：位置简查必须用这一帧的行，不得自己再抓再认。
+    # 保存视口带半行相位（50），所以列行必须与同一相位自洽。
+    columns = iter([_position_column(50)])
+    grab = Mock(side_effect=lambda hwnd: (blank_image(), next(columns)))
+    monkeypatch.setattr(runner, "_grab_label_frame", grab)
+    read_lines = Mock(side_effect=AssertionError("恢复帧的列表区域只允许识别一次"))
+    monkeypatch.setattr(runner, "_read_label_lines", read_lines)
     scan = Mock(side_effect=AssertionError("正常长页恢复不得重扫"))
     monkeypatch.setattr(runner, "_scan_cells", scan)
     sends = []
@@ -2135,6 +2232,9 @@ def test_long_recovery_reuses_candidates_and_half_row_position(offline_runner, m
     assert runner._restored_scan[0][10].center_y == 392
     offline_runner["reset_to_top"].assert_called_once_with(1)
     scan.assert_not_called()
+    # 一次恢复尝试只抓一帧、整幅列表区域只识别一次。
+    assert grab.call_count == 1
+    read_lines.assert_not_called()
 
 
 @pytest.mark.parametrize("change", ["job", "filter"])
@@ -2210,15 +2310,18 @@ def test_cached_recovery_f9_resume_does_not_repeat_top_reset(offline_runner, mon
     control = Mock(paused=False)
     control.checkpoint.side_effect = lambda: setattr(control, "paused", False)
     runner.hotkeys = control
+    # 暂停发生在恢复帧读出之后：等待重新走一遍也不得第二次抓帧/重扫。
     monkeypatch.setattr(runner, "_recovery_summary", lambda *args: setattr(control, "paused", True))
-    columns = iter([_position_column(0), _position_column(50)])
-    monkeypatch.setattr(runner, "_recovery_column_lines", lambda image: next(columns))
+    columns = iter([_position_column(50)])
+    grab = Mock(side_effect=lambda hwnd: (blank_image(), next(columns)))
+    monkeypatch.setattr(runner, "_grab_label_frame", grab)
     monkeypatch.setattr(runner, "_scan_cells", Mock(side_effect=AssertionError("不应重扫")))
     runner._restore_position(1, state, cells, cache=cache)
     offline_runner["reset_to_top"].assert_called_once_with(1)
     phases = [call.args[0] for call in runner._set_status.call_args_list]
     assert "paused" in phases and "running" in phases
     assert state.next_index == 101 and state.resume_point is None
+    assert grab.call_count == 1
 
 
 def test_single_screen_consecutive_upgrades_keep_initial_candidates(offline_runner, monkeypatch):

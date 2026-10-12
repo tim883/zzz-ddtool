@@ -235,38 +235,50 @@ def _use_temp_profile(tmp_path, monkeypatch) -> Path:
 def test_profile_roundtrip(tmp_path, monkeypatch):
     _use_temp_profile(tmp_path, monkeypatch)
     env = _env()
-    assert load_profile(env) is None
+    # 2026-10-12：缺档不再返回 None，而是给可用的出厂默认协议（启动免标定）。
+    missing = load_profile(env)
+    assert missing is not None and missing == nav_module.default_profile(env)
     profile = _profile()
     save_profile(profile)
     assert load_profile(env) == profile
 
 
 def test_profile_ignored_when_environment_changed(tmp_path, monkeypatch):
+    """环境不匹配 → 不采用档案，改用出厂默认协议（不是 None）。"""
     _use_temp_profile(tmp_path, monkeypatch)
     save_profile(_profile())
-    assert load_profile(_env(client_height=720, client_width=1280)) is None
-    assert load_profile(_env(window_dpi=120)) is None
-    assert load_profile(_env(game_build="9.9.9.9|1|2")) is None
-    assert load_profile(_env(machine_id="c" * 64)) is None
+    for env in (_env(client_height=720, client_width=1280), _env(window_dpi=120),
+                _env(game_build="9.9.9.9|1|2"), _env(machine_id="c" * 64)):
+        fallback = load_profile(env)
+        assert fallback == nav_module.default_profile(env)
+        assert fallback != _profile()
 
 
 def test_profile_ignored_when_corrupt_or_incomplete(tmp_path, monkeypatch):
+    """坏档/缺字段 → 改用出厂默认协议，不抛错、也不算采用该档案。"""
     target = _use_temp_profile(tmp_path, monkeypatch)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("{ not json", encoding="utf-8")
-    assert load_profile(_env()) is None
-    target.write_text(json.dumps({"machine_id": "a" * 64}), encoding="utf-8")
-    assert load_profile(_env()) is None
-    target.write_text(json.dumps([]), encoding="utf-8")
-    assert load_profile(_env()) is None
+    for bad in ("{ not json", json.dumps({"machine_id": "a" * 64}), json.dumps([])):
+        target.write_text(bad, encoding="utf-8")
+        assert load_profile(_env()) == nav_module.default_profile(_env())
 
 
 def test_profile_ignored_when_values_illegal(tmp_path, monkeypatch):
+    """非法数值（events_per_row=0 / 行距为负）→ 改用出厂默认协议。"""
     _use_temp_profile(tmp_path, monkeypatch)
     save_profile(_profile(events_per_row=0))
-    assert load_profile(_env()) is None
+    assert load_profile(_env()) == nav_module.default_profile(_env())
     save_profile(_profile(row_pitch_px=-1.0))
-    assert load_profile(_env()) is None
+    assert load_profile(_env()) == nav_module.default_profile(_env())
+
+
+def test_default_profile_is_usable_without_calibration():
+    """出厂默认协议必须通过 NavProfile.matches，且行距/事件数为正，开局即可用。"""
+    env = _env()
+    profile = nav_module.default_profile(env)
+    assert profile.matches(env)
+    assert profile.events_per_row >= 1 and profile.row_pitch_px > 0
+    assert profile.event_interval_ms > 0 and profile.settle_wait_ms >= 0
 
 
 # ------------------------------------------------------------------ 按行发送

@@ -1402,15 +1402,65 @@ def _click_slot(hwnd: int, slot: int, width: int, height: int) -> InputRelease:
     raise FilterClickError(f"筛选面板里没找到「分区[{slot}]」按钮，中断。")
 
 
-def _click_reset(hwnd: int, width: int, height: int) -> InputRelease:
-    """OCR 找面板底部的「重置」按钮点中心并返回释放回执（避开批量操作）。"""
+def _try_click_reset(hwnd: int, width: int, height: int) -> InputRelease | None:
+    """OCR 找面板底部的「重置」按钮点中心；落空返回 None（由调用方决定要不要再点漏斗）。"""
     image, _ = _grab()
     for line in read_rect(image, FILTER_RESET_AREA):
         text = line.text.replace(" ", "")
         if "重置" in text and "批量" not in text:
             with input_context("reset", defer_post_release=True):
                 return click_client(hwnd, (line.left + line.right) // 2, (line.top + line.bottom) // 2)
-    raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
+    return None
+
+
+def _click_reset(hwnd: int, width: int, height: int) -> InputRelease:
+    """OCR 找面板底部的「重置」按钮点中心并返回释放回执（避开批量操作）。"""
+    release = _try_click_reset(hwnd, width, height)
+    if release is None:
+        raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
+    return release
+
+
+def _click_funnel(hwnd: int, fx: int, fy: int) -> None:
+    """点漏斗按钮并等 ``open_panel`` 下限。漏斗是开/关切换，不管方向。"""
+    with input_context("open_panel", defer_post_release=True):
+        release = click_client(hwnd, fx, fy)
+    wait_release("open_panel", release, fallback_ms=75 + _MEASURED_SAFETY_MS)
+
+
+def _open_panel_and_reset(
+    hwnd: int, width: int, height: int, *, fx: int, fy: int, allow_reopen: bool
+) -> InputRelease:
+    """点漏斗打开筛选面板并点「重置」；**读不到「重置」就再点一次漏斗**开回来。
+
+    2026-10-12 真机因果：漏斗是**开/关切换**。面板本来就开着时（上一轮没关就点了开始），
+    开头那一下会把它**关掉**，接着找「重置」必然读空、整轮中断。日志证据：失败轮
+    ``0002-导航到仓库.png`` 左侧网格已被压暗（p95 119~129），正常轮是 218~242，
+    说明任务开始时面板就是开着的。
+
+    做法：点一次漏斗 → 找「重置」；找不到就**再点一次漏斗**。开关按两次回到原状态，
+    面板原本开着会被恢复，原本关着则第一次就已经打开。所以：
+
+    - 面板本来关着（正常路径）：点 1 次漏斗 + 读 1 次区域 OCR，与旧实现完全相同，不多抓帧；
+    - 面板本来开着：多 1 次点击 + 1 次区域 OCR，但把"必然失败"救成"正常继续"。
+
+    不读亮度、不判"面板开没开"，只用"读没读到重置"——不依赖跨机器会变的像素阈值。
+    ``allow_reopen=False`` 供 ``reset_game_filter`` 用：那条路径读不到时紧接着就 Esc 关面板，
+    没有"再点重置"的下一步，补点没有意义。
+    """
+    log = get_logger("zzz_ddtool.gamefilter")
+    _click_funnel(hwnd, fx, fy)
+    release = _try_click_reset(hwnd, width, height)
+    if release is not None:
+        return release
+    if not allow_reopen:
+        raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
+    log.info("没读到「重置」，再点一次漏斗把它开回来")
+    _click_funnel(hwnd, fx, fy)
+    release = _try_click_reset(hwnd, width, height)
+    if release is None:
+        raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
+    return release
 
 
 def reset_game_filter(hwnd: int, width: int, height: int) -> None:
@@ -1421,10 +1471,9 @@ def reset_game_filter(hwnd: int, width: int, height: int) -> None:
     """
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
-    with input_context("open_panel", defer_post_release=True):
-        release = click_client(hwnd, fx, fy)
-    wait_release("open_panel", release, fallback_ms=75 + _MEASURED_SAFETY_MS)
-    reset_release = _click_reset(hwnd, width, height)
+    reset_release = _open_panel_and_reset(
+        hwnd, width, height, fx=fx, fy=fy, allow_reopen=False
+    )
     wait_release("reset", reset_release, fallback_ms=203 + _MEASURED_SAFETY_MS)
     with input_context("close_panel_reset", defer_post_release=True):
         esc_release = press_key(hwnd, VK_ESCAPE)
@@ -1463,10 +1512,11 @@ def apply_game_filter(
     log = get_logger("zzz_ddtool.gamefilter")
     fx, fy = scale_point(*FILTER_BTN, width, height)
     _refuse_dismantle(fx, fy, width, height)
-    with input_context("open_panel", defer_post_release=True):
-        release = click_client(hwnd, fx, fy)
-    wait_release("open_panel", release, fallback_ms=75 + _MEASURED_SAFETY_MS)
-    reset_release = _click_reset(hwnd, width, height)
+    # 面板若本来就开着，第一下会把它关掉；读不到「重置」时补点一次开回来。
+    # 这里允许补点：紧接着还要在同一面板里点号位/套装/词条，不是马上关面板。
+    reset_release = _open_panel_and_reset(
+        hwnd, width, height, fx=fx, fy=fy, allow_reopen=True
+    )
     wait_release("reset", reset_release, fallback_ms=203 + _MEASURED_SAFETY_MS)
     for slot in slots:
         slot_release = _click_slot(hwnd, slot, width, height)

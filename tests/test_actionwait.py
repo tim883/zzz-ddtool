@@ -1,4 +1,4 @@
-"""actionwait 与输入层释放契约的离线验收（spec §2.1—§2.2、§3、§4.1、§5、§9 T1—T8 的 S2 部分）。
+﻿"""actionwait 与输入层释放契约的离线验收（spec §2.1—§2.2、§3、§4.1、§5、§9 T1—T8 的 S2 部分）。
 
 全部替身：不发真实输入、不睡真实时间、不碰真实档案（档案路径单独指到 tmp）。
 """
@@ -17,6 +17,7 @@ from zzz_ddtool.actionwait import (
     InputRelease,
     compute_floor_ms,
     load_policies,
+    load_policies_with_edges,
     policy_for,
     release_waits,
     wait_release,
@@ -320,7 +321,7 @@ def test_t6_floor_rejects_invalid(bad):
 
 def _payload(env: SimpleNamespace) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "time_origin": "native_release",
         "predicate_version": 2,
         "environment": _env_block(env),
@@ -441,7 +442,55 @@ def test_t8_pause_deduction_and_no_input_validation(monkeypatch):
     validate.assert_not_called()
 
 
-def test_t8_stop_during_shard_propagates_without_more_input(monkeypatch):
+def test_t9_write_profile_installs_return_edges(tmp_path):
+    """Spec v9 §12：逐边项写进根字段 return_edges，并按逐边下限装载（≥5 样本）。"""
+    env = _env()
+    profile = tmp_path / "post-release-waits.json"
+    edge_item = {"count": 5, "max_stable_ms": 60, "floor_ms": 80, "report_sha256": "d" * 64}
+    result = write_profile(
+        env,
+        {"open_panel": {"count": 10, "max_stable_ms": 100, "floor_ms": 120,
+                        "report_sha256": "a" * 64}},
+        path=profile, return_edges={"preview_warehouse": edge_item},
+    )
+    assert result["status"] == "written"
+    raw = json.loads(profile.read_text(encoding="utf-8"))
+    assert set(raw) == {"schema_version", "time_origin", "predicate_version",
+                        "environment", "policies", "return_edges"}
+    assert raw["schema_version"] == 2
+    assert raw["return_edges"] == {"preview_warehouse": edge_item}
+
+    policies, edges = load_policies_with_edges(env, path=profile)
+    assert policies == {"open_panel": ActionWaitPolicy(120, "measured")}
+    assert edges == {"preview_warehouse": ActionWaitPolicy(80, "measured")}
+
+
+def test_t9_return_edges_reject_unknown_edge_and_bad_items(tmp_path):
+    """未知边名写不出去；单边样本不足（<5）或越界只丢该边，不牵连其他边。"""
+    env = _env()
+    profile = tmp_path / "bad-edge.json"
+    assert write_profile(
+        env, {}, path=profile, return_edges={"nope": {"count": 5, "max_stable_ms": 1,
+                                                      "floor_ms": 50, "report_sha256": "e" * 64}},
+    )["status"] == "write_failed"
+
+    payload = _payload(env)
+    payload["return_edges"] = {
+        "preview_warehouse": {"count": 4, "max_stable_ms": 60, "floor_ms": 90,
+                              "report_sha256": "d" * 64},   # 样本不足
+        "modal_preview": {"count": 5, "max_stable_ms": 2000, "floor_ms": 4000,
+                          "report_sha256": "f" * 64},        # 越界（>=3580 timeout）
+        "modal_warehouse": {"count": 5, "max_stable_ms": 100, "floor_ms": 120,
+                            "report_sha256": "0" * 64},      # 合格
+    }
+    path2 = tmp_path / "partial-edges.json"
+    path2.write_text(json.dumps(payload), encoding="utf-8")
+    policies, edges = load_policies_with_edges(env, path=path2)
+    assert policies == {"open_panel": ActionWaitPolicy(120, "measured")}
+    assert edges == {"modal_warehouse": ActionWaitPolicy(120, "measured")}
+
+
+def test_t7_stop_during_shard_propagates_without_more_input(monkeypatch):
     fake = FakeTime(1.0)
     _freeze(monkeypatch, fake, actionwait, control)
     calls = {"n": 0}
