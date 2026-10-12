@@ -2470,7 +2470,7 @@ class Runner:
             self.log.info("cell %s action=%s level=%d", cell_tag, decision.action.value, disc.level)
             message = f"{where} 已{trace_action(decision.action.value)}"
             if decision.action == Action.MARK_DISCARD and not self.preset.labels.discard:
-                message = f"{where} 判为弃置，标签设置关闭，未打标签"
+                message = f"{where} 判为弃置，标记开关关闭，未按 R"
             self.trace.ok("detail", decision.action.value, message)
             self._set_status("action", decision.action.value, cell_tag)
         self.stats.disc_end(
@@ -3144,11 +3144,20 @@ class Runner:
 
     def _set_discard_label(self, hwnd: int, *, discarded: bool, value: bool,
                            before: Disc | None = None) -> bool:
-        """所有弃置标签增删的统一入口；高级设置关闭时不发送标签按键。"""
-        if not self.preset.labels.allows("discard"):
-            self.log.info("弃置标签设置关闭：保留判断结果，不修改标签")
-            self.trace.note("标签设置关闭，不修改弃置标签")
-            return False
+        """所有弃置标签增删的统一入口。
+
+        「判断后打上弃置标记」关闭时只不发 R：盘锁着、又要打弃置的，仍照旧先按 T
+        解锁（2026-10-12 作者裁定）；摘标记（``value=False``，进强化页前那一步）
+        属于强化流程，开关关闭也照常执行。读数拿不准不为一个不发的键停链。
+        """
+        skip_mark = value and not self.preset.labels.allows("discard")
+        if skip_mark:
+            self.log.info("弃置标记开关关闭：保留判断结果，不按 R")
+            self.trace.note("标记开关关闭，不按 R 打弃置标记")
+            previous = before if before is not None else self._detail_disc
+            # 没锁就没有要做的动作：不读数、不按键。
+            if previous is None or previous.locked is not True:
+                return False
         # discarded 是调用者先前的读数；输入前必须使用当前帧，不能信旧标签。
         context = _LabelContext(before or self._detail_disc, self._checkpoint())
         state = None
@@ -3160,6 +3169,9 @@ class Runner:
                 break
             time.sleep(0.05)
         if state is None or state["locked"] is None or state["discarded"] is None:
+            if skip_mark:
+                # 只为解锁读数：读不准就不按 T。
+                return False
             raise RunnerError("标签输入前状态无法确认，停止任务链")
 
         def send(vk: int, expected: dict, kind: str, key: str, target: bool) -> None:
@@ -3182,6 +3194,9 @@ class Runner:
             state = {"locked": False, "discarded": state["discarded"]}
             self._note_label_input("label_unlock_before_discard", "T")
             self.log.info("弃置前已确认解锁 (T)")
+        if skip_mark:
+            # 开关关闭：解锁已做完，这里只停 R，弃置标记不落游戏；判定与计数照旧。
+            return False
         send(VK_R, state, "label_discard" if value else "clear_discard", "discarded", value)
         self._verify_label(hwnd, key="discarded", value=value,
                            other_value=state["locked"], context=context)
@@ -3196,7 +3211,7 @@ class Runner:
         """在当前盘仍被选中时完成保留标签；不能在切页置顶后补按 T。"""
         self._esc_back_to_grid(hwnd)
         if not self.preset.labels.allows("save"):
-            self.log.info("保存标签设置关闭：升满保留，不修改锁定标签")
+            self.log.info("锁定标记开关关闭：升满保留，不修改锁定标签")
             return
 
         def read_current() -> tuple[Disc, QImage]:

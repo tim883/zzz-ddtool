@@ -89,6 +89,14 @@ def test_save_disabled_adds_no_ocr_or_key(setup):
     parser.assert_not_called()
 
 
+def test_save_disabled_records_no_label_input(setup):
+    """「判断后打上锁定标记」关闭：升满保留不再按 T，输入证据里也没有 label_save。"""
+    runner, _, _, keys, _ = setup
+    runner.preset = replace(runner.preset, labels=LabelPolicy(save=False))
+    runner._finish_kept_upgrade(1, kept_disc())
+    assert keys == [] and runner._label_inputs == []
+
+
 @pytest.mark.parametrize("changed", [None, kept_disc(locked=None), kept_disc(12)])
 def test_unknown_or_different_disc_is_not_locked(setup, changed):
     runner, state, parser, keys, _ = setup

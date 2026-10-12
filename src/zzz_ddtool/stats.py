@@ -502,7 +502,7 @@ class RunStats:
             log.info("    升满成功明细：%s", kept_desc)
         log.info(
             "    实际打上弃置标记 %d 次（判定弃置 %d 件，两者本来就不等：盘上已有标记、"
-            "或标签设置关闭时不会真打）",
+            "或标记开关关闭时不会真打）",
             data["discard_labels"],
             counts[OUTCOME_DISCARDED],
         )

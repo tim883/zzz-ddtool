@@ -1534,7 +1534,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._main_splitter, 1)
         self._refresh_run_status()
         self._load_path(self._path)
-        for box in (self.skip_locked, self.skip_equipped, self.skip_discarded):
+        for box in (self.mark_discard, self.mark_lock, self.skip_locked, self.skip_equipped,
+                    self.skip_discarded):
             box.toggled.connect(self._mark_unsaved)
         self.max_discs.valueChanged.connect(self._mark_unsaved)
         # 恢复上次的窗口大小/位置、三栏比例。放在最后：控件都建好了才动。
@@ -1821,9 +1822,15 @@ class MainWindow(QMainWindow):
 
         flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
+        self.mark_discard = QCheckBox("判断后打上弃置标记")
+        self.mark_lock = QCheckBox("判断后打上锁定标记")
         self.skip_locked = QCheckBox("跳过有锁定标记")
         self.skip_equipped = QCheckBox("跳过已装备（无法跳过）")
         self.skip_discarded = QCheckBox("跳过有弃置标记")
+        for box in (self.mark_discard, self.mark_lock):
+            # 判断后打不打标记：默认都打；取消勾选只停发 R/T，判定与计数不变。
+            box.setChecked(True)
+            flags.addWidget(box)
         for box in (self.skip_equipped, self.skip_locked, self.skip_discarded):
             # 弃置标记默认不勾，其余两项默认勾。
             box.setChecked(box is not self.skip_discarded)
@@ -3195,8 +3202,10 @@ class MainWindow(QMainWindow):
 
     def _apply_preset(self, preset: Preset) -> None:
         self._loading = True
-        self._label_policy = preset.labels
         self.name_edit.setText(preset.name)
+        # 判断后打不打标记：两个勾是这一项的唯一来源，不再另存一份 _label_policy。
+        self.mark_discard.setChecked(preset.labels.discard)
+        self.mark_lock.setChecked(preset.labels.save)
         self.skip_locked.setChecked(preset.skip_locked)
         self.skip_equipped.setChecked(preset.skip_equipped)
         self.skip_discarded.setChecked(preset.skip_discarded)
@@ -3452,7 +3461,8 @@ class MainWindow(QMainWindow):
                 "stage_require": current.get("stage_require") or {"three": {}, "four": {}},
                 "min_useful_types": int(current.get("min_useful_types") or 0),
                 "run": {"max_discs": int(self.max_discs.value())},
-                "labels": {"discard": self._label_policy.discard, "save": self._label_policy.save},
+                "labels": {"discard": self.mark_discard.isChecked(),
+                           "save": self.mark_lock.isChecked()},
                 "game_filter": {
                     "sets": list(self._filter_sets),
                     "slot": self._active_slot,

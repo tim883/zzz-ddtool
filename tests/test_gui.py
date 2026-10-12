@@ -117,6 +117,34 @@ def test_hard_filter_has_no_require_s_rank_checkbox(qapp: QApplication, tmp_path
     window.close()
 
 
+def test_mark_switches_reflect_and_save_labels(qapp: QApplication, tmp_path) -> None:
+    """「判断后打上弃置/锁定标记」两个勾：默认都勾上，按配置回显，改动能写回 labels。"""
+    from zzz_ddtool.config import LabelPolicy, preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    assert window.mark_discard.isChecked() and window.mark_lock.isChecked()
+    assert window.collect_preset().labels == LabelPolicy(discard=True, save=True)
+
+    window._apply_preset(preset_from_dict({
+        "task_chain": [{"slot": 4, "weights": {"暴击率": 1.0}}],
+        "labels": {"discard": False, "save": False},
+    }))
+    assert not window.mark_discard.isChecked() and not window.mark_lock.isChecked()
+    assert window.collect_preset().labels == LabelPolicy(discard=False, save=False)
+
+    window.mark_lock.setChecked(True)
+    assert window.collect_preset().labels == LabelPolicy(discard=False, save=True)
+
+    # 与同组其余勾选一样，改动要参与「未保存」提示。
+    window.save_current()
+    assert window.save_label.objectName() == "saveState"
+    window.mark_lock.setChecked(False)
+    assert window.save_label.objectName() == "saveStateIdle"
+    window.close()
+
+
 def test_editor_empty_when_no_job_selected(qapp: QApplication, tmp_path) -> None:
     """死线：左侧没有选中任务时，右侧必须是空的，绝不能显示残留内容（假信息）。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")

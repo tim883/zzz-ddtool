@@ -67,13 +67,48 @@ def test_locked_discard_both_entries_unlock_then_discard(labels, upgraded, save)
     assert runner.stats.summary()["discard_labels"] == 1
 
 
-def test_discard_disabled_suppresses_unlock_too(labels):
+def test_discard_marking_disabled_still_unlocks_and_never_sends_r(labels):
+    """「判断后打上弃置标记」关闭：锁定盘仍照旧先按下解锁，但不按 R、不计弃置标记。"""
     runner, state, _, _, keys, reader, parser, _ = labels
     runner.preset = replace(runner.preset, labels=LabelPolicy(discard=False))
-    runner._act(1, Action.MARK_DISCARD, state[0])
-    assert keys == []
-    reader.assert_not_called()
+    with controlled_inputs(runner._checkpoint):
+        runner._act(1, Action.MARK_DISCARD, state[0])
+    assert keys == [rm.VK_T]
+    assert (state[0].locked, state[0].discarded) == (False, False)
+    assert runner.stats.summary()["discard_labels"] == 0
+    assert [item["kind"] for item in runner._label_inputs] == ["label_unlock_before_discard"]
     parser.assert_not_called()
+
+
+def test_discard_marking_disabled_leaves_unlocked_disc_untouched(labels):
+    """开关关闭且盘没锁：不读标签、不按键——没有要发的键就不做无谓判定。"""
+    runner, state, _, _, keys, reader, _, _ = labels
+    state[0] = replace(state[0], locked=False)
+    runner.preset = replace(runner.preset, labels=LabelPolicy(discard=False))
+    changed = runner._set_discard_label(1, discarded=False, value=True, before=state[0])
+    assert changed is False and keys == []
+    reader.assert_not_called()
+
+
+def test_discard_marking_disabled_is_not_stopped_by_unreadable_state(labels):
+    """只为解锁读数：读不准就不按 T，也不为一个不发的键停链。"""
+    runner, state, _, _, keys, reader, _, _ = labels
+    runner.preset = replace(runner.preset, labels=LabelPolicy(discard=False))
+    reader.side_effect = lambda _: {"locked": None, "discarded": None}
+    changed = runner._set_discard_label(1, discarded=False, value=True, before=state[0])
+    assert changed is False and keys == []
+
+
+def test_discard_marking_disabled_keeps_clearing_mark_before_upgrade(labels):
+    """摘标记（进强化页前那一步）属于强化流程，开关关闭也照常按 R 执行。"""
+    runner, state, _, _, keys, _, _, _ = labels
+    state[0] = replace(state[0], locked=False, discarded=True)
+    runner.preset = replace(runner.preset, labels=LabelPolicy(discard=False))
+    with controlled_inputs(runner._checkpoint):
+        changed = runner._set_discard_label(1, discarded=True, value=False, before=state[0])
+    assert keys == [rm.VK_R]
+    assert state[0].discarded is False
+    assert changed is True
 
 
 @pytest.mark.parametrize("discarded,value,expected", [(False, True, [rm.VK_R]),
