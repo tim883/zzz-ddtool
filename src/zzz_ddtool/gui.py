@@ -1822,7 +1822,7 @@ class MainWindow(QMainWindow):
         flags_box = QGroupBox("硬过滤（任务链共用）")
         flags = QVBoxLayout(flags_box)
         self.skip_locked = QCheckBox("跳过有锁定标记")
-        self.skip_equipped = QCheckBox("跳过已装备")
+        self.skip_equipped = QCheckBox("跳过已装备（无法跳过）")
         self.skip_discarded = QCheckBox("跳过有弃置标记")
         for box in (self.skip_equipped, self.skip_locked, self.skip_discarded):
             # 弃置标记默认不勾，其余两项默认勾。

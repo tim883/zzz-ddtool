@@ -39,7 +39,7 @@ class Disc:
     level: int
     substats: tuple[Substat, ...]
     # 由界面读出的稀有度（S/A/B）；读不出时为 None——**不假定是 S**。
-    # require_s_rank 只在确认「不是 S」时跳过，未知按不跳过处理（宁可不跳，不误跳好盘）。
+    # 确认「不是 S」一律跳过（2026-10-12 起没有开关），未知按不跳过处理（宁可不跳，不误跳好盘）。
     rarity: str | None = None
     # 锁定/弃置由仓库侧栏的 R/T 提示读出：True/False 为已确认状态，None = 未知。
     # 未知不默认成 False（未标记）：解析层读不到时显式传 None，要按对应跳过规则

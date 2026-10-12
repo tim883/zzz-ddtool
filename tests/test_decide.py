@@ -12,7 +12,7 @@ def _preset(**overrides):
             "four": {0: 2.0, 3: 2.8},
         },
         "min_useful_types": 3,
-        "filters": {"require_s_rank": True, "skip_locked": True, "skip_equipped": True},
+        "filters": {"skip_locked": True, "skip_equipped": True},
     }
     data.update(overrides)
     return preset_from_dict(data)
@@ -132,11 +132,12 @@ def test_second_pass_whitelist_overrides_min_useful() -> None:
     assert decide(disc, preset, accepted_ids=set()).action is Action.MARK_DISCARD
 
 
-def test_require_s_rank_only_skips_confirmed_non_s() -> None:
-    """确认不是 S 才跳过；稀有度读不出（None）不跳过。
+def test_non_s_rank_is_always_skipped() -> None:
+    """非 S 一律跳过，没有开关；稀有度读不出（None）仍按不跳过处理。
 
     读不出就跳过会把好盘误丢，所以未知一律按不跳过处理（`Disc.rarity` 默认 None
     就是为此）。这是 B2「恒默认 S」的反面：既不蒙 S，也不拿未知当非 S。
+    2026-10-12 起「跳过非S级」开关已删除，判定固定，不再看配置。
     """
     preset = _preset()
     subs = (Substat("暴击率"), Substat("暴击伤害"), Substat("攻击力%"))
@@ -146,3 +147,11 @@ def test_require_s_rank_only_skips_confirmed_non_s() -> None:
     assert decide(Disc(level=0, substats=subs, rarity="S"), preset).reason != "not_s_rank"
     assert decide(Disc(level=0, substats=subs, rarity=None), preset).reason != "not_s_rank"
     assert decide(Disc(level=0, substats=subs, rarity="s"), preset).reason != "not_s_rank"
+
+
+def test_legacy_require_s_rank_false_cannot_bring_non_s_back() -> None:
+    """老存档写过 filters.require_s_rank: false，也不改变行为：非 S 仍然跳过。"""
+    preset = preset_from_dict({"filters": {"require_s_rank": False, "skip_locked": False}})
+    subs = (Substat("暴击率"), Substat("暴击伤害"), Substat("攻击力%"))
+
+    assert decide(Disc(level=0, substats=subs, rarity="A"), preset).reason == "not_s_rank"

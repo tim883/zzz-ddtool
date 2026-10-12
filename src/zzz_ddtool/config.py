@@ -33,7 +33,6 @@ class Preset:
     weights: Mapping[str, float] = field(default_factory=dict)
     stage_require: Mapping[str, Mapping[int, float]] = field(default_factory=dict)
     min_useful_types: int = 0
-    require_s_rank: bool = True
     skip_locked: bool = True
     skip_equipped: bool = True
     skip_discarded: bool = False  # 新任务默认不勾，等用户自己开
@@ -129,7 +128,6 @@ def preset_from_dict(data: dict[str, Any]) -> Preset:
         weights=active_weights,
         stage_require=active_require,
         min_useful_types=int(active.get("min_useful_types") or min_useful),
-        require_s_rank=bool(filters.get("require_s_rank", True)),
         skip_locked=bool(filters.get("skip_locked", True)),
         skip_equipped=bool(filters.get("skip_equipped", True)),
         skip_discarded=bool(filters.get("skip_discarded", False)),
@@ -212,7 +210,6 @@ def preset_to_dict(preset: Preset) -> dict[str, Any]:
             if int(slot) in SLOTS
         },
         "filters": {
-            "require_s_rank": preset.require_s_rank,
             "skip_locked": preset.skip_locked,
             "skip_equipped": preset.skip_equipped,
             "skip_discarded": preset.skip_discarded,

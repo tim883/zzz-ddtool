@@ -31,7 +31,6 @@ def test_roundtrip_keeps_stage_require_and_accepted(tmp_path: Path) -> None:
             "weights": {"暴击率": 1.0, "暴击伤害": 1.2},
             "stage_require": {"three": {0: 2.2, 3: 3.0}, "four": {0: 3.0}},
             "accepted": ["three:0:暴击伤害|暴击率|废词条|未出"],
-            "filters": {"require_s_rank": False},
         }
     )
     path = tmp_path / "p.yaml"
@@ -41,8 +40,8 @@ def test_roundtrip_keeps_stage_require_and_accepted(tmp_path: Path) -> None:
     assert loaded.weights["暴击伤害"] == 1.2
     assert loaded.require_for("three", 0) == 2.2
     assert loaded.accepted == ("three:0:暴击伤害|暴击率|废词条|未出",)
-    assert loaded.require_s_rank is False
     assert "accepted" in preset_to_dict(loaded)
+    assert "require_s_rank" not in preset_to_dict(loaded)["filters"]
 
 
 def test_max_discs_and_game_filter_roundtrip(tmp_path: Path) -> None:
@@ -111,3 +110,15 @@ def test_global_label_policy_roundtrip_and_legacy_defaults(tmp_path):
     loaded = load_preset(path)
     assert not loaded.labels.allows("discard")
     assert not loaded.labels.allows("save")
+
+
+def test_legacy_require_s_rank_key_is_ignored(tmp_path: Path) -> None:
+    """老存档里的 filters.require_s_rank 被忽略：载入不报错，也不再写回该键。"""
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        "name: 老存档\nweights:\n  暴击率: 1.0\nfilters:\n  require_s_rank: false\n",
+        encoding="utf-8",
+    )
+    loaded = load_preset(path)
+    assert loaded.name == "老存档"
+    assert "require_s_rank" not in preset_to_dict(loaded)["filters"]

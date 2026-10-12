@@ -31,7 +31,8 @@ def decide(disc: Disc, preset: Preset, accepted_ids: Collection[str] | None = No
     if preset.skip_discarded and disc.discarded:
         return _result(Action.SKIP, "already_marked_discard", score, useful_now, useful_max, checkpoint)
     # 稀有度未知（None）按不跳过处理：宁可不跳，也不把读不准的盘误判成非 S 丢掉。
-    if preset.require_s_rank and disc.rarity is not None and disc.rarity.upper() != "S":
+    # 非 S 一律跳过，没有开关（2026-10-12 用户要求删掉「跳过非S级」）。
+    if disc.rarity is not None and disc.rarity.upper() != "S":
         return _result(Action.SKIP, "not_s_rank", score, useful_now, useful_max, checkpoint)
 
     origin = infer_origin(disc)

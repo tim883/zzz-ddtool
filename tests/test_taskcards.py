@@ -245,7 +245,7 @@ def test_card_totals_match_runtime_decisions_across_all_stages():
                 replace(job, accepted=chosen), replace(job, accepted=())):
         effective = replace(raw, accepted=rebase_selection(raw))
         preset = Preset(weights=effective.weights, stage_require=effective.stage_require,
-                        require_s_rank=False, skip_locked=False, skip_equipped=False)
+                        skip_locked=False, skip_equipped=False)
         expected = {"three": 0, "four": 0}
         for (origin, level), patterns in grouped.items():
             for pattern in patterns:

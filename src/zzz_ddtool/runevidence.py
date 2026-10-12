@@ -78,7 +78,7 @@ def validate_plan(raw, jobs) -> list[str]:
             sub = Preset(
                 weights=j.weights, filter_slot=j.slot, filter_slots=(j.slot,), filter_mainstats=j.mainstats,
                 stage_require=j.stage_require, min_useful_types=j.min_useful_types,
-                require_s_rank=preset.require_s_rank, skip_locked=preset.skip_locked,
+                skip_locked=preset.skip_locked,
                 skip_equipped=preset.skip_equipped, skip_discarded=preset.skip_discarded,
                 accepted=j.accepted, labels=preset.labels, required_substats=j.required_substats,
             )
