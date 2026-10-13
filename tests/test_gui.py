@@ -619,7 +619,7 @@ def test_remembers_last_opened_yaml(qapp: QApplication, tmp_path, monkeypatch) -
 
 
 def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatch) -> None:
-    """点「打开」/「另存为」换了文件之后，那份就被记住。"""
+    """点「打开」/「另存为」换了文件之后，那份就被记住；界面文件名标签同步跟上。"""
     from zzz_ddtool import gui, paths
     from zzz_ddtool.config import preset_from_dict, save_preset
     from zzz_ddtool.gui import last_config_path
@@ -635,6 +635,9 @@ def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatc
     window = MainWindow(config_path=tmp_path / "空.yaml")
     window.open_preset()
     assert last_config_path() == target.resolve()
+    # 打开换了工作文件后，顶部文件名标签要跟着换。
+    assert window.path_label.text() == "手动打开.yaml"
+    assert window.path_label.toolTip() == str(target)
 
     # 另存为换了当前工作文件，也要记住
     target2 = tmp_path / "另存出去.yaml"
@@ -644,6 +647,9 @@ def test_open_and_save_as_remember_file(qapp: QApplication, tmp_path, monkeypatc
     window.save_as()
     assert target2.exists()
     assert last_config_path() == target2.resolve()
+    # 另存为同样换了工作文件：文件名标签即时跟上，不能停在旧档名上（回归 2026-10-13）。
+    assert window.path_label.text() == "另存出去.yaml"
+    assert window.path_label.toolTip() == str(target2)
     window.close()
 
 

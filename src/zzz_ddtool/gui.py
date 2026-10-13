@@ -3260,8 +3260,7 @@ class MainWindow(QMainWindow):
             self._apply_slot_widgets(self._slot_plans[self._active_slot])
         self._refresh_chain_list(self._editing_job_id)
         self._reset_saved_state()
-        self.path_label.setText(self._path.name)
-        self.path_label.setToolTip(str(self._path))
+        self._refresh_path_label()
         self._loading = False
         if self._jobs:
             self._selection_seed = accepted
@@ -3600,9 +3599,15 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._path = persistent_config_path(Path(path))
-        self.save_current()
-        # 另存为换了工作文件，下次启动就打开它
-        remember_config_path(self._path)
+        self.save_current()  # 落盘新档；内部同时记住新路径，下次启动就打开它
+        # 另存为换了工作文件，界面文件名要跟上——2026-10-13 前这里漏了刷新，
+        # 标签停在旧档名上，显示和实际保存目标不一致。
+        self._refresh_path_label()
+
+    def _refresh_path_label(self) -> None:
+        """文件名标签跟随 self._path：打开和另存为换了工作文件后都要刷新。"""
+        self.path_label.setText(self._path.name)
+        self.path_label.setToolTip(str(self._path))
 
     def run_trial(self) -> None:
         disc = self.trial.disc()
