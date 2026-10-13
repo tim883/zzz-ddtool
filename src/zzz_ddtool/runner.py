@@ -123,7 +123,7 @@ _READY_TIMEOUT_MS: dict[str, int] = {
     "return_warehouse": 3580,
 }
 #: 无测量时的总下限（ms）；有实测档案时由 actionwait 提供。
-#: 2026-10-12 作者裁定：与 §4.2 同规矩 = 真机实测（取有效样本最大值，见《等待时间表》）
+#: 与上表同一口径 = 真机实测取有效样本的最大值
 #: + _MEASURED_SAFETY_MS；不准再手写 +200。
 _READY_FLOOR_MS: dict[str, int] = {
     "select_disc": 320 + _MEASURED_SAFETY_MS,
@@ -141,23 +141,22 @@ _LABEL_FLOOR_MS = 135 + _MEASURED_SAFETY_MS
 _REFUND_DISMISS_FLOOR_MS = 1277 + _MEASURED_SAFETY_MS
 
 # ---- return_warehouse 逐边下限（Spec v9 §12）----
-#: 三条允许边各自的下限；`_READY_FLOOR_MS["return_warehouse"]` 只作为三边都缺项时的兜底。
-#: 取自 2026-10-12 真机一轮（log/20261012-202521-215）的运行时证据：
-#: preview→warehouse 第 0 帧即 ready（约 70 ms 起），modal→preview 约 1.4 s 才可见。
-#: 三边共用 1611 ms 时，快边被迫等慢边（每件强化盘两次 Esc 合计约 4.3 s、单轮 17.1 s）。
+#: 允许边各自的下限；`_READY_FLOOR_MS["return_warehouse"]` 只作为两边都缺项时的兜底。
+#: `modal_preview`（强化页 → 缩放层）自 2026-10-13 起按「实测 100 + `_MEASURED_SAFETY_MS`」取值 = 300 ms
+#: （用户裁定：这一段没有 1680 ms 那么长）。旧的 1680 来自 2026-10-12 一轮的运行期证据。
+#: `preview_warehouse` 仍是运行期兜底 680。
+#: `modal_warehouse`（弹层直接到仓库）2026-10-13 删除：边名只按发键前那层取，这个名字永远
+#: 选不到，留着它的下限与逐边档位都不会生效，还会让逐边标定凑不齐边。
 #: 逐边实测（每边 ≥5 个有效样本）落档后由 `return_edges` 覆盖，这里的值随之失去作用。
 _RETURN_EDGE_FLOOR_MS: dict[str, int] = {
-    "modal_preview": 1680,
-    "modal_warehouse": 1680,
+    "modal_preview": 100 + _MEASURED_SAFETY_MS,
     "preview_warehouse": 680,
 }
 
-#: 「阶段添加」→「升级」之间的固定间隔（秒）。2026-10-12 作者裁定：阶段添加后的动画
-#: 不必等画面稳定，直接点「升级」会让动画立刻结束，结果一样；素材是否到位也不用确认
-#: （点下去没反应会在后面的 upgrade_result 等待里超时暴露）。原 `material_ready` 就绪等待
-#: （下限 947 ms、实测间隔约 1.16 s）由本固定间隔取代。
-#: 2026-10-13 作者先裁定取 0（与副词条/set_option 连点口径一致），真机验证通过后
-#: **再裁定取 0.1 s 作保险余量**。
+#: 「阶段添加」→「升级」之间的固定间隔（秒）。阶段添加后的动画不必等画面稳定，直接点
+#: 「升级」会让动画立刻结束，结果一样；素材是否到位也不用确认（点下去没反应会在后面的
+#: upgrade_result 等待里超时暴露）。原 `material_ready` 就绪等待（下限 947 ms、实测间隔
+#: 约 1.16 s）由本固定间隔取代。取值 0.1 s 作保险余量，与副词条/set_option 连点口径一致。
 _STAGE_ADD_TO_UPGRADE_S = 0.1
 
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
@@ -515,7 +514,9 @@ class Runner:
 
     # ---------------------------------------------------------------- 就绪等待基础（§6）
 
-    #: §6.2 return_warehouse 每次 Esc 允许的更浅层进展（三条边）。
+    #: §6.2 return_warehouse 每次 Esc 允许的更浅层进展。
+    #: `("modal", "warehouse")`（弹层一脚直接到仓库）保留为可完成的结果：判层只回答这帧是哪层。
+    #: 2026-10-13 起它没有独立边名（`modal_warehouse` 已删），下限按发键前那层取 `modal_preview`。
     RETURN_EDGES: frozenset = frozenset(
         {("modal", "preview"), ("modal", "warehouse"), ("preview", "warehouse")}
     )
@@ -832,7 +833,7 @@ class Runner:
         def probe() -> readiness.WaitSample:
             frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
             captured = time.monotonic()
-            # 提速（2026-10-12 老大拍板）：固定坐标「阶段添加」按钮模板匹配判定就绪
+            # 固定坐标「阶段添加」按钮模板匹配判定就绪
             # （毫秒级，无 OCR/认页）。锚点取按钮文字带稳定子区——按钮上缘经验条与
             # 下缘有动画不能比，已避开。原 OCR 逻辑注释保留在下方，随时可还原。
             has_add = is_upgrade_stage_add(frame)
@@ -1683,7 +1684,7 @@ class Runner:
 
         # 滚轮协议必须在设置筛选之前备好：标定要选第 3 行的盘做锚点，而筛选会把列表
         # 裁短（实测只剩 16/3000，从第 3 行起全是空格），空行选不中锚点，标定必失败。
-        with self.stats.timed("导航", "滚轮协议准备"):
+        with self.stats.timed("导航", "滚轮协议准备(后续有内存加速)"):
             self._ensure_profile(hwnd)
 
         image, page, method, _hwnd = self._grab()
@@ -1795,6 +1796,8 @@ class Runner:
                     skips,
                     len(deferred),
                     max_index=max((cell.global_index for cell in cells), default=None),
+                    # 同一帧读到的游戏标题数量才是「筛选后总盘数」；扫到的最深序号只是下界。
+                    total=self._last_count,
                 )
             for cell in deferred:
                 state.block(cell.global_index, CellStatus.DEFERRED)
@@ -1864,7 +1867,8 @@ class Runner:
             for cell in pending:
                 self._checkpoint()
                 if self._job_limit_reached():
-                    self._log_job_limit_reached()
+                    # 这里只停止继续取本批的格位；「达到上限、收工」统一由下面收工点
+                    # 记一次。两处都记会让批中途用满额度时留下两条同样的收工记录。
                     break
                 result = self._process_cell(
                     hwnd, job, state, cell, sub_preset, accepted_ids, up_counts
@@ -3130,12 +3134,12 @@ class Runner:
     # 「等级00」整行读成「00碳美」之类的废字（2026-10-02 真机第 6 轮 R5C5 实测，
     # 同一布局下 (1100,150,1550,300) 误读、本框在 zoom-preview / 满级页 / 失败现场三张真机图上均正确）。
     ZOOM_LEVEL_AREA = (1150, 170, 1500, 280)
-    # 强化页按钮区（老大 2026-09-06 实拍截图标定）：
+    # 强化页按钮区（实拍截图标定）：
     # 「阶段添加」中心≈(1282,866)，「升级」中心≈(1511,866)。旧区 y=860 起把按钮拦腰切断导致 OCR 认不出。
     STAGE_ADD_AREA = (1150, 800, 1420, 940)
     UPGRADE_CONFIRM_AREA = (1420, 800, 1650, 940)
     #: 「升级」按钮的**硬编码点击中心**（设计坐标，`scale_point` 按客户区缩放）。
-    #: 2026-10-12 作者裁定：阶段添加后不必等动画，**直接点**，不再抓帧 + OCR 找文字。
+    #: 阶段添加后不必等动画，**直接点**，不再抓帧 + OCR 找文字。
     #: 取值用 2026-09-06 实拍标定的按钮中心 (1511,866)；真机日志里按 OCR 文字中心点出的
     #: 实际坐标是 (1532,867)，两者相差 21px，同在按钮内。按钮位置固定，无需每次识别。
     UPGRADE_BUTTON_CENTER = (1511, 866)
@@ -3218,7 +3222,7 @@ class Runner:
         """所有弃置标签增删的统一入口。
 
         「判断后打上弃置标记」关闭时只不发 R：盘锁着、又要打弃置的，仍照旧先按 T
-        解锁（2026-10-12 作者裁定）；摘标记（``value=False``，进强化页前那一步）
+        解锁；摘标记（``value=False``，进强化页前那一步）
         属于强化流程，开关关闭也照常执行。读数拿不准不为一个不发的键停链。
         """
         skip_mark = value and not self.preset.labels.allows("discard")
@@ -3457,7 +3461,7 @@ class Runner:
         # 点①前截图留档（OCR 找「查看/强化」按钮用的那一帧，即点击前画面）。
         self.trace.ok("detail", "step-open-preview", "点「查看/强化」前截图", image=image)
 
-        # ===== 临时提速（2026-10-12 老大拍板）：open_preview 之后到点箭头之间只保留等待，
+        # ===== 提速：open_preview 之后到点箭头之间只保留等待，
         # ===== 原判定/定位动作整段注释停用（保留在下方，随时可还原）。
         # 原逻辑 A：open_preview 就绪轮询——每轮 grab + 判层级/读等级的多次 OCR 判定，
         #           真机实测 ~1.3s/轮 × 连续 2 帧稳定（慢的是逐轮 OCR 判定，不是模板匹配）。
@@ -3547,16 +3551,15 @@ class Runner:
 
         §6.2/§4.3：调用开始清空素材/升级释放回执；素材输入前取得 before_frame。
 
-        **2026-10-12 改动（作者裁定）**：素材输入（「阶段添加」）后**不再做 `material_ready`
-        就绪等待**，只等固定 `_STAGE_ADD_TO_UPGRADE_S` 就去找并点「升级」。理由：阶段添加
-        后的动画不必等画面稳定，点「升级」会让动画立刻结束、结果一样；素材是否到位也不用
-        确认。原文"按释放点执行 material_ready、完成后才定位并点击一次「升级」"已作废。
+        素材输入（「阶段添加」）后**不再做 `material_ready` 就绪等待**，只等固定
+        `_STAGE_ADD_TO_UPGRADE_S` 就去找并点「升级」：阶段添加后的动画不必等画面稳定，
+        点「升级」会让动画立刻结束、结果一样；素材是否到位也不用确认。
         该动作的释放点仍供 ``_upgrade_loop`` 的 upgrade_result 使用。
         material_slot>0 是测试入口，走 _pick_material（那条路径仍消费 material_ready）。
 
-        2026-10-12 追加（作者裁定）：「升级」改为**直接点硬编码中心**
-        ``UPGRADE_BUTTON_CENTER``，不再抓帧 + OCR 找「升级」文字——按钮位置固定。
-        至此阶段添加与升级之间只剩 ``_STAGE_ADD_TO_UPGRADE_S`` 一个固定间隔。
+        「升级」**直接点硬编码中心** ``UPGRADE_BUTTON_CENTER``，不再抓帧 + OCR 找
+        「升级」文字——按钮位置固定。阶段添加与升级之间只剩 ``_STAGE_ADD_TO_UPGRADE_S``
+        一个固定间隔。
         """
         from zzz_ddtool.ocr import read_rect
 
@@ -3578,8 +3581,8 @@ class Runner:
             raise RunnerError("素材输入未成功发出，无法确认素材准备就绪，停止任务链")
         # 固定间隔替代原 material_ready 就绪等待：不等动画、不等素材条变化。
         time.sleep(_STAGE_ADD_TO_UPGRADE_S)
-        # 「升级」直接点硬编码中心：不抓帧、不做 OCR 找文字。按钮位置固定，
-        # 2026-10-12 作者裁定（阶段添加后动画不必等稳定，点下去动画即刻结束）。
+        # 「升级」直接点硬编码中心：不抓帧、不做 OCR 找文字。按钮位置固定；
+        # 阶段添加后不必等动画稳定，点下去动画即刻结束。
         ux, uy = scale_point(
             *self.UPGRADE_BUTTON_CENTER, before_frame.width(), before_frame.height()
         )

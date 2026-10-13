@@ -1,6 +1,6 @@
 """运行统计：把「这一轮都干了什么、花了多少时间」记下来。
 
-要回答的问题（老大 2026-10-04 提的）：
+要回答的问题：
     - 筛选后有多少格位？总计 / 跳过 / 实际处理各多少？
     - 每件盘升到几级？有几件满级保留？几件弃置？
     - 每个动作耗时多少（合计 / 平均 / 最快 / 最慢）？
@@ -155,7 +155,8 @@ class DiscStat:
 class JobStat:
     """一个任务的用量与格位计数。
 
-    slots 取「见过的最大全局序号 + 1」，也就是这个任务的筛选结果有多少个盘。
+    slots 取游戏标题栏读到的**筛选后总盘数**（含满级、锁定、弃置）；读不到时退回
+    「见过的最大全局序号 + 1」这个下界——它只说明扫到哪，不等于筛选结果有多少个盘。
     跳过去重（同一格位在相邻批次里会重复出现，用 set 收）。
     """
 
@@ -173,6 +174,15 @@ class JobStat:
     @property
     def skipped(self) -> int:
         return len(self.skip_indices)
+
+
+def unprocessed_of(job: JobStat) -> int:
+    """没被点开的盘数：筛选后总数 − 扫到并跳过的 − 已处理。负数按 0 收。
+
+    额度用满、页面到顶或用户中途停止都会留下这个差值；它包含没滚到的尾部，
+    不是「确定没被处理」的精确清单。
+    """
+    return max(0, int(job.slots) - int(job.skipped) - int(job.processed))
 
 
 class RunStats:
@@ -211,13 +221,15 @@ class RunStats:
     def _job(self) -> JobStat | None:
         return self.jobs[-1] if self.jobs else None
 
-    def scan(self, cells, skips, deferred: int, max_index: int | None = None) -> None:
+    def scan(self, cells, skips, deferred: int, max_index: int | None = None,
+             total: int | None = None) -> None:
         """记一批扫描结果。
 
         cells：本批可见格位数（跨批会重复，只用来做参考量）。
         skips：本批跳过的 {序号: 原因}，按序号去重后才是真正的「跳过多少」。
         deferred：本批挂起的边界行格位数。
-        max_index：本批见过的最小/最大全局序号里最大的那个，用来推这个任务有多少格位。
+        max_index：本批见过的最小/最大全局序号里最大的那个，用来兜底格位数。
+        total：同一帧读到的游戏标题数量（筛选后总盘数）。读不到传 None。
         """
         job = self._job
         if job is None:
@@ -230,6 +242,10 @@ class RunStats:
         job.deferred = max(job.deferred, int(deferred))
         if max_index is not None:
             job.slots = max(job.slots, int(max_index) + 1)
+        if total is not None:
+            # 读到的总数才是筛选结果有多少个盘；取大值是为了读花时不吃亏，
+            # 也保住任务开始时的口径（中途数量变化不把筛选后总数改小）。
+            job.slots = max(job.slots, int(total))
 
     def disc_begin(self, job, index: int, level: int, name: str = "", *,
                    slot: int = 0, sets: tuple[str, ...] = (), line_count: int = 0) -> int:
@@ -386,6 +402,7 @@ class RunStats:
                     "skipped": j.skipped,
                     "deferred": j.deferred,
                     "processed": j.processed,
+                    "unprocessed": unprocessed_of(j),
                 }
                 for j in self.jobs
             ],
@@ -394,6 +411,7 @@ class RunStats:
                 "slots": sum(j.slots for j in self.jobs),
                 "skipped": sum(j.skipped for j in self.jobs),
                 "processed": len(self.discs),
+                "unprocessed": sum(unprocessed_of(j) for j in self.jobs),
             },
             "outcomes": counts,
             "max_level_kept": max_level_kept,
@@ -465,14 +483,15 @@ class RunStats:
         log.info("─" * 28 + " 本轮统计 " + "─" * 28)
         log.info("%s", self.headline())
         log.info(
-            "    （任务 %d 个 · 筛选后合计 %d 个盘 · 跳过 %d）",
+            "    （任务 %d 个 · 筛选后合计 %d 个盘 · 跳过 %d · 未处理 %d）",
             totals["jobs"],
             totals["slots"],
             totals["skipped"],
+            totals["unprocessed"],
         )
         for job in data["jobs"]:
             log.info(
-                "    任务%d(%s号位%s%s) · 筛选后 %d 个 · 跳过 %d · 处理 %d · 用时 %.1fs",
+                "    任务%d(%s号位%s%s) · 筛选后 %d 个 · 跳过 %d · 处理 %d · 未处理 %d · 用时 %.1fs",
                 job["index"],
                 job["slot"],
                 " 套装" + "、".join(job["sets"]) if job["sets"] else "",
@@ -480,6 +499,7 @@ class RunStats:
                 job["slots"],
                 job["skipped"],
                 job["processed"],
+                job["unprocessed"],
                 job["seconds"],
             )
         log.info(
@@ -598,14 +618,15 @@ class RunStats:
             f"| 筛选后合计 | {totals['slots']} 个盘 |",
             f"| 扫描跳过 | {totals['skipped']} 个 |",
             f"| 处理 | {totals['processed']} 个 |",
+            f"| 未处理 | {totals['unprocessed']} 个 |",
             f"| 升满成功 | {data['max_level_kept']} 件 |",
             f"| 判定弃置 | {counts[OUTCOME_DISCARDED]} 件 |",
             f"| 总耗时 | {format_duration(data['seconds'])} |",
             "",
             "## 逐任务",
             "",
-            "| # | 号位 | 套装 | 主词条 | 筛选后 | 跳过 | 处理 | 用时 |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| # | 号位 | 套装 | 主词条 | 筛选后 | 跳过 | 处理 | 未处理 | 用时 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for job in data["jobs"]:
             lines.append(
@@ -613,6 +634,7 @@ class RunStats:
                 f"{'、'.join(job['sets']) or '不限'} | "
                 f"{'、'.join(job['mainstats']) or '不限'} | "
                 f"{job['slots']} | {job['skipped']} | {job['processed']} | "
+                f"{job['unprocessed']} | "
                 f"{format_duration(job['seconds'])} |"
             )
         lines += [
@@ -707,6 +729,10 @@ class RunStats:
         lines += [
             "## 说明",
             "",
+            "- 「筛选后」是游戏标题栏读到的筛选后总盘数（含满级、锁定、弃置），"
+            "不是本轮扫到多深；读不到时退回「扫过的最深格位序号 + 1」。",
+            "- 「未处理」= 筛选后 − 扫描跳过 − 处理，即本轮没被点开的盘"
+            "（含额度用满后没滚到的尾部）。",
             "- 长动作与步骤耗时口径不同，**会重叠，别相加**。",
             f"- 「升满成功」= {KEPT_NOTE}；「判定弃置」= {DISCARD_NOTE}。",
             "",

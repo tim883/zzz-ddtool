@@ -46,9 +46,9 @@ def test_low_confidence_keeps_both_states_unknown(monkeypatch, score):
 
 
 @pytest.mark.parametrize("relative,expected", [
-    ("手册/参考图/驱动盘仓库/列表与侧栏.png", {"locked": True, "discarded": False}),
-    ("手册/参考图/驱动盘详情/首档复用-侧栏盘面.png", {"locked": False, "discarded": False}),
-    ("手册/参考图/驱动盘仓库/标签-已弃置.png", {"locked": False, "discarded": True}),
+    ("tests/fixtures/驱动盘仓库/列表与侧栏.png", {"locked": True, "discarded": False}),
+    ("tests/fixtures/驱动盘详情/首档复用-侧栏盘面.png", {"locked": False, "discarded": False}),
+    ("tests/fixtures/驱动盘仓库/标签-已弃置.png", {"locked": False, "discarded": True}),
 ])
 def test_fast_label_archive_replay(relative, expected):
     path = Path(__file__).resolve().parents[1] / relative

@@ -1,4 +1,4 @@
-﻿"""执行器回归：全局格位遍历、扫描跳过、进度提交、白名单与失败传播。
+"""执行器回归：全局格位遍历、扫描跳过、进度提交、白名单与失败传播。
 
 替身网格模拟 4 行视口、可配置总行数的仓库；真实 OCR/输入/窗口接口全部替换，
 不发送任何真实游戏输入。
@@ -471,12 +471,46 @@ def test_invalid_max_pages_fails_without_input(offline_runner, monkeypatch):
 
 def test_max_discs_stops_mid_batch_without_scrolling(offline_runner, monkeypatch):
     runner = Runner(Preset(max_discs=5, accepted=()), hotkeys=False)
+    runner.log = Mock()
     grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=6))
     monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
     monkeypatch.setattr(runner, "_act", Mock())
     runner.run()
     assert runner.outcome == "completed"
     assert runner.processed_disc_count == 5
+    assert grid.visited == [(0, c) for c in range(5)]
+    # 额度在批中途用满：本批只能跳出一次，收工记录也只能有一条。
+    quota_lines = [
+        call.args[0] for call in runner.log.info.call_args_list
+        if call.args and "达到上限" in str(call.args[0])
+    ]
+    assert len(quota_lines) == 1
+
+
+def test_scan_hands_the_game_reported_total_to_stats(offline_runner, monkeypatch):
+    """统计的「筛选后」用游戏报的总数：runner 要把同一帧读到的数量交给 stats。
+
+    数量本身怎么读出来由真图用例覆盖（`test_restore_single_screen_upgrade_replay`
+    断言 `_last_count == 34`）；这里只钉住「读到的数有没有传下去」这一跳。
+    """
+    runner = Runner(Preset(max_discs=5, accepted=()), hotkeys=False)
+    grid = wire_grid(runner, monkeypatch, FakeGrid(total_rows=6))
+    stub_scan = runner._scan_cells
+
+    def scan_with_count(state, **kwargs):
+        runner._last_count = 107  # 真扫描会在这一步读标题栏数量
+        return stub_scan(state, **kwargs)
+
+    monkeypatch.setattr(runner, "_scan_cells", scan_with_count)
+    monkeypatch.setattr(runner, "_parse_disc", lambda image: sample_disc())
+    monkeypatch.setattr(runner, "_act", Mock())
+    runner.run()
+
+    job = runner.stats.summary()["jobs"][0]
+    assert runner.outcome == "completed"
+    assert job["slots"] == 107  # 不是扫到的 6
+    assert job["processed"] == 5
+    assert job["unprocessed"] == 102  # 107 − 0 − 5
     assert grid.visited == [(0, c) for c in range(5)]
 
 
@@ -1146,7 +1180,7 @@ def test_upgrade_page_fails_when_both_layouts_unreadable(offline_runner, monkeyp
 def test_upgrade_button_missing_does_not_click_next(offline_runner, monkeypatch, missing, clicks, expected):
     """2026-10-12 改动：素材区没有「阶段添加」→ 不发任何输入、返回 False。
 
-    「升级」自本次改动起**直接点硬编码中心**（不抓帧、不 OCR，作者裁定），所以
+    「升级」**直接点硬编码中心**（不抓帧、不 OCR），所以
     ``missing="confirm"`` 不再是"不点"的守卫，而是照点：阶段添加 1 次 + 升级 1 次。
     """
     runner = Runner(Preset(), hotkeys=False)
@@ -2086,7 +2120,7 @@ def test_restore_single_screen_upgrade_replay(monkeypatch):
     state.start_first_batch()
     runner._processed = 7
     runner._verified_upgrade_level = 3
-    paths = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘仓库"
+    paths = Path(__file__).resolve().parents[1] / "tests/fixtures/驱动盘仓库"
     before_image = QImage(str(paths / "升级前-34件-序号32.png"))
     after_image = QImage(str(paths / "升级后-34件-序号28.png"))
     assert not before_image.isNull() and not after_image.isNull()
@@ -2168,12 +2202,12 @@ def _position_column(phase):
 
 
 def test_recovery_column_position_replay():
-    """既有 1080p 参考图验证局部定位区域；不读取全网格，不进行游戏输入。"""
+    """既有 1080p 真机样本验证局部定位区域；不读取全网格，不进行游戏输入。"""
     runner = Runner(Preset(), hotkeys=False)
     runner._origin_center_y = 268.5
     runner._row_pitch = 174.5
     state = _single_screen_state(34, active_index=32)
-    path = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘仓库/升级后-34件-序号28.png"
+    path = Path(__file__).resolve().parents[1] / "tests/fixtures/驱动盘仓库/升级后-34件-序号28.png"
     image = QImage(str(path))
     assert not image.isNull()
     assert runner._recovery_position_reason(image, state) is None
@@ -2404,7 +2438,7 @@ def test_first_upgrade_reuses_only_once_and_times_full_stage(offline_runner, mon
 
 def test_archived_first_upgrade_frames_have_same_disc_data():
     """真实初始两页识别一致；图片缺失不能静默跳过。不是动态真机验收。"""
-    folder = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘详情"
+    folder = Path(__file__).resolve().parents[1] / "tests/fixtures/驱动盘详情"
     detail_image = QImage(str(folder / "首档复用-侧栏盘面.png"))
     upgrade_image = QImage(str(folder / "首档复用-强化未升级.png"))
     assert not detail_image.isNull() and not upgrade_image.isNull()

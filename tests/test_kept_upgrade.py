@@ -260,7 +260,7 @@ def test_finish_transport_errors_are_counted_failed(setup, monkeypatch, error):
 
 
 def test_archived_disc_data_keeps_upgrade_label_state_unknown():
-    base = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘详情"
+    base = Path(__file__).resolve().parents[1] / "tests/fixtures/驱动盘详情"
     # 完整盘面图没有仓库侧栏的文字提示，不能把未知当未锁定；收尾必须先回侧栏。
     for filename, level, locked in [("升满保留-初始未锁定.png", 0, False),
                                     ("升满保留-15级未锁定.png", 15, None)]:

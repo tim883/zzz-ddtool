@@ -22,13 +22,13 @@ from zzz_ddtool.ocr import (
     read_rect,
 )
 
-SAMPLE = Path(__file__).resolve().parents[1] / "手册" / "参考图" / "驱动盘详情" / "详情弹层.png"
+SAMPLE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "驱动盘详情" / "详情弹层.png"
 
 
 @pytest.fixture
 def sample_image() -> QImage:
     image = QImage(str(SAMPLE))
-    assert not image.isNull(), f"参考图缺失或无法解码：{SAMPLE}"
+    assert not image.isNull(), f"固定样本缺失或无法解码：{SAMPLE}"
     return image
 
 
@@ -261,7 +261,7 @@ def test_upgrade_level_digit_bottom_not_clipped() -> None:
 def test_read_action_state_uses_words_only_present_when_active(monkeypatch) -> None:
     """锁定/弃置各按「自己的提示里有没有生效词」判断，不整行乱认。
 
-    2026-10-05 真机 86 帧对账（log/debug/action-text-summary.txt）：未锁定 =
+    真机 86 帧对账：未锁定 =
     「T 锁定」、已锁定 =「T 解除锁定」；未弃置 =「R 弃置」、**已弃置 =「R 解除弃置」
     （不是旧文档写的「取消弃置」）**。旧写法整行见「解除」就判锁定，把 26/26 帧
     已弃置盘判成「已锁定、未弃置」——两个字都错。

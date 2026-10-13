@@ -25,7 +25,7 @@ DISMANTLE_FORBID = (210, 890, 460, 990)
 # FILTER_RESET=(1301,1033) 偏到重置按钮左缘图标；FILTER_SLOTS 整表偏到错误按钮上。
 FILTER_RESET = (1432, 1029)
 
-# 右侧详情面板。2026-09-06 OCR 实测（log/captures/detail-page.png + 老大截图）重新标定：
+# 右侧详情面板。OCR 实测标定：
 # 旧值 DISC_LEVEL/SUB_STATS 偏下约 150px，导致 parse_disc 读不到副属性。
 DETAIL_PANEL = (1400, 225, 1870, 800)
 DISC_NAME = (1400, 260, 1620, 315)
@@ -45,7 +45,7 @@ SUB_STAT_SPLIT_X = 1650
 WAREHOUSE_DISC_LEVEL = (1460, 398, 1610, 445)
 WAREHOUSE_SUB_STATS = (1410, 560, 1835, 765)
 
-# 强化页（点详情页「查看/强化」进入的弹层）。2026-09-06 OCR 实测老大截图：
+# 强化页（点详情页「查看/强化」进入的弹层），OCR 实测标定：
 # 副属性整体比详情页左移约 300px，判断要在这里做，必须用强化页自己的坐标。
 UPGRADE_SUB_STATS = (883, 419, 1692, 501)
 # 强化页等级条最左一格，装「当前等级」数字。2026-10-04 按真机实拍重新夹紧：

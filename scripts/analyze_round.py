@@ -26,12 +26,13 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 #: 层级边名（与 actionwait.RETURN_EDGE_IDS 一致，独立书写避免本脚本依赖 src）。
-_EDGES = ("modal_preview", "modal_warehouse", "preview_warehouse")
+#: 2026-10-13：`modal_warehouse` 删除（边名只按发键前那层取，生产路径选不到）。
+_EDGES = ("modal_preview", "preview_warehouse")
 
 #: 逐边运行时常量；与 runner._RETURN_EDGE_FLOOR_MS 同步，落后即视为已改代码。
+#: modal_preview 自 2026-10-13 起 = 实测 100 + runner 的 _MEASURED_SAFETY_MS（200）= 300。
 _RUNTIME_EDGE_FLOOR_MS = {
-    "modal_preview": 1680,
-    "modal_warehouse": 1680,
+    "modal_preview": 300,
     "preview_warehouse": 680,
 }
 
@@ -66,16 +67,15 @@ def _iter_inputs(rows: list[dict]) -> dict[str, dict]:
 def _edge_of(state_key: object) -> str | None:
     """从 wait 样本的 state_key 反推这次 Esc 所在的边。
 
-    state_key 形如 ``["return_warehouse", before_layer, after_layer]``；允许的三条边
-    由 before→after 唯一确定。构不出允许边（含 unknown）返回 None，按未知统计。
+    state_key 形如 ``["return_warehouse", before_layer, after_layer]``；当前两条边
+    由 before→after 唯一确定。构不出允许边（含 unknown，以及没有独立边名的
+    弹层→仓库）返回 None，按未知统计。
     """
     if not isinstance(state_key, list) or len(state_key) < 3:
         return None
     _kind, before, after = state_key[0], state_key[1], state_key[2]
     if before == "modal" and after == "preview":
         return "modal_preview"
-    if before == "modal" and after == "warehouse":
-        return "modal_warehouse"
     if before == "preview" and after == "warehouse":
         return "preview_warehouse"
     return None
@@ -193,7 +193,7 @@ def analyze(round_dir: Path) -> int:
         print(f"{edge:<20}{len(items):>5}{dur:>8.1f}{avg:>9.0f}{floor:>8}"
               f"{probes_n:>6}{f'{first_ready}/{len(items)}':>10}  {verdict}")
     if unknown:
-        print(f"{'(未知边)':<20}{unknown:>5}   ← state_key 构不出允许边，按未知统计")
+        print(f"{'(未知边)':<20}{unknown:>5}   ← 构不成当前两条允许边（含弹层→仓库，已无独立边名），按未知统计")
     per_disc = total_esc / max(1, len(by_edge.get("modal_preview") or []))
     print(f"\n  各边合计 {total_esc:.1f}s；按每件强化盘 2 次 Esc 计约 {per_disc:.1f}s/件")
 

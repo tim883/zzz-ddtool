@@ -1,10 +1,11 @@
 """游戏画面上的状态悬浮层（Win32 分层窗口 + GDI，纯 ctypes，零依赖）。
 
 技术来自 March7thAssistant debug_overlay：
-- WS_EX_LAYERED + LWA_ALPHA：深色半透明背景，确保日志可读
+- WS_EX_LAYERED + LWA_COLORKEY：底色键透明，只有白字浮在游戏画面上
 - WS_EX_TRANSPARENT + WM_NCHITTEST→HTTRANSPARENT：鼠标完全穿透到游戏
 - WS_EX_TOPMOST + SWP_NOACTIVATE：浮在游戏上但不抢焦点
 - 后台线程消息循环 + WM_PAINT 里 GDI 绘制
+- 每 FOLLOW_INTERVAL_MS 跟随游戏客户区；游戏最小化/隐藏/不是前台窗口时隐藏
 
 为什么不影响截图：这是独立悬浮窗口，capture 的 PrintWindow(游戏hwnd)
 只渲染游戏窗口自身表面，拍不到本层，OCR 零污染。
@@ -22,6 +23,7 @@ MAX_LINES = 9
 LINE_H = 24
 FONT_H = 17
 TEXT_COLOR = 0x00FFFFFF  # COLORREF 白
+KEY_COLOR = 0x00202020  # COLORREF：_paint 用它填满整幅底，该色像素在色键模式下全透明
 
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
@@ -44,8 +46,12 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 WM_UPDATE = 0x8001
 WM_HIDE = 0x8002
 WM_TIMER = 0x0113
-FOLLOW_INTERVAL_MS = 100
+#: 跟随游戏窗口的轮询间隔（毫秒）。16ms 已经贴着系统定时器粒度（约 15.6ms），再调小
+#: 没有意义；旧的 100ms 在 60Hz 下等于落后 6 帧，拖动窗口时肉眼看到的就是拖影。
+FOLLOW_INTERVAL_MS = 16
 NONANTIALIASED_QUALITY = 3  # 关抗锯齿，避免颜色键窗口文字边缘杂色
+LWA_COLORKEY = 0x00000001
+GA_ROOT = 2  # GetAncestor 的 gaFlags
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -133,6 +139,9 @@ _bind(user32, "ShowWindow", [wintypes.HWND, ctypes.c_int], wintypes.BOOL)
 _bind(user32, "IsWindowVisible", [wintypes.HWND], wintypes.BOOL)
 _bind(user32, "IsWindow", [wintypes.HWND], wintypes.BOOL)
 _bind(user32, "IsIconic", [wintypes.HWND], wintypes.BOOL)
+# 不声明 argtypes/restype 的话句柄会被截成 c_int，64 位上随时读错窗口。
+_bind(user32, "GetForegroundWindow", [], wintypes.HWND)
+_bind(user32, "GetAncestor", [wintypes.HWND, ctypes.c_uint], wintypes.HWND)
 _bind(user32, "GetClientRect", [wintypes.HWND, ctypes.POINTER(RECT)], wintypes.BOOL)
 _bind(user32, "GetWindowRect", [wintypes.HWND, ctypes.POINTER(RECT)], wintypes.BOOL)
 _bind(user32, "SetTimer", [wintypes.HWND, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p], ctypes.c_size_t)
@@ -171,12 +180,18 @@ _last_geometry = None
 _wanted_visible = False
 _wda_active = False  # 浮层已设为「不参与屏幕捕获」（Win10 2004+ / Win11 支持）
 _capture_hidden = False  # 截图期间临时隐藏浮层（WDA 不可用时的兜底）
+# 离屏 DC + 位图复用：跟随提到 ~60Hz 后，每帧新建约 1MB 位图是纯浪费。
+_paint_dc = None
+_paint_bmp = None
+_paint_old_bmp = None
+_paint_size = None  # 缓存对应的 (_screen_w, _screen_h)
+_paint_cache_warned = False
 
 
 def _make_font() -> int:
     return gdi32.CreateFontW(
         -FONT_H, 0, 0, 0,
-        700,  # FW_BOLD
+        400,  # FW_NORMAL（不加粗）
         0, 0, 0,
         1,  # DEFAULT_CHARSET
         0, 0,
@@ -186,12 +201,54 @@ def _make_font() -> int:
     )
 
 
+def _discard_paint_cache() -> None:
+    """释放复用的离屏 DC 与位图（换宽度或窗口销毁时）。位图要先选出去再删。"""
+    global _paint_dc, _paint_bmp, _paint_old_bmp, _paint_size
+    if _paint_dc and _paint_old_bmp:
+        gdi32.SelectObject(_paint_dc, _paint_old_bmp)
+    if _paint_bmp:
+        gdi32.DeleteObject(_paint_bmp)
+    if _paint_dc:
+        gdi32.DeleteDC(_paint_dc)
+    _paint_dc = None
+    _paint_bmp = None
+    _paint_old_bmp = None
+    _paint_size = None
+
+
+def _ensure_paint_cache(hdc: wintypes.HDC) -> None:
+    """复用离屏 DC 与位图，只在尺寸变化时重建（跟随频率高，每帧新建太浪费）。"""
+    global _paint_dc, _paint_bmp, _paint_old_bmp, _paint_size, _paint_cache_warned
+    size = (_screen_w, _screen_h)
+    if _paint_size == size and _paint_dc:
+        return
+    _discard_paint_cache()
+    mem_dc = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, _screen_w, _screen_h) if mem_dc else None
+    if not mem_dc or not bmp:
+        if bmp:
+            gdi32.DeleteObject(bmp)
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+        if not _paint_cache_warned:
+            _paint_cache_warned = True
+            from zzz_ddtool.logutil import get_logger
+
+            get_logger("zzz_ddtool.overlay").warning("离屏位图创建失败，悬浮日志画不出来")
+        return
+    _paint_old_bmp = gdi32.SelectObject(mem_dc, bmp)
+    _paint_dc = mem_dc
+    _paint_bmp = bmp
+    _paint_size = size
+
+
 def _paint(hdc: wintypes.HDC) -> None:
     global _font
-    mem_dc = gdi32.CreateCompatibleDC(hdc)
-    bmp = gdi32.CreateCompatibleBitmap(hdc, _screen_w, _screen_h)
-    old_bmp = gdi32.SelectObject(mem_dc, bmp)
-    key_brush = gdi32.CreateSolidBrush(0x00202020)
+    _ensure_paint_cache(hdc)
+    mem_dc = _paint_dc
+    if not mem_dc:
+        return
+    key_brush = gdi32.CreateSolidBrush(KEY_COLOR)
     full = RECT(0, 0, _screen_w, _screen_h)
     user32.FillRect(mem_dc, ctypes.byref(full), key_brush)
     gdi32.DeleteObject(key_brush)
@@ -208,9 +265,6 @@ def _paint(hdc: wintypes.HDC) -> None:
         gdi32.TextOutW(mem_dc, ox + 12, oy + 8 + i * LINE_H, buf, len(line))
     gdi32.SelectObject(mem_dc, old_font)
     gdi32.BitBlt(hdc, 0, 0, _screen_w, _screen_h, mem_dc, 0, 0, 0x00CC0020)  # SRCCOPY
-    gdi32.SelectObject(mem_dc, old_bmp)
-    gdi32.DeleteObject(bmp)
-    gdi32.DeleteDC(mem_dc)
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
@@ -284,7 +338,9 @@ def _window_loop() -> None:
         _ready.set()
         return
     _hwnd = hwnd
-    user32.SetLayeredWindowAttributes(hwnd, 0, 220, 2)  # 深色半透明背景，保证文字可读
+    # 底色键透明：整幅底填成 KEY_COLOR，键色像素全透明，只有白字浮在游戏画面上。
+    # 不用整体 LWA_ALPHA——那会把背景一起压成一块半透明深色板子，拖窗口时非常显眼。
+    user32.SetLayeredWindowAttributes(hwnd, KEY_COLOR, 0, LWA_COLORKEY)
     # 浮层不进入屏幕捕获：截图走屏幕 BitBlt 时会把它一起截进去，污染 OCR。
     # 设为 excluded 后用户仍照常看到浮层，但截图里没有它（Win10 2004+ / Win11）。
     # 老系统（Win10 2004 之前）不支持，置 _wda_active=False，改由截图侧临时隐藏兜底。
@@ -313,6 +369,7 @@ def _window_loop() -> None:
         if _font:
             gdi32.DeleteObject(_font)
             _font = None
+        _discard_paint_cache()
         user32.UnregisterClassW(CLASS_NAME, wc.hInstance)
 
 
@@ -326,8 +383,25 @@ def _ensure_window() -> bool:
         return _ready.wait(3) and _hwnd is not None
 
 
+def _game_in_foreground(hwnd) -> bool:
+    """游戏是不是当前前台窗口的根窗口。
+
+    切走（Alt+Tab、点别的窗口、Win+D 回桌面）时游戏既没最小化也没被隐藏，只看
+    IsIconic/IsWindowVisible 会让浮层继续压在别人窗口上面，所以用前台判据补齐。
+    取根窗口，是因为前台可能是游戏的子窗口或弹出窗口，那时仍算「在游戏里」。
+    读不到前台时按「在游戏里」处理：宁可多显示，也不要把日志无声地吞掉。
+    """
+    try:
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
+            return False
+        return int(user32.GetAncestor(foreground, GA_ROOT)) == int(hwnd)
+    except Exception:
+        return True
+
+
 def _refresh_game_origin() -> bool:
-    """定时跟随客户区，仅几何变化时移动；目标隐藏/最小化时隐藏日志。"""
+    """定时跟随客户区，仅几何变化时移动；目标最小化/隐藏/不是前台时隐藏日志。"""
     global _target_hwnd, _last_geometry, _screen_w
     try:
         from zzz_ddtool.capture import find_game_hwnd
@@ -336,7 +410,11 @@ def _refresh_game_origin() -> bool:
             _target_hwnd = find_game_hwnd()
             _last_geometry = None
         hwnd = _target_hwnd
-        if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+        if (
+            user32.IsIconic(hwnd)
+            or not user32.IsWindowVisible(hwnd)
+            or not _game_in_foreground(hwnd)
+        ):
             return False
         pt = wintypes.POINT(0, 0)
         rect = RECT()

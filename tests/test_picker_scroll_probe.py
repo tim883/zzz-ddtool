@@ -148,10 +148,10 @@ def test_unknown_top_state_stops_without_scrolling(setup, monkeypatch):
 
 
 @pytest.mark.parametrize("path,visible,expected", [
-    ("手册/参考图/驱动盘仓库/列表与侧栏.png", False, True),
-    ("手册/参考图/驱动盘筛选/套装弹窗-确认后.png", True, True),
-    ("手册/参考图/驱动盘筛选/套装弹窗-顶部.png", False, False),
-    ("手册/参考图/驱动盘筛选/套装弹窗-顶部.png", True, False),
+    ("tests/fixtures/驱动盘仓库/列表与侧栏.png", False, True),
+    ("tests/fixtures/驱动盘筛选/套装弹窗-确认后.png", True, True),
+    ("tests/fixtures/驱动盘筛选/套装弹窗-顶部.png", False, False),
+    ("tests/fixtures/驱动盘筛选/套装弹窗-顶部.png", True, False),
 ])
 def test_warehouse_entry_uses_positive_page_evidence_not_popup_band(setup, path, visible, expected):
     _, probe, _, _ = setup

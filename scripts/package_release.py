@@ -1,6 +1,6 @@
 """把 ``build.py`` 的产物打成发布 zip。
 
-两个包，命名与语义对齐发版手册 §3：
+两个包，命名与语义对齐 ``docs/技术/打包与发布.md`` 第 3 节：
 
 - **程序包** ``zzz-ddtool-v<version>.zip``：根 = 包目录内容（exe / ``_internal/`` / ``data/`` / ``version.txt``）
 - **数据包** ``data.zip``：根 = ``data/`` 里的内容

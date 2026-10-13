@@ -120,6 +120,69 @@ def test_scan_counts_are_per_job_and_deduped() -> None:
     assert totals["jobs"] == 2
 
 
+def test_slots_follow_the_game_reported_total() -> None:
+    """筛选后总数取游戏标题数，不是「扫到多深」。
+
+    额度用满时扫到的最深序号远小于总数；总数读不到（None）才退回深度下界。
+    """
+    st = S.RunStats(tag="t")
+    st.job_begin(1, 1, (), ())
+    st.scan(["c"] * 36, {i: "满级" for i in range(20)}, 9, max_index=35, total=107)
+    for index in range(20, 35):
+        slot = st.disc_begin("j1", index, 0)
+        st.disc_end(slot, S.OUTCOME_DISCARDED, 0)
+    st.job_end(1.0, 15)
+
+    st.job_begin(2, 2, (), ())
+    st.scan(["c"] * 36, {}, 0, max_index=35)  # 标题数读不到：只能用深度
+    for index in range(36, 51):
+        slot = st.disc_begin("j2", index, 0)
+        st.disc_end(slot, S.OUTCOME_DISCARDED, 0)
+    st.job_end(1.0, 15)
+
+    data = st.summary()
+    first, second = data["jobs"]
+    assert first["slots"] == 107  # 不是 36
+    assert first["skipped"] == 20
+    assert first["processed"] == 15
+    assert first["unprocessed"] == 72  # 107 − 20 − 15
+    assert second["slots"] == 36
+    assert second["unprocessed"] == 21  # 36 − 0 − 15
+
+    totals = data["totals"]
+    assert totals["slots"] == 143
+    assert totals["processed"] == 30
+    # 总览三列要对得上账：筛选后 − 跳过 − 处理 = 未处理
+    assert totals["slots"] - totals["skipped"] - totals["processed"] == totals["unprocessed"] == 93
+
+
+def test_report_and_log_list_the_unprocessed_remainder(caplog) -> None:
+    """总览要有「未处理」一行、逐任务要有一列，日志摘要也要带出来。"""
+    st = S.RunStats(tag="t")
+    st.job_begin(1, 1, (), ())
+    st.scan(["c"] * 36, {i: "满级" for i in range(20)}, 9, max_index=35, total=107)
+    for index in range(20, 35):
+        slot = st.disc_begin("j1", index, 0)
+        st.disc_end(slot, S.OUTCOME_DISCARDED, 0)
+    st.job_end(1.0, 15)
+    st.seconds = 60.0
+
+    text = st.report_text()
+    assert "| 筛选后合计 | 107 个盘 |" in text
+    assert "| 扫描跳过 | 20 个 |" in text
+    assert "| 处理 | 15 个 |" in text
+    assert "| 未处理 | 72 个 |" in text
+    assert "| 107 | 20 | 15 | 72 |" in text  # 逐任务那一行
+    assert "不是本轮扫到多深" in text
+
+    with caplog.at_level(logging.INFO):
+        st.log_summary(logging.getLogger("stats_remainder"))
+    assert any(
+        "筛选后合计 107 个盘 · 跳过 20 · 未处理 72" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_scan_without_job_is_ignored() -> None:
     st = S.RunStats(tag="t")
     st.scan(["c"], {}, 0, max_index=0)

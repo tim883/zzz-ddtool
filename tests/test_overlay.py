@@ -66,6 +66,8 @@ def test_overlay_follows_without_new_logs_and_restores(monkeypatch):
         find.append(target)
         return target
 
+    # 前台判据：本测试的假目标永远不会成为前台窗口，这里显式放行，另单独验证。
+    monkeypatch.setattr(overlay, "_game_in_foreground", lambda hwnd: True)
     monkeypatch.setattr("zzz_ddtool.capture.find_game_hwnd", find_game)
 
     def geometry():
@@ -82,6 +84,11 @@ def test_overlay_follows_without_new_logs_and_restores(monkeypatch):
         overlay.user32.ShowWindow(target, 0)
         wait_until(lambda: not overlay.user32.IsWindowVisible(overlay._hwnd))
         overlay.user32.ShowWindow(target, 4)
+        wait_until(lambda: overlay.user32.IsWindowVisible(overlay._hwnd))
+        # 前台判据：不是前台（Alt+Tab / 切走）就隐藏，回到前台再出现。
+        monkeypatch.setattr(overlay, "_game_in_foreground", lambda hwnd: False)
+        wait_until(lambda: not overlay.user32.IsWindowVisible(overlay._hwnd))
+        monkeypatch.setattr(overlay, "_game_in_foreground", lambda hwnd: True)
         wait_until(lambda: overlay.user32.IsWindowVisible(overlay._hwnd))
         overlay.overlay_hide()
         wait_until(lambda: not overlay.user32.IsWindowVisible(overlay._hwnd))

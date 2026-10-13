@@ -106,7 +106,10 @@ def _assert_rejected_before_cleanup(monkeypatch, output: Path | str) -> None:
     package.assert_not_called()
 
 
-@pytest.mark.parametrize("output", ["..", ".git", ".venv", "src", "tests", "scripts", "data", "user", "手册", "dev-docs", "build"])
+@pytest.mark.parametrize(
+    "output",
+    ["..", ".git", ".venv", "src", "tests", "scripts", "data", "user", "docs", "docs/技术", "dev-docs", "dev-docs/功能改造", "build"],
+)
 def test_protected_output_is_rejected_before_any_cleanup(tmp_path: Path, monkeypatch, output) -> None:
     root = tmp_path / build.PKG_NAME
     root.mkdir()
@@ -114,6 +117,75 @@ def test_protected_output_is_rejected_before_any_cleanup(tmp_path: Path, monkeyp
     monkeypatch.setattr(build, "ROOT", root)
     _assert_rejected_before_cleanup(monkeypatch, output)
     assert (root / "pyproject.toml").is_file()
+
+
+@pytest.mark.parametrize("relative", ["../dev-docs", "../dev-docs/功能改造", "../dev-docs/功能改造/主题"])
+def test_sibling_dev_docs_output_is_rejected_before_any_cleanup(tmp_path: Path, monkeypatch, relative) -> None:
+    """源码根同级的开发资料目录（含不存在的路径）不能作为打包输出。"""
+    root = tmp_path / "repo" / build.PKG_NAME
+    root.mkdir(parents=True)
+    _fake_repo(root)
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, relative)
+
+
+def test_sibling_dev_docs_absolute_output_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    """绝对路径表示同样被拒绝，且已存在的开发资料一个字节都不动。"""
+    root = tmp_path / "repo" / build.PKG_NAME
+    root.mkdir(parents=True)
+    _fake_repo(root)
+    sibling = tmp_path / "repo" / "dev-docs"
+    (sibling / "功能改造" / "主题").mkdir(parents=True)
+    spec = sibling / "功能改造" / "主题" / "Spec.md"
+    spec.write_text("私有资料", encoding="utf-8")
+    monkeypatch.setattr(build, "ROOT", root)
+    _assert_rejected_before_cleanup(monkeypatch, sibling)
+    _assert_rejected_before_cleanup(monkeypatch, sibling / "功能改造")
+    assert spec.read_text(encoding="utf-8") == "私有资料"
+
+
+def test_sibling_protection_follows_relocated_source_root(tmp_path: Path, monkeypatch) -> None:
+    """保护按「源码根的同级」重新定位，不记着搬家前的旧路径。"""
+    old_root = tmp_path / "old" / build.PKG_NAME
+    old_root.mkdir(parents=True)
+    _fake_repo(old_root)
+    moved = tmp_path / "moved" / "deeper" / build.PKG_NAME
+    moved.mkdir(parents=True)
+    _fake_repo(moved)
+    monkeypatch.setattr(build, "ROOT", moved)
+
+    _assert_rejected_before_cleanup(monkeypatch, tmp_path / "moved" / "deeper" / "dev-docs")
+    _assert_rejected_before_cleanup(monkeypatch, "../dev-docs")
+
+
+def test_source_root_move_keeps_normal_output_working(tmp_path: Path, monkeypatch) -> None:
+    """源码根换到一个全新的同级目录后，不重叠的外部输出仍然可用。"""
+    moved = tmp_path / "moved" / "deeper" / build.PKG_NAME
+    moved.mkdir(parents=True)
+    _fake_repo(moved)
+    monkeypatch.setattr(build, "ROOT", moved)
+    allowed = tmp_path / "release"
+    _stub_pyinstaller(monkeypatch, allowed)
+    assert build.main(["--outdir", str(allowed)]) == 0
+    assert (allowed / build.PKG_NAME / "zzz-ddtool.exe").is_file()
+
+
+def test_package_target_containing_linked_dev_docs_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    """链接解析后外层开发目录落进包目标内部时，同样在任何清理前拒绝。"""
+    root = tmp_path / "source"
+    root.mkdir()
+    _fake_repo(root)
+    outdir = tmp_path / "release"
+    inside = outdir / build.PKG_NAME / "data"
+    sibling = root.parent / "dev-docs"
+    resolve = Path.resolve
+
+    def resolve_sibling(path, *args, **kwargs):
+        return inside if path == sibling else resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(build, "ROOT", root)
+    monkeypatch.setattr(Path, "resolve", resolve_sibling)
+    _assert_rejected_before_cleanup(monkeypatch, outdir)
 
 
 def test_output_containing_repository_is_rejected(tmp_path: Path, monkeypatch) -> None:

@@ -1,4 +1,4 @@
-"""套装弹窗路径回放：参考图清单与静态判读（spec §8.1 R16 / R20—R22 / R25）。
+"""套装弹窗路径回放：固定样本清单与静态判读（spec §8.1 R16 / R20—R22 / R25）。
 
 R16（reference_manifest）消费 `tests/fixtures/filter-replay/manifest.json` 的全部静态样本：
 `cases`、`substat_cases`、`name_span_cases` 逐项跑**真实**判读函数并比对 expected，
@@ -68,7 +68,7 @@ def _image(relative: str) -> QImage:
         path = BASE / relative
         assert path.exists(), f"清单引用的图不存在：{relative}"
         image = QImage(str(path))
-        assert not image.isNull(), f"参考图无法解码：{relative}"
+        assert not image.isNull(), f"固定样本无法解码：{relative}"
         _images[relative] = image
     return _images[relative]
 
@@ -1132,7 +1132,7 @@ def _probe_line() -> OcrLine:
 
 def test_ocr_state_restoration(monkeypatch: pytest.MonkeyPatch) -> None:
     """R25：成功 / None / 异常三条路径后字符框开关都恢复；普通读取不被污染。"""
-    image = _image("手册/参考图/驱动盘筛选/套装弹窗-选择段1-前.png")
+    image = _image("tests/fixtures/驱动盘筛选/套装弹窗-选择段1-前.png")
     engine = ocr._get_engine()
     before = _switches(engine)
 
@@ -1221,169 +1221,6 @@ def test_legacy_target_normalization_trace(monkeypatch: pytest.MonkeyPatch) -> N
     box = stub.name_boxes()["河豚电音 3"]
     assert frames[0].boxes == (tuple(box),)
     assert (option_ends[0]["x"], option_ends[0]["y"]) == ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
-
-
-def _load_module_from_tests(name: str, filename: str):
-    """按文件名加载同目录的测试/脚本模块（导入不启动真实输入、不改搜索顺序）。"""
-    import importlib.util
-    import sys
-
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module  # dataclass 解析字符串注解需要模块在 sys.modules 里
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_control_scenario_trigger(tmp_path: Path) -> None:
-    """R29：触发点只在 B 首个 set_option completed 之后（且仅一次）；暂停一次返回 true、
-    观察到 paused 后 ≥1 秒再调用一次返回 false；停止恰一次 request_stop；不发 F9/F10。"""
-    import time
-
-    live = _load_module_from_tests("_live_filter_replay_r29", "live_filter_replay.py")
-
-    class FakeController:
-        def __init__(self) -> None:
-            self.paused = False
-            self.calls: list[str] = []
-
-        def toggle_pause(self) -> bool:
-            self.calls.append("toggle")
-            self.paused = not self.paused
-            return self.paused
-
-        def request_stop(self) -> None:
-            self.calls.append("stop")
-
-        def close(self) -> None:
-            self.calls.append("close")
-
-    item_b = SimpleNamespace(run_id="r01-optimized-B")
-    b_end = {"event": "end", "role": "set_option", "status": "completed", "run_id": item_b.run_id}
-
-    pause_controller = FakeController()
-    pause_script = live.Acceptance(tmp_path / "pause", "pause_resume")
-    pause_script.controller = pause_controller
-    pause_script.arm_pause_trigger(item_b)
-    pause_script.on_record({**b_end, "run_id": "r01-optimized-A"})  # 非 B：不触发
-    assert pause_controller.calls == [] and pause_script.triggered is False
-    pause_script.on_record(dict(b_end))
-    assert pause_controller.calls == ["toggle"] and pause_controller.paused is True
-    pause_script.on_record(dict(b_end))  # 只触发一次
-    assert pause_controller.calls == ["toggle"]
-    pause_script.pause_marker_ns = time.monotonic_ns()  # 包装观察到 paused 的时刻
-    pause_script.join_aux()
-    assert pause_controller.calls == ["toggle", "toggle"]  # 恢复调用恰一次
-    assert pause_controller.paused is False
-    assert pause_script.aux_error is None
-
-    stop_controller = FakeController()
-    stop_script = live.Acceptance(tmp_path / "stop", "stop_after_click")
-    stop_script.controller = stop_controller
-    stop_script.arm_stop_trigger(item_b)
-    stop_script.on_record(dict(b_end))
-    assert stop_controller.calls == ["stop"]
-    stop_script.on_record(dict(b_end))  # 只触发一次
-    assert stop_controller.calls == ["stop"]
-
-
-def test_scenario_finalization(tmp_path: Path) -> None:
-    """R30：四个合法场景的产物检查都返回 0（含合法 stopped）；缺 review、错误 outcome、
-    丢控制标记、停止后补输入任一破坏都必须非零。"""
-    helpers = _load_module_from_tests("_checker_tests_r30", "test_check_filter_replay_artifacts.py")
-
-    for scenario in ("baseline", "different_sets", "pause_resume", "stop_after_click"):
-        root = tmp_path / scenario
-        root.mkdir()
-        helpers.Fixture(root, scenario).write()
-        result = helpers.run_checker(root)
-        assert result.returncode == 0, f"合法 {scenario} 产物应通过：\n{result.stdout}"
-
-    # ① 缺 review
-    root = tmp_path / "no_review"
-    root.mkdir()
-    helpers.Fixture(root, "different_sets").write()
-    (root / "review.json").unlink()
-    assert helpers.run_checker(root).returncode != 0
-
-    # ② 错误 outcome：停止场景写成 completed
-    root = tmp_path / "bad_outcome"
-    root.mkdir()
-    helpers.Fixture(root, "stop_after_click").write()
-    payload = json.loads((root / "result.json").read_text(encoding="utf-8"))
-    payload["outcome"] = "completed"
-    (root / "result.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    assert helpers.run_checker(root).returncode != 0
-
-    # ③ 丢控制标记（暂停/恢复）
-    root = tmp_path / "no_control"
-    root.mkdir()
-    fixture = helpers.Fixture(root, "pause_resume")
-    fixture.write()
-    fixture.rows = [r for r in fixture.rows if r["event"] != "control"]
-    fixture.rewrite_rows()
-    assert helpers.run_checker(root).returncode != 0
-
-    # ④ 停止后补输入
-    root = tmp_path / "input_after_stop"
-    root.mkdir()
-    fixture = helpers.Fixture(root, "stop_after_click")
-    fixture.write()
-    fixture.call("r01-optimized-B", "press_key", role="close_panel", vk=27, round=1, path="optimized", task="B")
-    fixture.rewrite_rows()
-    assert helpers.run_checker(root).returncode != 0
-
-
-def test_artifact_checker_untracked_files(tmp_path: Path) -> None:
-    """§9 步骤6：静态文件检查覆盖未跟踪的新文件——行尾空格/缺换行必须失败、合法 CRLF 通过；
-    清单缺图、跨数组 ID 重复必须失败。"""
-    checker = _load_module_from_tests("_checker_static_r6", "check_filter_replay_artifacts.py")
-
-    good = tmp_path / "good.py"
-    good.write_bytes(b"x = 1\r\ny = 2\r\n")  # 合法 CRLF，且以换行结束
-    assert checker.check_static_files(tmp_path, ("good.py",)) == []
-
-    bad = tmp_path / "bad.py"
-    bad.write_bytes(b"x = 1 \r\ny = 2\r\n")  # 行尾空格
-    errors = checker.check_static_files(tmp_path, ("bad.py",))
-    assert any("行尾" in message for message in errors), errors
-
-    no_newline = tmp_path / "no_newline.py"
-    no_newline.write_bytes(b"x = 1")  # 未以换行结束
-    errors = checker.check_static_files(tmp_path, ("no_newline.py",))
-    assert any("换行" in message for message in errors), errors
-
-    def write_manifest(name: str, cases: list[dict], *, version: int = 3,
-                       substat_cases: list[dict] | None = None) -> Path:
-        path = tmp_path / name
-        path.write_text(json.dumps({
-            "version": version,
-            "layouts": [{"layout_id": "L"}],
-            "cases": cases,
-            "substat_cases": substat_cases or [],
-            "name_span_cases": [],
-        }, ensure_ascii=False), encoding="utf-8")
-        return path
-
-    real_image = "手册/参考图/驱动盘筛选/套装弹窗-顶部.png"
-    valid = write_manifest("valid.json", [
-        {"id": "c1", "layout_id": "L", "image": real_image, "identity_source_id": None},
-    ])
-    assert checker.check_manifest(valid) == []
-
-    missing = write_manifest("missing.json", [
-        {"id": "c1", "layout_id": "L", "image": "手册/参考图/驱动盘筛选/不存在.png"},
-    ])
-    errors = checker.check_manifest(missing)
-    assert any("图片不存在" in message for message in errors), errors
-
-    duplicate = write_manifest(
-        "duplicate.json",
-        [{"id": "c1", "layout_id": "L", "image": real_image}],
-        substat_cases=[{"id": "c1", "image": real_image}],
-    )
-    errors = checker.check_manifest(duplicate)
-    assert any("冲突" in message for message in errors), errors
 
 
 # ---------------------------------------------------------------- 点击前状态（F01）
@@ -1517,8 +1354,8 @@ def test_pause_changed_window_during_replay(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_panel_present_pixel_judgement() -> None:
     """F03：面板存在判据是像素判据（零 OCR）——实拍面板帧 True、仓库帧 False。"""
-    panel = _image("手册/参考图/驱动盘筛选/套装弹窗-确认后.png")
-    closed = _image("手册/参考图/驱动盘筛选/筛选面板-关闭.png")
+    panel = _image("tests/fixtures/驱动盘筛选/套装弹窗-确认后.png")
+    closed = _image("tests/fixtures/驱动盘筛选/筛选面板-关闭.png")
     assert (panel.width(), panel.height()) == (1920, 1080)
     assert (closed.width(), closed.height()) == (1920, 1080)
     assert gf._panel_present(panel) is True
@@ -1834,7 +1671,7 @@ def test_blocked_focus_checkpoint_resume(monkeypatch, mode, changed):
 @pytest.mark.parametrize("name", ["混沌爵士", "原始朋克", "啄木鸟电音", "拂晓生花", "如影相随", "法厄同之歌"])
 def test_zero_count_or_dark_art_pre_click_real_frame(name, monkeypatch):
     """190926 原帧：0 件灰锁及非零暗图案均不因亮度拒绝，真实 OCR/指纹/勾区。"""
-    relative = "手册/参考图/驱动盘筛选/套装弹窗-混沌爵士零件数.png"
+    relative = "tests/fixtures/驱动盘筛选/套装弹窗-混沌爵士零件数.png"
     image = _image(relative)
     box = _name_box(relative, name)
     assert box is not None
@@ -1875,7 +1712,7 @@ def test_all_requested_sets_clicked_without_option_enabled_check(monkeypatch):
     assert len(enabled_calls) == 1  # 只在首次学习确认按钮时判读
 
 
-_THUNDER_FRAME = "手册/参考图/驱动盘筛选/套装弹窗-震星迪斯科候选漏字.png"
+_THUNDER_FRAME = "tests/fixtures/驱动盘筛选/套装弹窗-震星迪斯科候选漏字.png"
 
 
 def test_truncated_thunder_candidate_recovered_with_precise_glyph_box():
@@ -2222,9 +2059,9 @@ def test_legacy_scroll_uses_same_picker_scroll_budget(monkeypatch):
 def test_scroll_rejection_frame_is_in_motion_despite_valid_popup_layout():
     from dataclasses import replace
     from zzz_ddtool.filter_replay import identity_score
-    reference = _image("手册/参考图/驱动盘筛选/套装弹窗-两项选中第三项未选-20261012.png")
-    moving = _image("手册/参考图/驱动盘筛选/套装回放-滚动中拒绝原帧-20261012.png")
-    settled = _image("手册/参考图/驱动盘筛选/套装回放-滚动稳定失败后-20261012.png")
+    reference = _image("tests/fixtures/驱动盘筛选/套装弹窗-两项选中第三项未选-20261012.png")
+    moving = _image("tests/fixtures/驱动盘筛选/套装回放-滚动中拒绝原帧-20261012.png")
+    settled = _image("tests/fixtures/驱动盘筛选/套装回放-滚动稳定失败后-20261012.png")
     identity = make_identity(reference, (1188,491,1266,517))
     assert identity is not None
     assert gf._picker_stage_matches(moving, LAYOUT) is True

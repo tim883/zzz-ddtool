@@ -45,8 +45,8 @@ def test_colorful_corner_counts_as_portrait(qapp: QApplication) -> None:
 
 @pytest.mark.legacy
 def test_archived_equipped_tile(qapp: QApplication) -> None:
-    sample = Path(__file__).resolve().parents[1] / "手册" / "参考图" / "驱动盘仓库" / "裁剪" / "已装备头像格.png"
-    assert sample.is_file(), f"已归档参考图缺失：{sample}"
+    sample = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "驱动盘仓库" / "裁剪" / "已装备头像格.png"
+    assert sample.is_file(), f"归档样本缺失：{sample}"
     image = QImage(str(sample))
     assert not image.isNull()
     assert tile_has_portrait(image, 0, 0, image.width(), image.height()) is True
@@ -70,9 +70,9 @@ def test_portrait_criteria_on_real_tiles(qapp: QApplication, name, expected) -> 
     只盖住头像左半边又混进盘面立绘；保留判据（亮且非黄占比 ≥0.10，且头像内圈平均
     亮度 ≥48）仅在这些标定样本上检查预期输出，没有独立答案集，不能据此启用
     生产头像过滤。无头像样本覆盖灰色盘面角与黄色装饰角。
-    原图（1920×1080 真机截图的格位裁剪）在 手册/参考图/驱动盘仓库/裁剪/。
+    原图（1920×1080 真机截图的格位裁剪）在 tests/fixtures/驱动盘仓库/裁剪/。
     """
-    sample = Path(__file__).resolve().parents[1] / "手册" / "参考图" / "驱动盘仓库" / "裁剪" / name
+    sample = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "驱动盘仓库" / "裁剪" / name
     image = QImage(str(sample))
     assert not image.isNull()
     # 裁剪取的是「图标中心 ±(70, 92)」，格位方框在裁剪内的位置固定为 (14, 24)-(126, 160)。
@@ -142,7 +142,7 @@ def test_tile_is_selected_on_real_fixture(qapp: QApplication, width, height) -> 
 
 # ---------------------------------------------------------------- 空位占位识别
 
-# 阈值来自 2026-10-02 真机标定（log/captures/list-e5-scroll20.png）：占位格彩色/亮
+# 阈值来自真机标定：占位格彩色/亮
 # 像素均为 0%，有盘格 6~10% / 30~37%；中间带一律判「拿不准」，由调用方走失败路径。
 
 

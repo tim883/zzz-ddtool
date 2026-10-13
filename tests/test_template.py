@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication
 from zzz_ddtool.screen import DRIVE_DISC, MENU, OVERWORLD, STORAGE, classify_image, is_page
 from zzz_ddtool.template import assets_dir
 
-REFERENCES = Path(__file__).resolve().parents[1] / "手册" / "参考图"
+REFERENCES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 PAGES = [
     ("大地图/普通大世界.png", OVERWORLD),
     ("功能菜单/仓库入口.png", MENU),
@@ -44,7 +44,7 @@ def test_template_files_exist() -> None:
 @pytest.mark.parametrize("filename,page", PAGES)
 def test_reference_pages_hit_their_icons(qapp: QApplication, filename, page) -> None:
     sample = REFERENCES / filename
-    assert sample.is_file(), f"固定参考图缺失：{sample}"
+    assert sample.is_file(), f"固定样本缺失：{sample}"
     image = QImage(str(sample))
     assert not image.isNull(), filename
     assert is_page(image, page), filename

@@ -25,7 +25,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PKG_NAME = "zzz-ddtool"  # 必须与 zzz-ddtool.spec 的 COLLECT(name=...) 一致
 DEFAULT_OUTDIR = ROOT / "dist"
-PROTECTED_DIRS = (".git", ".venv", "src", "tests", "scripts", "data", "user", "log", "log_test", "手册", "dev-docs", "build")
+# 源码根内不可作为打包输出的目录（现行文档、运行资源、开发资料与仓库元数据）。
+PROTECTED_DIRS = (".git", ".venv", "src", "tests", "scripts", "data", "user", "log", "log_test", "docs", "dev-docs", "build")
+# 源码根**同级**的本地开发资料目录名。按「源码根的同级」这一可移动关系定位，
+# 不写死本机绝对路径、不读取其中内容、也不要求它存在：源码根整体搬家后，
+# 保护自动跟到新位置的同级目录。公开项目没有这个目录时正常输出不受影响。
+PROTECTED_SIBLINGS = ("dev-docs",)
 PRESERVED_MARKERS = (".git", ".zzz-ddtool-root", "pyproject.toml", "user")
 
 
@@ -56,6 +61,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def protected_dirs(root: Path) -> tuple[tuple[str, Path], ...]:
+    """本次打包输出不得重叠的目录（按解析后的实际路径判断）。
+
+    两组：源码根内的固定目录，以及源码根同级的本地开发资料目录。同级目录按
+    相对关系定位，存在与否都保护——不存在的目录照样拒绝指向它的危险输出。
+    """
+    return tuple(
+        [(f"源码内 {name}", (root / name).resolve()) for name in PROTECTED_DIRS]
+        + [(f"源码根同级 {name}", (root.parent / name).resolve()) for name in PROTECTED_SIBLINGS]
+    )
+
+
 def _build_paths(output: str) -> tuple[Path, Path, Path]:
     """在清理前验证实际路径，避免输出覆盖源码、存档或链接指向的目录。"""
     root = ROOT.resolve()
@@ -68,10 +85,9 @@ def _build_paths(output: str) -> tuple[Path, Path, Path]:
         raise ValueError(f"目标包目录通过链接指向了其他位置：{pkg_dir}")
     if root.is_relative_to(pkg_dir):
         raise ValueError(f"目标包目录包含源码仓库：{pkg_dir}")
-    for name in PROTECTED_DIRS:
-        protected = (root / name).resolve()
+    for label, protected in protected_dirs(root):
         if pkg_dir.is_relative_to(protected) or protected.is_relative_to(pkg_dir):
-            raise ValueError(f"目标包目录与受保护目录 {name} 重叠：{pkg_dir}")
+            raise ValueError(f"目标包目录与受保护目录重叠（{label}）：{pkg_dir}")
     if work_dir != root / "build":
         raise ValueError(f"build 中间目录通过链接指向了其他位置：{work_dir}")
     for target in (pkg_dir, work_dir):

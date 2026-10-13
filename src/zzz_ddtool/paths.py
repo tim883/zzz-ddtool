@@ -53,7 +53,8 @@ def repo_root() -> Path:
 
 
 def handbook_dir() -> Path:
-    return repo_root() / "手册"
+    """公开现行文档根目录（仓库内的 `docs/`）。"""
+    return repo_root() / "docs"
 
 
 def assets_dir() -> Path:

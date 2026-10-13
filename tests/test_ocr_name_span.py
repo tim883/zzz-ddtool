@@ -1,6 +1,6 @@
 """`read_name_span`：候选整行框里的「名称字符范围」隔离（spec §3.3 / R20 / R21 / R25）。
 
-参考图用 tests/fixtures/warehouse-detail.png（真机 1920×1080）里的「等级15」那一行：
+样本用 tests/fixtures/warehouse-detail.png（真机 1920×1080）里的「等级15」那一行：
 它是**同一行里「名称 + 件数」**的真实样本，正好覆盖「行框含件数后缀、要把名称
 精确隔离出来」的场景，不用另造图。
 
@@ -55,7 +55,7 @@ def _assert_inside(span: OcrLine, row: OcrLine) -> None:
 @pytest.fixture(scope="module")
 def sample_image() -> QImage:
     image = QImage(str(SAMPLE))
-    assert not image.isNull(), f"参考图缺失或无法解码：{SAMPLE}"
+    assert not image.isNull(), f"固定样本缺失或无法解码：{SAMPLE}"
     assert (image.width(), image.height()) == (1920, 1080)
     return image
 

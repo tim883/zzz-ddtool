@@ -64,9 +64,12 @@ _EXECUTOR_ACTIONS = frozenset({
 #: 全部合法动作ID（§4.2 + §4.3）。
 ACTION_IDS = _PANEL_ACTIONS | _EXECUTOR_ACTIONS
 
-#: `return_warehouse` 的三条允许边（Spec v9 §12）。与 ``readiness.RETURN_EDGES`` 逐字相同：
+#: `return_warehouse` 的允许边（Spec v9 §12）。与 ``readiness.RETURN_EDGES`` 逐字相同：
 #: 本模块不反向导入 readiness，避免把屏幕判读依赖带进纯等待层。
-RETURN_EDGE_IDS = ("modal_preview", "modal_warehouse", "preview_warehouse")
+#: 2026-10-13 删掉 `modal_warehouse`：边名只按**发键前**那层取（弹层→`modal_preview`、
+#: 缩放层→`preview_warehouse`），这个名字生产路径永远选不到；留着还会让逐边标定永远
+#: 凑不齐边而拿不到 calibrated。
+RETURN_EDGE_IDS = ("modal_preview", "preview_warehouse")
 
 #: 逐边档案挂在哪个动作下；键名进档案，不能随意改。
 RETURN_EDGE_ACTION = "return_warehouse"

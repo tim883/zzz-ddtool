@@ -286,7 +286,7 @@ def test_w2_stage_add_to_upgrade_uses_fixed_bounded_interval(monkeypatch, sim_ti
     """2026-10-12 改动：素材输入后不再消费 material_ready，只等固定间隔再点「升级」。
 
     原用例 ``test_w2_material_wait_starts_from_input_release`` 验的是"等待起点等于素材点击
-    的真实释放点"；该等待已按作者裁定删除（阶段添加后的动画不必等稳定，点「升级」会让动画
+    的真实释放点"；该等待已删除（阶段添加后的动画不必等稳定，点「升级」会让动画
     立刻结束），因此改为验新行为：不触发 material_ready、间隔固定且有界、素材释放点仍被记录。
     """
     runner = Runner(Preset(), hotkeys=False)
@@ -594,15 +594,18 @@ def test_w7_return_to_warehouse_single_esc_real_wait_default_bound(monkeypatch, 
     modal, warehouse = image(), image()
     runner, esc = _layer_runner(
         monkeypatch, sim_time, {id(modal): "modal", id(warehouse): "warehouse"},
-        edge_floors={"modal_warehouse": runner_module._READY_FLOOR_MS["return_warehouse"]},
+        # 单次 Esc 从弹层直接落到仓库时，边名由**发键前**那层决定（modal → modal_preview），
+        # 所以下限取该边的值。这里注入 1680 让时刻期望与生产常量解耦：本条只验等待机制
+        # （下限 + 两帧稳定 + 进循环前的一次认层抓帧），常量取值由下表用例单独守着。
+        edge_floors={"modal_preview": 1680},
     )
     frames = Frames([{"image": modal}] * 9 + [{"image": warehouse}])
     bind_grab(monkeypatch, runner, frames)
 
     assert runner._esc_back_to_grid(1) is True
     assert esc.call_count == 1
-    # 本边用动作级兜底：实测 1411 ms + 200 ms 余量。下限到点后还要两帧稳定确认，
-    # 因此比只等下限多一轮抓帧；加上进入循环前的那一次认层抓帧。
+    # 本边注入下限 1680 ms：下限到点后还要两帧稳定确认，因此比只等下限多一轮抓帧；
+    # 加上进入循环前的那一次认层抓帧。
     assert runner_module._READY_FLOOR_MS["return_warehouse"] == 1611
     # 兜底下限 1611 ms 到点后还需两帧稳定确认，总活动时间见下。
     assert sim_time.now() == pytest.approx(10_001.75, abs=0.01)
@@ -610,18 +613,18 @@ def test_w7_return_to_warehouse_single_esc_real_wait_default_bound(monkeypatch, 
 
 
 def test_w7_return_each_edge_uses_its_own_floor(monkeypatch, sim_time):
-    """逐边取下限：三条允许边各自一条策略，快边不被慢边的值拖住（Spec v9 §12）。"""
+    """逐边取下限：两条允许边各自一条策略，一边不被另一边的值拖住（Spec v9 §12）。"""
     modal, warehouse = image(), image()
     runner, esc = _layer_runner(
         monkeypatch, sim_time, {id(modal): "modal", id(warehouse): "warehouse"},
-        edge_floors={"modal_warehouse": 600},
+        edge_floors={"preview_warehouse": 600},
     )
-    assert runner._wait_policy("return_warehouse", return_edge="modal_warehouse").floor_ms == 600
+    assert runner._wait_policy("return_warehouse", return_edge="preview_warehouse").floor_ms == 600
     # 未被覆盖的边用自己的运行时常量，不回落、也不借别的边的值。
-    assert runner._wait_policy("return_warehouse", return_edge="preview_warehouse").floor_ms == (
-        runner_module._RETURN_EDGE_FLOOR_MS["preview_warehouse"]
+    assert runner._wait_policy("return_warehouse", return_edge="modal_preview").floor_ms == (
+        runner_module._RETURN_EDGE_FLOOR_MS["modal_preview"]
     )
-    # 不传边时仍是动作级兜底（旧口径保留给三边都缺项的场合）。
+    # 不传边时仍是动作级兜底（旧口径保留给两边都缺项的场合）。
     assert runner._wait_policy("return_warehouse").floor_ms == (
         runner_module._READY_FLOOR_MS["return_warehouse"]
     )
@@ -645,12 +648,19 @@ def test_w7_measured_edge_overrides_runtime_constant(monkeypatch, sim_time):
         _active.reset(token)
 
 
-def test_w7_preview_edge_floor_is_lower_than_modal_edges():
-    """运行时常量表必须体现实测差异：preview→仓库明显快于两条 modal 边。"""
+def test_w7_edge_floor_table_matches_decided_values():
+    """逐边下限表按当前裁定取值；任何一边改动都要同步这条期望。
+
+    2026-10-13 起 `modal_preview`（强化页→缩放层）按用户裁定的「实测 100 +
+    `_MEASURED_SAFETY_MS`」取值，取代旧的 1680；同日删掉生产路径选不到的 `modal_warehouse`，
+    表里只剩两条边。原先「preview→仓库快于两条 modal 边」的顺序断言随该裁定取消，改成直接钉住
+    各边的数。逐边独立取值本身仍由
+    `test_w7_return_each_edge_uses_its_own_floor` 与 `test_w7_measured_edge_overrides_runtime_constant` 守着。
+    """
     floors = runner_module._RETURN_EDGE_FLOOR_MS
     assert set(floors) == set(actionwait.RETURN_EDGE_IDS)
-    assert floors["preview_warehouse"] < floors["modal_preview"]
-    assert floors["preview_warehouse"] < floors["modal_warehouse"]
+    assert floors["modal_preview"] == 100 + runner_module._MEASURED_SAFETY_MS
+    assert floors["preview_warehouse"] == 680
     for value in floors.values():
         assert 0 < value < runner_module._READY_TIMEOUT_MS["return_warehouse"]
 
@@ -1129,27 +1139,64 @@ def test_p2_refund_two_waits_are_distinct_and_linked(monkeypatch, sim_time, tmp_
     assert waits[1]["parent_id"] == runner._disc_event_id
 
 
-def test_wait_table_in_core_doc_syncs_with_code():
-    """核心文档的「代码里设置的等待」总表必须与源码一致（作者裁定，最高优先级）。
+# --------------------------------------------------------------------------
+# 面板一次滚到底：滚轮事件条数、事件间隔与末条等待预算（生产模块行为回归）
+# --------------------------------------------------------------------------
+class _ScrollClock:
+    """模拟时钟：sleep 真正推进时间，用来断言滚轮事件之间的间隔。"""
 
-    脱节时这里失败：运行
-    `python dev-docs/功能改造/操作等待提速/scripts/dump_wait_table.py --write <README.md>` 同步。
-    """
-    import sys as _sys
-    from pathlib import Path as _Path
+    def __init__(self, start: float = 100.0) -> None:
+        self.t = float(start)
 
-    root = _Path(__file__).resolve().parents[1]
-    scripts = root / "dev-docs" / "功能改造" / "操作等待提速" / "scripts"
-    if str(scripts) not in _sys.path:
-        _sys.path.insert(0, str(scripts))
-    import dump_wait_table as dumper
+    def now(self) -> float:
+        return self.t
 
-    readme = root / "dev-docs" / "功能改造" / "操作等待提速" / "等待时间表.md"
-    text = readme.read_text(encoding="utf-8")
-    start, end = text.find(dumper.BEGIN), text.find(dumper.END)
-    assert start >= 0 and end >= 0, "等待时间表缺 wait-table 标记块"
-    block = text[start:end + len(dumper.END)]
-    assert block.strip() == dumper.render_block().strip(), (
-        "等待时间表与代码不一致：运行 scripts/dump_wait_table.py --write 同步"
-    )
+    def sleep(self, seconds: float) -> None:
+        self.t += float(seconds)
+
+
+_MS = 1_000_000
+
+
+def test_t4_panel_scroll_events_and_single_tail_budget(monkeypatch):
+    """8 条 -3、间隔 60 ms，仅末条使用实测 173 ms + 200 ms 余量。"""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from zzz_ddtool import gamefilter as gf
+
+    clock = _ScrollClock(100.0)
+    wheels: list[int] = []
+    receipts: list = []
+    contexts: list[tuple] = []
+    waits: list[tuple] = []
+
+    @contextmanager
+    def fake_input_context(role, **kwargs):
+        contexts.append((role, dict(kwargs)))
+        yield
+
+    def fake_send(delta):
+        wheels.append(delta)
+        receipt = InputRelease("send_wheel_event", int(clock.now() * 1e9))
+        receipts.append(receipt)
+        return receipt
+
+    monkeypatch.setattr(gf, "input_context", fake_input_context)
+    monkeypatch.setattr(gf, "send_wheel_event", fake_send)
+    monkeypatch.setattr(gf, "wait_release",
+                        lambda role, release, fallback_ms=None: waits.append((role, release, fallback_ms)))
+    monkeypatch.setattr(gf, "focus_window", lambda hwnd: None)
+    monkeypatch.setattr(gf, "client_to_screen", lambda hwnd, x, y: (x, y))
+    monkeypatch.setattr(gf, "user32", SimpleNamespace(SetCursorPos=lambda x, y: None))
+    monkeypatch.setattr(gf.time, "sleep", clock.sleep)
+
+    gf._scroll_panel_to_bottom(1, 1920, 1080)
+
+    assert wheels == [-3] * 8
+    assert contexts == [("substat_scroll", {"defer_post_release": True})]
+    stamps = [int(receipt.released_at_ns) for receipt in receipts]
+    deltas = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
+    assert deltas == [60 * _MS] * 7  # 事件间 60 ms 不变
+    assert waits == [("substat_scroll", receipts[-1], 373)]  # 仅最后一条后一次预算，不叠加
 

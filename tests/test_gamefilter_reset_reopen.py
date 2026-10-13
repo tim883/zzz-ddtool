@@ -1,4 +1,4 @@
-"""筛选面板打开的重试回归：读不到「重置」就再点一次漏斗把它开回来。
+"""筛选面板打开的重试回归：读不到「重置」就再点漏斗把它开回来。
 
 背景（2026-10-12 真机）：漏斗按钮是**开/关切换**。面板本来就开着时（上一轮没关就点了
 开始），开头那一下会把它关掉，接着找「重置」读空、整轮中断。失败轮 ``0002-导航到仓库.png``
@@ -64,12 +64,20 @@ def test_reopens_panel_when_reset_not_found(monkeypatch):
     assert calls["funnel"] == 2
 
 
-def test_raises_when_still_not_found_after_reopen(monkeypatch):
-    """补点后仍读不到：抛出，不再无限重试。"""
-    calls = _patch(monkeypatch, [None, None])
+def test_keeps_retrying_up_to_the_limit(monkeypatch):
+    """补点不是只补一次：第 3 次才读到「重置」也要能成功。"""
+    calls = _patch(monkeypatch, [None, None, Mock()])
+    release = gf._open_panel_and_reset(1, 1920, 1080, fx=149, fy=930, allow_reopen=True)
+    assert release is not None
+    assert calls["funnel"] == 3
+
+
+def test_raises_only_after_all_retries(monkeypatch):
+    """试满 `_RESET_TRIES` 次仍读不到：抛出，不再无限重试。"""
+    calls = _patch(monkeypatch, [None] * gf._RESET_TRIES)
     with pytest.raises(FilterClickError, match="没找到「重置」"):
         gf._open_panel_and_reset(1, 1920, 1080, fx=149, fy=930, allow_reopen=True)
-    assert calls["funnel"] == 2
+    assert calls["funnel"] == gf._RESET_TRIES == 4
 
 
 def test_reset_game_filter_does_not_reopen(monkeypatch):

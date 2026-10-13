@@ -109,8 +109,8 @@ ENVIRONMENT_FIELDS: tuple[str, ...] = (
 )
 _INT_ENV_FIELDS = ("client_width", "client_height", "window_dpi")
 
-#: §9.1 return 三条允许边。
-RETURN_EDGES: tuple[str, ...] = ("modal_preview", "modal_warehouse", "preview_warehouse")
+#: §9.1 return 的允许边（2026-10-13 由三条减为两条：删掉生产路径选不到的 `modal_warehouse`）。
+RETURN_EDGES: tuple[str, ...] = ("modal_preview", "preview_warehouse")
 RETURN_MIN_SAMPLES = 5
 SELECT_MIN_SAMPLES = 20
 SELECT_MIN_DIFFERENT = 10

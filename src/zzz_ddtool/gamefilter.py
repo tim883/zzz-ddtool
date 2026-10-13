@@ -57,6 +57,9 @@ FILTER_SETS_BAR = (1300, 260, 1860, 380)
 FILTER_SLOT_AREA = (1300, 380, 1860, 950)
 # 面板底部「重置」按钮搜索区（避开右边的批量操作）
 FILTER_RESET_AREA = (1250, 990, 1650, 1080)
+# 点漏斗找「重置」的总尝试次数（含首次）。漏斗是开/关切换：面板原本开着时第一次会把它
+# 关掉，读空要再点一次；真机补点偶发仍读空，留几次余量。
+_RESET_TRIES = 4
 # 弹层 / 词条按钮的全窗口搜索区。认不上的话宁可中断。
 FULL_WINDOW = (0, 0, 1920, 1080)
 # 滚动找词条时的尝试上限
@@ -78,19 +81,18 @@ _PANEL_CLICK_BOTTOM_GAP = 160
 # 8 条足够到底（到顶后会停住，多发无害）。宁可一次发到位，也不要「滚一格→抓图→再滚」。
 _PANEL_SCROLL_NOTCHES = 8
 
-#: 2026-10-12 作者裁定（**勿重复叠加**）：最终等待 = 真机实测值（见《等待时间表》第 14 轮）
-#: + 本保底。调用点一律写成「实测值 + _MEASURED_SAFETY_MS」；日后调保底只改这里，
-#: 不准再往任何数值里手写 +200。
+#: 最终等待 = 实测取值 + 本保底（**勿重复叠加**）：调用点一律写成
+#: 「实测值 + _MEASURED_SAFETY_MS」；日后调保底只改这里，不往任何数值里手写 +200。
 _MEASURED_SAFETY_MS = 200
-# 套装滚动采用用户已修正的学习预算；学习/回放/回顶/legacy共用，避免坐标基准不同。
+# 套装滚动采用修正后的学习预算；学习/回放/回顶/legacy共用，避免坐标基准不同。
 _SET_SCROLL_WAIT_MS = 784  # 最终预算，不再叠加200ms
 #: 连续点击：组内零等待且不检测，最后一个实际点击按其动作的实测值等待。
-#: 四项沿用组动作不叠加200ms的约定；来源《等待时间表》第14轮。
+#: 四项沿用组动作不叠加 200ms 的约定。
 _SET_OPTION_TAIL_WAIT_MS = 87
 _MAINSTAT_OPTION_TAIL_WAIT_MS = 160
 _SUBSTAT_OPTION_TAIL_WAIT_MS = 93
 _SUBSTAT_COUNT_TAIL_WAIT_MS = 86
-# 主属性名与词条名的相似度下限，低于它宁可中断也不猜（手册 01 底线）
+# 主属性名与词条名的相似度下限，低于它宁可中断也不猜（识别不清就中断，不猜）
 _MATCH_CUTOFF = 0.75
 
 
@@ -107,14 +109,14 @@ _PICKER_SCROLL_DELTA = -8
 _PICKER_MATCH_CUTOFF = 0.75
 _PICKER_MAX_ROUNDS = 8
 _PICKER_OBSERVE_FRAMES = 3
-# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+# 判读/观察延迟一律 50 ms。
 _PICKER_OBSERVE_INTERVAL_S = 0.05
 _PICKER_CONFIRM_TEXT = "确认筛选"
-# 名称带近似命中但未能精确隔离时的重拍重读上限（用户决定 2026-10-11）：
+# 名称带近似命中但未能精确隔离时的重拍重读上限：
 # 识别错误不点击，重拍新帧再认，认对一次即用；上限内仍无法精确隔离才按 R21 停止。
 _PICKER_NAME_READ_ATTEMPTS = 5
 # 重拍前的短暂等待：给游戏一帧新的呈现，不改变任何点击/滚动时序。
-# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+# 判读/观察延迟一律 50 ms。
 _PICKER_NAME_RETRY_DELAY_S = 0.05
 
 
@@ -900,7 +902,7 @@ def _select_sets_with_replay(
                 session.last_metrics = metrics.payload()
 # ---------------- 套装弹窗判读（spec §4.2 / §4.3） ----------------
 # 区域为设计坐标（1920x1080）；阈值取自 2026-10-06 静态样本实测
-# （手册/参考图/驱动盘筛选/，见该页说明.md）：
+# （静态样本见 tests/fixtures/驱动盘筛选/）：
 #   提示行均值：弹窗存在 124.4—124.6 / 关闭 42.9；首行上沿条带亮尾：在顶部 34.2—65.5 / 已滚动 242.2；
 _PICKER_HINT_BAND = (764, 299, 1156, 328)
 _PICKER_TOP_BAND = (830, 366, 1470, 384)
@@ -916,7 +918,7 @@ _PANEL_RESET_MIN_TAIL = 120.0
 _PICKER_COLUMN_CENTERS = (900, 1064, 1228, 1392)
 # 副属性就位观察（§6.5）：一次滑到底后未知最多共 3 张（含滚后第一张），期间不补发输入
 _SUBSTAT_OBSERVE_FRAMES = 3
-# 2026-10-11 用户裁定：判读/观察延迟一律 50 ms（与原先取低值；原先 0.1 s）。
+# 判读/观察延迟一律 50 ms。
 _SUBSTAT_OBSERVE_INTERVAL_S = 0.05
 
 
@@ -1174,7 +1176,7 @@ def _confirm_popup(hwnd: int, metrics: _PickerMetrics | None = None) -> None:
     if metrics is not None:
         metrics.search_ocr_calls += 1
     if release is None:
-        raise FilterClickError("没找到「确认筛选」按钮，弹层未关闭。按手册 01 中断。")
+        raise FilterClickError("没找到「确认筛选」按钮，弹层未关闭。识别不清就中断，不猜。")
     # legacy 分支：580 = 180 + 400，不消费实测。
     wait_release("confirm_sets", release, fallback_ms=78 + _MEASURED_SAFETY_MS, allow_measured=False)
 
@@ -1215,7 +1217,7 @@ def _toggle_below(lines, title_y: int):
 def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
     """把筛选面板滚到「主属性词条」区，并确保该区已展开。
 
-    真机标定（2026-10-02，log/captures/probe-filter-open.png）：
+    真机标定：
     面板内容比视口高，滚到顶时「主属性词条」区在视口外；
     该区默认**收起**，只有一条「点击展开」，点开后才是
     「生命值 / 攻击力百分比 / …」这些复选框。
@@ -1247,7 +1249,7 @@ def _open_mainstat_section(hwnd: int, width: int, height: int) -> list:
             release = click_client(hwnd, (toggle.left + toggle.right) // 2, (toggle.top + toggle.bottom) // 2)
         wait_release("open_mainstats", release, fallback_ms=0)
         after = _text_lines()
-        # 作者裁定（2026-10-12）：关闭「展开成功」回读检测（原实现保留备查）。
+        # 「展开成功」回读检测已关闭（原实现保留备查）。
         # after_y = _title_y(after, MAINSTAT_TITLE)
         # after_toggle = _toggle_below(after, after_y) if after_y is not None else None
         # if after_toggle is not None and "收起" in after_toggle.text.replace(" ", ""):
@@ -1370,7 +1372,7 @@ def apply_sets_mainstats(
     """在筛选面板里点开套装 / 主属性词条并勾选。
 
     套装走 `_select_sets_with_replay` 分派（legacy / learn / replay），主属性走原来的展开+点名。
-    全部靠 OCR 或标定判读；认不上就中断（手册 01 底线）。
+    全部靠 OCR 或标定判读；认不上就中断（识别不清就中断，不猜）。
     """
     log = get_logger("zzz_ddtool.gamefilter")
     if sets:
@@ -1431,36 +1433,38 @@ def _click_funnel(hwnd: int, fx: int, fy: int) -> None:
 def _open_panel_and_reset(
     hwnd: int, width: int, height: int, *, fx: int, fy: int, allow_reopen: bool
 ) -> InputRelease:
-    """点漏斗打开筛选面板并点「重置」；**读不到「重置」就再点一次漏斗**开回来。
+    """点漏斗打开筛选面板并点「重置」；读不到「重置」就再点漏斗，最多试 ``_RESET_TRIES`` 次。
 
     2026-10-12 真机因果：漏斗是**开/关切换**。面板本来就开着时（上一轮没关就点了开始），
     开头那一下会把它**关掉**，接着找「重置」必然读空、整轮中断。日志证据：失败轮
     ``0002-导航到仓库.png`` 左侧网格已被压暗（p95 119~129），正常轮是 218~242，
     说明任务开始时面板就是开着的。
 
-    做法：点一次漏斗 → 找「重置」；找不到就**再点一次漏斗**。开关按两次回到原状态，
-    面板原本开着会被恢复，原本关着则第一次就已经打开。所以：
+    做法：点漏斗 → 找「重置」；读空就再点一次漏斗重来，**总共最多 ``_RESET_TRIES`` 次**
+    （首次 + 补点）。开关按偶数次回到原状态，所以补点能把原本开着的面板恢复，原本关着则
+    第一次就已经打开。因此：
 
-    - 面板本来关着（正常路径）：点 1 次漏斗 + 读 1 次区域 OCR，与旧实现完全相同，不多抓帧；
-    - 面板本来开着：多 1 次点击 + 1 次区域 OCR，但把"必然失败"救成"正常继续"。
+    - 面板本来关着（正常路径）：点 1 次漏斗 + 读 1 次区域 OCR 就结束，不多抓帧；
+    - 面板本来开着：第 2 次起才点到「重置」，前面几次都是必然读空的补点。
 
     不读亮度、不判"面板开没开"，只用"读没读到重置"——不依赖跨机器会变的像素阈值。
     ``allow_reopen=False`` 供 ``reset_game_filter`` 用：那条路径读不到时紧接着就 Esc 关面板，
-    没有"再点重置"的下一步，补点没有意义。
+    没有"再点重置"的下一步，补点没有意义，只试首次。
     """
     log = get_logger("zzz_ddtool.gamefilter")
-    _click_funnel(hwnd, fx, fy)
-    release = _try_click_reset(hwnd, width, height)
-    if release is not None:
-        return release
-    if not allow_reopen:
-        raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
-    log.info("没读到「重置」，再点一次漏斗把它开回来")
-    _click_funnel(hwnd, fx, fy)
-    release = _try_click_reset(hwnd, width, height)
-    if release is None:
-        raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
-    return release
+    attempts = _RESET_TRIES if allow_reopen else 1
+    for attempt in range(1, attempts + 1):
+        _click_funnel(hwnd, fx, fy)
+        release = _try_click_reset(hwnd, width, height)
+        if release is not None:
+            return release
+        if attempt < attempts:
+            log.info(
+                "第 %d 次没读到「重置」，再点一次漏斗把它开回来（最多 %d 次）",
+                attempt,
+                attempts,
+            )
+    raise FilterClickError("筛选面板里没找到「重置」按钮，中断。")
 
 
 def reset_game_filter(hwnd: int, width: int, height: int) -> None:
@@ -1651,7 +1655,7 @@ def _open_substat_section(hwnd: int, width: int, height: int) -> tuple[QImage, l
     wait_release("open_substats", release, fallback_ms=0)
 
     after, after_lines = _read_panel()
-    # 作者裁定（2026-10-12）：关闭「展开成功」回读检测（原实现保留备查）。
+    # 「展开成功」回读检测已关闭（原实现保留备查）。
     # after_y = _title_y(after_lines, SUBSTAT_TITLE)
     # after_toggle = _toggle_below(after_lines, after_y) if after_y is not None else None
     # if after_toggle is None or "收起" not in after_toggle.text:

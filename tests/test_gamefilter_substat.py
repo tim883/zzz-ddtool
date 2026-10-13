@@ -400,7 +400,7 @@ def test_substat_stop_during_final_observation_does_not_resend(monkeypatch):
 
 
 def test_failure_after_frame_attack_percent_is_selected_with_real_predicate():
-    image = QImage(str(BASE / "手册/参考图/驱动盘筛选/副属性-攻击百分比误报失败后-20261012.png"))
+    image = QImage(str(BASE / "tests/fixtures/驱动盘筛选/副属性-攻击百分比误报失败后-20261012.png"))
     assert not image.isNull() and (image.width(), image.height()) == (1920, 1080)
     names = ("攻击力%", "暴击伤害", "暴击率", "攻击力", "穿透值")
     ready, targets = gf._inspect_substat_targets(image, gf._panel_lines(image), names=names, counts=(3, 4))

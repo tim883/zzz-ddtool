@@ -30,8 +30,8 @@ from zzz_ddtool.ocr import (
 from zzz_ddtool.paths import assets_dir
 
 REPO = Path(__file__).resolve().parents[1]
-REF = REPO / "手册" / "参考图" / "驱动盘详情"
 FIXTURES = REPO / "tests" / "fixtures"
+REF = FIXTURES / "驱动盘详情"
 
 SIDEBAR = REF / "首档复用-侧栏盘面.png"
 MODAL = REF / "详情弹层.png"
@@ -44,7 +44,7 @@ _UPGRADE = "upgrade-1920x1080"
 
 def load(path: Path) -> QImage:
     image = QImage(str(path))
-    assert not image.isNull(), f"参考图缺失或无法解码：{path}"
+    assert not image.isNull(), f"固定样本缺失或无法解码：{path}"
     assert (image.width(), image.height()) == (1920, 1080), path
     return image
 

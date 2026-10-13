@@ -717,20 +717,19 @@ def _return_obs(edge, t, **kwargs):
     return readiness.ReturnObservation(edge, t_stable_ms=t, **kwargs)
 
 
-def test_c3_return_three_edges_take_max():
+def test_c3_return_two_edges_take_max():
+    """两条允许边各自取 max 再取最大；2026-10-13 起第三条边（弹层→仓库）已删除。"""
     obs = []
     obs += [_return_obs("modal_preview", t) for t in (90, 80, 70, 60, 50)]
-    obs += [_return_obs("modal_warehouse", t) for t in (177, 160, 150, 140, 130)]
-    obs += [_return_obs("preview_warehouse", t) for t in (30, 25, 20, 15, 10)]
+    obs += [_return_obs("preview_warehouse", t) for t in (177, 160, 150, 140, 130)]
     summary = readiness.summarize_return_warehouse(obs)
     assert summary.status == "calibrated"
-    assert summary.floor_ms == 280  # max(190, 280, 130)
-    assert summary.edge_floors["modal_warehouse"] == 280
+    assert summary.floor_ms == 280  # max(190, 280)
+    assert summary.edge_floors["preview_warehouse"] == 280
 
 
 def test_c3_return_missing_edge_keeps_default():
     obs = [_return_obs("modal_preview", t) for t in (90, 80, 70, 60, 50)]
-    obs += [_return_obs("modal_warehouse", t) for t in (177, 160, 150, 140, 130)]
     summary = readiness.summarize_return_warehouse(obs)
     assert summary.status == "insufficient"
     assert summary.floor_ms == readiness.DEFAULT_FLOOR_MS["return_warehouse"]  # 保默认，不降
@@ -739,7 +738,6 @@ def test_c3_return_missing_edge_keeps_default():
 
 def test_c3_return_non_allowed_edge_timeout_failed():
     obs = [_return_obs("modal_preview", t) for t in (90, 80, 70, 60, 50)]
-    obs += [_return_obs("modal_warehouse", t) for t in (177, 160, 150, 140, 130)]
     obs += [_return_obs("preview_warehouse", t) for t in (30, 25, 20, 15, 10)]
     obs += [readiness.ReturnObservation(None, t_stable_ms=None, timed_out=True)]
     summary = readiness.summarize_return_warehouse(obs)

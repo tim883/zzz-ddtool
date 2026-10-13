@@ -1,4 +1,4 @@
-﻿"""actionwait 与输入层释放契约的离线验收（spec §2.1—§2.2、§3、§4.1、§5、§9 T1—T8 的 S2 部分）。
+"""actionwait 与输入层释放契约的离线验收（spec §2.1—§2.2、§3、§4.1、§5、§9 T1—T8 的 S2 部分）。
 
 全部替身：不发真实输入、不睡真实时间、不碰真实档案（档案路径单独指到 tmp）。
 """
@@ -481,13 +481,24 @@ def test_t9_return_edges_reject_unknown_edge_and_bad_items(tmp_path):
         "modal_preview": {"count": 5, "max_stable_ms": 2000, "floor_ms": 4000,
                           "report_sha256": "f" * 64},        # 越界（>=3580 timeout）
         "modal_warehouse": {"count": 5, "max_stable_ms": 100, "floor_ms": 120,
-                            "report_sha256": "0" * 64},      # 合格
+                            "report_sha256": "0" * 64},      # 2026-10-13 已删除的边名 → 未知键
     }
     path2 = tmp_path / "partial-edges.json"
     path2.write_text(json.dumps(payload), encoding="utf-8")
     policies, edges = load_policies_with_edges(env, path=path2)
     assert policies == {"open_panel": ActionWaitPolicy(120, "measured")}
-    assert edges == {"modal_warehouse": ActionWaitPolicy(120, "measured")}
+    assert edges == {}
+
+    # 逐边项互不牵连：把同一个键换成合格项，该边照常装载（旧的三边档里同样的合格项放在
+    # `modal_warehouse` 下，那条边 2026-10-13 删掉后换成仍在的两条边之一）。
+    payload["return_edges"] = {
+        "modal_preview": {"count": 5, "max_stable_ms": 100, "floor_ms": 120,
+                          "report_sha256": "0" * 64},
+    }
+    path3 = tmp_path / "one-good-edge.json"
+    path3.write_text(json.dumps(payload), encoding="utf-8")
+    _policies, edges = load_policies_with_edges(env, path=path3)
+    assert edges == {"modal_preview": ActionWaitPolicy(120, "measured")}
 
 
 def test_t7_stop_during_shard_propagates_without_more_input(monkeypatch):

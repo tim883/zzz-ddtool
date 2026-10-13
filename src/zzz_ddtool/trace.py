@@ -178,7 +178,7 @@ class Trace:
         get_logger("zzz_ddtool.trace").info(message)
 
     def fail(self, page: str, action: str, reason: str = "", image=None) -> None:
-        """一步失败。图必留，永远不被容量清理删掉。"""
+        """一步失败。失败现场照常保存截图，供当轮复核（轮次目录按轮数策略整轮回收）。"""
         self.step_start(page, action)
         self._close_span(reason)
         self.failed = True

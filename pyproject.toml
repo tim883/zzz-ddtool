@@ -42,7 +42,7 @@ zzz_ddtool = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 # 默认排除真实窗口用例和停用功能用例；改动相关功能时显式选择
-# window / legacy。测试范围和验证限制见手册/测试约定.md。
+# window / legacy。测试范围和验证限制见 docs/测试约定.md。
 addopts = '-m "not window and not legacy"'
 markers = [
   "window: 会创建真实桌面窗口的用例，默认跳过以避免占用屏幕",

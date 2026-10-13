@@ -11,7 +11,7 @@ from zzz_ddtool import gamefilter as gf, ocr, picker_names
 from zzz_ddtool.control import checkpoint_input, controlled_inputs
 from zzz_ddtool.filter_replay import FilterReplaySession, identity_matches, make_identity
 
-BASE = Path(__file__).resolve().parents[1] / "手册/参考图/驱动盘筛选"
+BASE = Path(__file__).resolve().parents[1] / "tests/fixtures/驱动盘筛选"
 CASES = [
     ("套装弹窗-顶部.png", ("荆棘玫瑰", "月光骑士颂", "雪兔梦游仙境")),
     ("套装弹窗-选择段2-前.png", ("折枝剑歌", "静听嘉音")),
