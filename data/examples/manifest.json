@@ -2,25 +2,25 @@
   "schema": 1,
   "examples": [
     {
-      "file": "example.yaml",
-      "title": "双暴攻击-示例",
-      "updated_at": "2026-10-08",
-      "note": "入门示例：单个任务最多处理 5 件",
-      "sha256": "9986f20a7b02de589606a72ec631fc9f9e241ab3c2eeb36ff4adb6b3bddd9828"
+      "file": "example-异常攻精.yaml",
+      "title": "异常攻精",
+      "updated_at": "2026-10-14",
+      "note": "异常攻精：8 套装 6 个部位，异常精通 1 分 / 攻击力% 0.8 分，每个任务最多 15 件",
+      "sha256": "cea9a4cbd1593656d955a0f3e1e5abfc37531bfe83be2293d18caa27850c2140"
     },
     {
-      "file": "example2.yaml",
-      "title": "双暴攻击-示例",
-      "updated_at": "2026-10-08",
-      "note": "单个任务最多处理 10 件",
-      "sha256": "b4325c919b4af1f4d0813325cc56b0968b795649021956da5b61df5ec694ad6b"
+      "file": "example-星见雅折纸.yaml",
+      "title": "星见雅折纸",
+      "updated_at": "2026-10-14",
+      "note": "星见雅折纸：折枝剑歌 1 套，按主词条拆成 9 个任务，异常精通 / 攻击力% / 暴击率 各 1 分，每个任务最多 15 件",
+      "sha256": "b6e4bee7aa5b7be1d51e2a12b5994530d779e1bf7263f6797a4b52a5bfb9da86"
     },
     {
-      "file": "example3.yaml",
-      "title": "双暴攻击-示例",
-      "updated_at": "2026-10-08",
-      "note": "单个任务最多处理 29 件，跑得多一点",
-      "sha256": "1f099534606eaada921e7dcabf21cd91f03c66f91ef10a1014b24363548b8cbe"
+      "file": "example-直伤双爆.yaml",
+      "title": "直伤双爆",
+      "updated_at": "2026-10-14",
+      "note": "直伤双爆：6 套装，4 号暴击率 / 暴击伤害 / 攻击力% 分开建任务，三项各 1 分，每个任务最多 10 件",
+      "sha256": "0b373ef4c54c59e6887babb320c7f21a6a7afa2ebaf0de6095b2b2e29717b294"
     }
   ]
 }
