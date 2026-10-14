@@ -6,7 +6,7 @@ from zzz_ddtool.config import Preset, checkpoint_level
 from zzz_ddtool.feasibility import fails_useful_quota, max_achievable_useful_types, present_useful_types
 from zzz_ddtool.models import MAX_LEVEL, Action, Decision, Disc
 from zzz_ddtool.origin import infer_origin
-from zzz_ddtool.patterns import JUNK, disc_to_pattern
+from zzz_ddtool.patterns import disc_to_pattern
 from zzz_ddtool.score import score_disc
 
 
@@ -87,18 +87,6 @@ def decide(disc: Disc, preset: Preset, accepted_ids: Collection[str] | None = No
                 f"useful_types_impossible:{useful_now}+empty{disc.empty_slots}"
                 f"<{preset.min_useful_types}(max{useful_max})"
             ),
-            score,
-            useful_now,
-            useful_max,
-            checkpoint,
-            origin.value,
-            pattern.pattern_id,
-        )
-
-    if any(slot.name == JUNK and slot.bonus > 0 for slot in pattern.slots):
-        return _result(
-            Action.MARK_DISCARD,
-            "junk_bonus_hidden",
             score,
             useful_now,
             useful_max,

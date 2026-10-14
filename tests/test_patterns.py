@@ -97,7 +97,26 @@ def test_disc_canonical_matches_enum() -> None:
 
 def test_preview_enumerates_all_stages() -> None:
     weights = {"暴击率": 1.0, "暴击伤害": 1.2, "攻击力%": 0.8}
-    cards = enumerate_all(weights, hide_junk_bonus=True)
+    cards = enumerate_all(weights)
     assert 15 in CHECKPOINTS
     assert {card.checkpoint for card in cards} == set(CHECKPOINTS)
-    assert 40 <= len(cards) <= 800
+    # 2026-10-14 起「强化落在废词条上」的组合照常出卡（见下一条用例），张数因此变大。
+    assert len(cards) == 810
+
+
+def test_enumeration_keeps_rolls_that_landed_on_junk() -> None:
+    """废词条上的强化是游戏里真实存在的状态，必须出卡。
+
+    2026-10-14 之前 ``first_filter(hide_junk_bonus=True)`` 把这些组合整张丢掉：运行时
+    按盘面算出的图案查不到卡片 → 直接判弃置，而界面上没有任何地方能表达相反的意思。
+    现在照常出卡，收不收由每档「本档要求」与勾选决定。
+    """
+    weights = {"暴击率": 1.0, "暴击伤害": 1.2, "攻击力%": 0.8}
+    # 走**卡片库**（enumerate_all 会过 first_filter），而不是裸的 enumerate_patterns：
+    # 被过滤掉的正是 first_filter 这一层，裸穷举前后都含这些组合，钉不住改动。
+    cards = {card.pattern_id: card for card in enumerate_all(weights)}
+    root = cards["four:0:暴击伤害|暴击率|攻击力%|废词条"]
+    whiffed = cards["four:3:暴击伤害|暴击率|攻击力%|废词条+1"]
+
+    # 白给的那次强化不加分：它的分数就是这张盘 +0 时的分数，门槛天然能把它筛掉。
+    assert whiffed.score == root.score

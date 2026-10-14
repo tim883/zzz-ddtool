@@ -199,12 +199,50 @@ def test_selection_rebases_deduplicates_and_filters_using_current_task():
         "four:0:暴击率|暴击伤害|废词条|废词条",
         "four:3:暴击率|废词条+1|废词条|废词条",
     ))
-    assert rebase_selection(job) == ("four:0:暴击率|废词条|废词条|废词条",)
+    # 前两张归一成同一张；第三张是「强化落在废词条上」，2026-10-14 起不再被丢掉。
+    assert rebase_selection(job) == (
+        "four:0:暴击率|废词条|废词条|废词条",
+        "four:3:暴击率|废词条+1|废词条|废词条",
+    )
     job.mainstats = ("攻击力%",)
-    assert rebase_selection(job) == ("four:0:暴击率|废词条|废词条|废词条",)
+    assert rebase_selection(job) == (
+        "four:0:暴击率|废词条|废词条|废词条",
+        "four:3:暴击率|废词条+1|废词条|废词条",
+    )
+    # 只卡 +0：白给的那档没设门槛，它留在名单里
     job.stage_require = {"four": {0: 1.5}}
+    assert rebase_selection(job) == ("four:3:暴击率|废词条+1|废词条|废词条",)
+    # +3 也抬到 1.5：两张都落到门槛外——收不收这种盘完全由门槛表达
+    job.stage_require = {"four": {0: 1.5, 3: 1.5}}
     assert rebase_selection(job) == ()
     assert rebase_selection(replace(job, accepted=None)) is None
+
+
+def test_roll_that_landed_on_junk_follows_the_threshold_only():
+    """废词条上的强化不再被写死判弃置：有白名单时按名单，没有时按门槛。
+
+    2026-10-14 删掉了 decide 里写死的 ``junk_bonus_hidden`` 弃置分支——它会在
+    「本档要求」之外再做一次判弃置，用户无法表达相反的意思。
+    """
+    weights = {"攻击力%": 1.0, "暴击伤害": 1.0, "穿透值": 0.5}
+    # +9、四词条、三次强化：其中一次落在废词条「生命值」上，分数 4.5
+    disc = Disc(9, (
+        Substat("攻击力%", 3), Substat("暴击伤害", 1),
+        Substat("穿透值", 1), Substat("生命值", 2),
+    ))
+    whiffed = "four:9:攻击力%+2|暴击伤害|穿透值|废词条+1"
+    preset = Preset(weights=weights, skip_locked=False)
+
+    assert decide(disc, preset, ()).action == Action.MARK_DISCARD      # 没勾 → 弃置
+    assert decide(disc, preset, (whiffed,)).action == Action.UPGRADE   # 勾了 → 继续强化
+    assert decide(disc, preset, (whiffed,)).pattern_id == whiffed
+
+    # 没有名单时（命令行分数判定）只由门槛决定
+    low = Preset(weights=weights, stage_require={"four": {9: 4.0}}, skip_locked=False)
+    high = Preset(weights=weights, stage_require={"four": {9: 5.0}}, skip_locked=False)
+    assert decide(disc, low, None).action == Action.UPGRADE
+    assert decide(disc, low, None).pattern_id == whiffed
+    assert decide(disc, high, None).action == Action.MARK_DISCARD
 
 
 def test_catalog_reuses_weights_and_does_not_cache_cancelled_generation():

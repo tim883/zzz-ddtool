@@ -11,7 +11,7 @@ from zzz_ddtool.gamedata import blocked_substats, possible_substats
 from zzz_ddtool.origin import Origin
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern, Slot, canonicalize, enumerate_patterns,
-    first_filter, score_slots, useful_ordered,
+    score_slots, useful_ordered,
 )
 
 
@@ -94,7 +94,7 @@ def rebase_selection(job: TaskJob, *, filtered: bool = True,
             if pattern.checkpoint not in CHECKPOINTS:
                 continue
             need = (job.stage_require.get(origin) or {}).get(pattern.checkpoint, 0.0)
-            if pattern.score + 1e-9 < need or not first_filter([pattern]):
+            if pattern.score + 1e-9 < need:
                 continue
         out.add(pattern.pattern_id)
     return tuple(sorted(out))
@@ -156,7 +156,7 @@ class PatternCatalog:
                     raw = enumerator(dict(key), origin=origin, checkpoint=level, cancelled=cancelled) if key else []
                     if cancelled():
                         return None
-                    grouped[(origin.value, level)] = tuple(first_filter(raw))
+                    grouped[(origin.value, level)] = tuple(raw)
             with self._lock:
                 self._entries[key] = grouped
                 # At most four weight configurations and about one maximum-size catalog.

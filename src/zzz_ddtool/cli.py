@@ -92,7 +92,6 @@ def main(argv: list[str] | None = None) -> int:
     preview_p.add_argument(
         "--out", type=Path, help="HTML path, default current log_test round pattern-cards.html"
     )
-    preview_p.add_argument("--show-junk-bonus", action="store_true", help="Also show rolls that landed on junk")
 
     args = parser.parse_args(argv)
     from zzz_ddtool.logutil import setup
@@ -351,7 +350,7 @@ def _cmd_decide(args: argparse.Namespace) -> int:
 
 def _cmd_preview(args: argparse.Namespace) -> int:
     preset = load_preset(args.config)
-    cards = enumerate_all(preset.effective_weights(), hide_junk_bonus=not args.show_junk_bonus)
+    cards = enumerate_all(preset.effective_weights())
     dest = args.out or _default_preview_path()
     write_cards_html(
         cards,

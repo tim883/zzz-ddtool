@@ -144,29 +144,28 @@ def first_filter(
     patterns: Sequence[Pattern],
     *,
     threshold: float | None = None,
-    hide_junk_bonus: bool = True,
 ) -> list[Pattern]:
+    """只按分数门槛过滤，不动「强化落在废词条上」的组合。
+
+    2026-10-14 起废词条上的强化按普通情况照常出卡：它是游戏里真实存在的盘面状态
+    （`槽位 bonus>0`），把它藏起来等于在「本档要求」之外替用户多做一次判弃置。
+    收不收这种盘由门槛与勾选表达：白给一次强化的盘，分数等于它上一档的样子，
+    门槛抬到该收的分数之上它就自然落在门槛外。
+    """
     kept = []
     for pattern in patterns:
-        if hide_junk_bonus and _has_junk_bonus(pattern):
-            continue
         if threshold is not None and pattern.score < threshold:
             continue
         kept.append(pattern)
     return kept
 
 
-def enumerate_all(
-    weights: Mapping[str, float],
-    *,
-    hide_junk_bonus: bool = True,
-) -> list[Pattern]:
+def enumerate_all(weights: Mapping[str, float]) -> list[Pattern]:
     """穷举全部阶段卡片，不过阶段门槛。门槛留给用户在每档手填。"""
     cards: list[Pattern] = []
     for origin in Origin:
         for checkpoint in CHECKPOINTS:
-            raw = enumerate_patterns(weights, origin=origin, checkpoint=checkpoint)
-            cards.extend(first_filter(raw, threshold=None, hide_junk_bonus=hide_junk_bonus))
+            cards.extend(enumerate_patterns(weights, origin=origin, checkpoint=checkpoint))
     return cards
 
 
@@ -174,7 +173,6 @@ def enumerate_filtered(
     weights: Mapping[str, float],
     thresholds: Mapping[int, float] | None = None,
     *,
-    hide_junk_bonus: bool = True,
     stage_require: Mapping[str, Mapping[int, float]] | None = None,
 ) -> list[Pattern]:
     cards: list[Pattern] = []
@@ -186,12 +184,8 @@ def enumerate_filtered(
                 require = float(stage_require[origin.value][checkpoint])
             elif thresholds and checkpoint in thresholds:
                 require = float(thresholds[checkpoint])
-            cards.extend(first_filter(raw, threshold=require, hide_junk_bonus=hide_junk_bonus))
+            cards.extend(first_filter(raw, threshold=require))
     return cards
-
-
-def _has_junk_bonus(pattern: Pattern) -> bool:
-    return any(slot.name == JUNK and slot.bonus > 0 for slot in pattern.slots)
 
 
 def _bonus_assignments(n_slots: int, budget: int, kinds: Sequence[str]) -> list[tuple[int, ...]]:
