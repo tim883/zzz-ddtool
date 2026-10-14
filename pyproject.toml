@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zzz-ddtool"
-version = "0.1.0"
+version = "1.0.0"
 description = "绝区零驱动盘自动强化辅助：本地截屏 + OCR + 模拟点击"
 requires-python = ">=3.11"
 # 缺一个都跑不起来：PySide6 管窗口和图像，opencv/numpy 是 OCR 前置，
