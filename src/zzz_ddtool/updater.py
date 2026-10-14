@@ -213,16 +213,25 @@ def apply_program_update(url: str) -> None:
 
         app_dir = base_dir()
         bat = app_dir / "_update.bat"
+        # 替身脚本的正文保持**纯 ASCII**，两个路径由命令行参数传进来。
+        #
+        # 不能把路径写进脚本正文：cmd.exe 按自己的代码页解析 .bat，安装路径含中文时
+        #   - encoding="ascii"  → Path.write_text 先建文件再编码，抛 UnicodeEncodeError，
+        #                          留下一个 0 字节的 _update.bat，更新静默失败；
+        #   - encoding="mbcs"   → 写得出来，但 cmd 仍可能按别的代码页读，
+        #                          xcopy 一条都复制不到（2026-10-14 实测）。
+        # 走 "%~1"/"%~2" 后，路径经 CreateProcessW 以 Unicode 传入，与代码页无关；
+        # 2026-10-14 用全中文路径实测：xcopy 覆盖与递归复制正常、脚本自删正常。
         bat.write_text(
             "@echo off\r\n"
             "timeout /t 2 /nobreak >nul\r\n"
-            f'xcopy /E /I /Y "{new_dir}" "{app_dir}"\r\n'
-            f'start "" "{app_dir / "zzz-ddtool.exe"}"\r\n'
-            f'del "%~f0"\r\n',
+            'xcopy /E /I /Y "%~1" "%~2"\r\n'
+            'start "" "%~2\\zzz-ddtool.exe"\r\n'
+            'del "%~f0"\r\n',
             encoding="ascii",
         )
-        subprocess.Popen(["cmd", "/c", str(bat)])
+        subprocess.Popen(["cmd", "/c", str(bat), str(new_dir), str(app_dir)])
         raise SystemExit(0)
     finally:
-        # 注意：不能删 tmp，替身 bat 还要从 new_dir 拷贝
+        # 注意：不能删 tmp，替身脚本还要从 new_dir 拷贝
         pass

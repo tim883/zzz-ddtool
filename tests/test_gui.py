@@ -95,6 +95,27 @@ def test_window_loads_example_and_trial(qapp: QApplication, tmp_path) -> None:
     window.close()
 
 
+def test_header_shows_version_and_drops_the_old_hint_line(qapp: QApplication, tmp_path, monkeypatch) -> None:
+    """页头（2026-10-14）：程序名右侧是版本号，第二行只留文件名和保存状态。
+
+    原来第二行那句「左边任务链，中间编当前部位…不必凑齐 6 个」的提示已去掉。
+    """
+    from PySide6.QtWidgets import QLabel
+
+    from zzz_ddtool import version
+
+    version_txt = tmp_path / "version.txt"
+    version_txt.write_text("9.9.9", encoding="utf-8")
+    monkeypatch.setattr(version, "version_file", lambda: version_txt)
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    assert window.version_label.text() == "v9.9.9"
+    assert window.version_label.toolTip()
+    texts = [label.text() for label in window.findChildren(QLabel)]
+    assert all("左边任务链" not in text for text in texts), texts
+    window.close()
+
+
 def test_collect_preset_roundtrip(qapp: QApplication, tmp_path) -> None:
     window = MainWindow(config_path=tmp_path / "t.yaml")
     # 右侧是选中任务的镜像：没有选中任务时右侧为空，得先新建一个任务才有的可收集
@@ -1357,9 +1378,14 @@ def test_refresh_requests_coalesce_and_close_waits_for_worker(qapp, tmp_path, mo
         wait_until(qapp, lambda: window._preview_thread is None)
 
 
-def test_utility_runs_off_thread_and_reports_failure(qapp, tmp_path):
+def test_utility_runs_off_thread_and_reports_failure(qapp, tmp_path, monkeypatch):
     import threading
     from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox
+
+    warnings: list[str] = []
+    # 模态弹窗必须 mock：离屏平台下 QMessageBox.warning 的 exec() 照样阻塞事件循环。
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text: warnings.append(text))
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
     entered, release = threading.Event(), threading.Event()
@@ -1382,6 +1408,8 @@ def test_utility_runs_off_thread_and_reports_failure(qapp, tmp_path):
         wait_until(qapp, lambda: window._utility_thread is None)
         assert window.start_btn.isEnabled()
         assert "test failure" in window.status.text()
+        # 失败不能只写状态栏：更新下载耗时长，用户会把失败当成"慢"（2026-10-14 线上表现）
+        assert warnings and "test failure" in warnings[-1]
     finally:
         release.set()
         window.close()

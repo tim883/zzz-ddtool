@@ -68,6 +68,7 @@ from zzz_ddtool.decide import decide
 from zzz_ddtool.models import Disc, Substat
 from zzz_ddtool.origin import Origin
 from zzz_ddtool.taskcards import PatternCatalog, counts_signature, effective_required_substats, effective_weights, has_required_substats, rebase_selection, task_counts
+from zzz_ddtool.version import current_version
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern,
@@ -167,6 +168,7 @@ QLabel#hint { color: #605e5c; }
 QLabel#saveStateIdle { color: #8a8a8a; }
 QLabel#saveState { color: #107c10; font-weight: 700; }
 QLabel#bannerTitle { font-size: 20px; font-weight: 700; color: #1a1a1a; }
+QLabel#appVersion { color: #605e5c; font-size: 13px; }
 QLabel#score { color: #0078d7; font-size: 13px; font-weight: 600; }
 QLabel#junk { color: #8a8a8a; }
 QLabel#empty { color: #9a9a9a; font-style: italic; }
@@ -1736,30 +1738,37 @@ class MainWindow(QMainWindow):
         titles.setSpacing(2)
         title = QLabel("驱动盘强化辅助")
         title.setObjectName("bannerTitle")
-        hint = _ElidedLabel("左边任务链，中间编当前部位，右边勾组合。设完一号就新建任务，不必凑齐 6 个。")
-        hint.setObjectName("hint")
+        # 版本号跟在程序名右侧：打包态读 exe 同级的 version.txt，开发态仓库根没有这个
+        # 文件，会回退成 version.FALLBACK_VERSION（要和 pyproject 的 version 对齐）。
+        self.version_label = QLabel(f"v{current_version()}")
+        self.version_label.setObjectName("appVersion")
+        self.version_label.setToolTip("当前程序版本（读程序目录下的 version.txt）")
+        # 文件名标签跟当前存档走：悬停看全路径。它排在保存状态左边，两者一起靠右。
         self.path_label = QLabel()
         self.path_label.setObjectName("hint")
-        # 保存状态常驻标签：固定在标题行右端，不占用文件名位置。
-        # 固定宽度避免文本长短变化时布局跳动。
+        # 保存状态常驻标签：文件名行最右的一个。
+        # 宽度跟着文本走（「未保存」短、保存后带时间戳长），换来文件名和状态之间
+        # 恒定的一小段间隔；不再用固定宽度顶住，状态文本变长时文件名跟着左移。
         self.save_label = QLabel()
         self.save_label.setObjectName("saveStateIdle")
         self.save_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.save_label.setFixedWidth(160)
-        # 页头只占两行，矮屏上多留给三栏：文件名跟标题一行，保存状态跟提示语一行。
-        # 保存状态放在能被压窄的提示语旁边，不放标题行，免得把整个窗口的最小宽撑大。
+        # 页头只占两行，矮屏上多留给三栏：第一行程序名 + 版本号，第二行文件名 + 保存状态。
+        # 第二行原来是「左边任务链…不必凑齐 6 个」那句操作提示（2026-10-14 去掉），
+        # 现在整行靠右排成「文件名 · 保存状态」，左边留白。
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(14)
         title_row.addWidget(title)
-        title_row.addWidget(self.path_label, 0, Qt.AlignmentFlag.AlignBottom)
+        title_row.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignBottom)
         title_row.addStretch(1)
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_row.addWidget(hint, 1)
-        hint_row.addWidget(self.save_label)
+        path_row = QHBoxLayout()
+        path_row.setContentsMargins(0, 0, 0, 0)
+        path_row.setSpacing(12)
+        path_row.addStretch(1)
+        path_row.addWidget(self.path_label)
+        path_row.addWidget(self.save_label)
         titles.addLayout(title_row)
-        titles.addLayout(hint_row)
+        titles.addLayout(path_row)
         self._reset_saved_state()
 
         open_btn = QPushButton("打开")
@@ -3551,6 +3560,9 @@ class MainWindow(QMainWindow):
             self.close()
         elif worker.error is not None:
             self.status.setText(f"操作失败：{worker.error}")
+            # 只写状态栏会被忽略：更新下载耗时长，用户会一直以为只是"慢"。
+            # 2026-10-14 线上就是这个表现——替身脚本写失败、状态栏有字、用户没看见。
+            QMessageBox.warning(self, "操作失败", f"操作没能完成：\n\n{worker.error}")
         else:
             self._update_status()
             self._utility_success(worker.value)

@@ -240,3 +240,52 @@ def test_log_stripped_reaches_the_text_log(tmp_path, monkeypatch) -> None:
     assert "log" in text
     assert "log_test" in text
     loground.close_active()  # 收尾释放占用：不把活动轮次留给后面的用例
+
+
+def test_update_bat_survives_non_ascii_install_path(tmp_path: Path, monkeypatch) -> None:
+    """安装路径含非 ASCII 时，替身脚本必须完整写出，且路径不得写进脚本正文。
+
+    2026-10-14 线上实测踩到的两种错法：
+
+    - ``encoding="ascii"``：``Path.write_text`` 先建文件再编码，抛
+      ``UnicodeEncodeError`` 并留下 **0 字节** 的 ``_update.bat`` —— 更新静默失败，
+      界面只在状态栏给一行字，用户看着就是"卡住了"。
+    - ``encoding="mbcs"``：写得出来，但 cmd.exe 按自己的代码页读脚本，
+      xcopy 一条都复制不到（同日在全中文路径下实测）。
+
+    所以正文保持纯 ASCII，两个路径用 ``%~1``/``%~2`` 由命令行传入 —— 路径经
+    ``CreateProcessW`` 以 Unicode 传递，与代码页无关。
+    """
+    app = tmp_path / "更新测试" / "zzz-ddtool"  # 中文安装路径，就是触发条件
+    app.mkdir(parents=True)
+
+    zipsrc = tmp_path / "prog.zip"
+    _make_zip(zipsrc, {"zzz-ddtool.exe": "NEW-EXE", "version.txt": "1.0.1"})
+    staged = tmp_path / "staged"
+    staged.mkdir()
+
+    captured: dict = {}
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = list(args)
+        return None
+
+    monkeypatch.setattr(updater, "_download", lambda url, dest: Path(dest).write_bytes(zipsrc.read_bytes()))
+    monkeypatch.setattr(paths, "base_dir", lambda: app)
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **kwargs: str(staged))
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    with pytest.raises(SystemExit):
+        updater.apply_program_update("http://example.invalid/x.zip")
+
+    bat = app / "_update.bat"
+    assert bat.is_file()
+    assert bat.stat().st_size > 0, "0 字节的替身脚本 = 更新静默失败"
+
+    text = bat.read_text(encoding="ascii")  # 纯 ASCII：这一步本身也是断言
+    assert "%~1" in text and "%~2" in text
+    assert "更新测试" not in text, "路径不得写进脚本正文（cmd 会按代码页误读）"
+    # 两个路径必须作为参数传出，而不是拼进脚本
+    assert captured["args"][:3] == ["cmd", "/c", str(bat)]
+    assert captured["args"][3] == str(staged / "new")
+    assert captured["args"][4] == str(app)
