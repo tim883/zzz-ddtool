@@ -68,7 +68,7 @@ def test_apply_program_update_cannot_touch_user_or_log(tmp_path: Path, monkeypat
     staged = tmp_path / "staged"
     staged.mkdir()
 
-    monkeypatch.setattr(updater, "_download", lambda url, dest: Path(dest).write_bytes(zipsrc.read_bytes()))
+    monkeypatch.setattr(updater, "_download", lambda url, dest, progress=None: Path(dest).write_bytes(zipsrc.read_bytes()))
     monkeypatch.setattr(paths, "base_dir", lambda: app)
     monkeypatch.setattr(tempfile, "mkdtemp", lambda **kwargs: str(staged))
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: None)
@@ -112,7 +112,7 @@ def test_apply_data_update_strips_protected_and_merges_into_data(tmp_path: Path,
     workdir = tmp_path / "work"
     workdir.mkdir()
 
-    monkeypatch.setattr(updater, "_download", lambda url, dest: Path(dest).write_bytes(zipsrc.read_bytes()))
+    monkeypatch.setattr(updater, "_download", lambda url, dest, progress=None: Path(dest).write_bytes(zipsrc.read_bytes()))
     monkeypatch.setattr(paths, "data_dir", lambda: data_root)
     monkeypatch.setattr(tempfile, "mkdtemp", lambda **kwargs: str(workdir))
 
@@ -270,7 +270,7 @@ def test_update_bat_survives_non_ascii_install_path(tmp_path: Path, monkeypatch)
         captured["args"] = list(args)
         return None
 
-    monkeypatch.setattr(updater, "_download", lambda url, dest: Path(dest).write_bytes(zipsrc.read_bytes()))
+    monkeypatch.setattr(updater, "_download", lambda url, dest, progress=None: Path(dest).write_bytes(zipsrc.read_bytes()))
     monkeypatch.setattr(paths, "base_dir", lambda: app)
     monkeypatch.setattr(tempfile, "mkdtemp", lambda **kwargs: str(staged))
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -289,3 +289,68 @@ def test_update_bat_survives_non_ascii_install_path(tmp_path: Path, monkeypatch)
     assert captured["args"][:3] == ["cmd", "/c", str(bat)]
     assert captured["args"][3] == str(staged / "new")
     assert captured["args"][4] == str(app)
+
+
+class _FakeStreamResp:
+    """urlopen 替身：支持分块 ``read(size)`` 与 ``headers``，用来测下载进度。"""
+
+    def __init__(self, chunks: list[bytes], total: int | None) -> None:
+        self._chunks = list(chunks)
+        self.headers = {} if total is None else {"Content-Length": str(total)}
+
+    def read(self, size: int = -1) -> bytes:  # noqa: ARG002 - 替身忽略块大小
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def __enter__(self) -> "_FakeStreamResp":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def test_download_reports_progress_with_content_length(tmp_path: Path, monkeypatch) -> None:
+    """分块下载要逐块回调进度，总量取 Content-Length。
+
+    程序包约 140 MB，慢网络要十几分钟；没有这个回调，界面只能显示一句
+    "正在下载…"，用户无法区分"慢"和"卡死"。
+    """
+    chunks = [b"a" * 1000, b"b" * 1000, b"c" * 500]
+    total = sum(len(c) for c in chunks)
+    seen: list[tuple[int, int | None]] = []
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen", lambda *a, **kw: _FakeStreamResp(chunks, total)
+    )
+    dest = tmp_path / "out.bin"
+    updater._download("http://example.invalid/x", dest, progress=lambda d, t: seen.append((d, t)))
+
+    assert dest.read_bytes() == b"".join(chunks)
+    assert [d for d, _ in seen] == [1000, 2000, 2500], "进度必须单调递增到总量"
+    assert all(t == total for _, t in seen)
+
+
+def test_download_progress_tolerates_unknown_total(tmp_path: Path, monkeypatch) -> None:
+    """服务端不给 Content-Length 时总量传 None：不能崩，也要照常落盘。"""
+    chunks = [b"x" * 10, b"y" * 20]
+    seen: list[tuple[int, int | None]] = []
+
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen", lambda *a, **kw: _FakeStreamResp(chunks, None)
+    )
+    dest = tmp_path / "o.bin"
+    updater._download("http://example.invalid/x", dest, progress=lambda d, t: seen.append((d, t)))
+
+    assert dest.read_bytes() == b"".join(chunks)
+    assert seen == [(10, None), (30, None)]
+
+
+def test_download_without_progress_callback_still_works(tmp_path: Path, monkeypatch) -> None:
+    """不传 progress 时照旧可用（多数调用点不需要进度）。"""
+    chunks = [b"z" * 7]
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen", lambda *a, **kw: _FakeStreamResp(chunks, 7)
+    )
+    dest = tmp_path / "z.bin"
+    updater._download("http://example.invalid/x", dest)
+
+    assert dest.read_bytes() == b"z" * 7

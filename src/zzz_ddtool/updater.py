@@ -122,12 +122,29 @@ def check_for_update() -> UpdateStatus:
     return UpdateStatus(available, latest, current, body, data_url, program_url)
 
 
-def _download(url: str, dest) -> None:
-    import shutil
+def _download(url: str, dest, progress=None) -> None:
+    """下载到 ``dest``。
 
+    ``progress`` 可选，签名 ``progress(已下载字节, 总字节或 None)``：每读完一块调一次。
+    总量取响应的 ``Content-Length``；服务端分块传输不给长度时传 ``None``，
+    调用方必须能接受"总量未知"。
+
+    为什么不用 ``shutil.copyfileobj``：程序包约 140 MB，慢网络下要十几分钟，
+    全程不给进度用户会以为卡死（2026-10-14 两次都被这么误判）。
+    """
     req = urllib.request.Request(url, headers={"User-Agent": "zzz-ddtool"})
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
-        shutil.copyfileobj(resp, f)
+        raw_total = resp.headers.get("Content-Length")
+        total = int(raw_total) if raw_total and str(raw_total).isdigit() else None
+        done = 0
+        while True:
+            chunk = resp.read(262144)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress is not None:
+                progress(done, total)
 
 
 def _strip_protected(root: Path) -> list[str]:
@@ -163,7 +180,7 @@ def _log_stripped(removed: list[str]) -> None:
         )
 
 
-def apply_data_update(url: str) -> None:
+def apply_data_update(url: str, progress=None) -> None:
     """数据更新：下载数据包 zip，剥离 user//log//log_test/ 后覆盖 data/（只碰 data）。"""
     import shutil
     import tempfile
@@ -174,7 +191,7 @@ def apply_data_update(url: str) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="zzz-data-"))
     try:
         zip_path = tmp / "data.zip"
-        _download(url, zip_path)
+        _download(url, zip_path, progress)
         staged = tmp / "new"
         staged.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as zf:
@@ -188,11 +205,11 @@ def apply_data_update(url: str) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def apply_program_update(url: str) -> None:
-    """程序更新：下载完整包 zip，解压到临时目录，写替身 bat 替换后重启。
+def apply_program_update(url: str, progress=None) -> None:
+    """程序更新：下载完整包 zip，解压到临时目录，写替身脚本替换后重启。
 
-    主程序退出后，替身 bat 等待 2 秒、覆盖程序目录、拉起新 exe、删自己。
-    （初版，需真机验证）
+    主程序退出后，替身脚本等待 2 秒、覆盖程序目录、拉起新 exe、删自己。
+    2026-10-14 已在真机（含中文安装路径）端到端验证通过。
     """
     import shutil
     import subprocess
@@ -204,7 +221,7 @@ def apply_program_update(url: str) -> None:
     tmp = Path(tempfile.mkdtemp(prefix="zzz-prog-"))
     try:
         zip_path = tmp / "prog.zip"
-        _download(url, zip_path)
+        _download(url, zip_path, progress)
         new_dir = tmp / "new"
         new_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path) as zf:

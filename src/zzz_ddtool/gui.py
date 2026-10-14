@@ -6,7 +6,9 @@ Spin boxes keep the system arrows (not styled).
 
 from __future__ import annotations
 
+import inspect
 import sys
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from dataclasses import replace
@@ -1381,6 +1383,8 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._exit_after_close: int | None = None
         self._utility_thread = None
+        self._utility_message = ""      # 后台操作的提示语，进度行在它后面接百分比
+        self._utility_started = 0.0     # 该操作开始时刻，用来估剩余时间
         self._pattern_catalog = PatternCatalog()
         self._counts_thread = None
         self._job_counts: dict[str, tuple[tuple, dict]] = {}
@@ -3060,13 +3064,15 @@ class MainWindow(QMainWindow):
             ask = f"{detail}\n\n将下载完整程序包，程序会退出、重启后完成更新。现在更新？"
             if QMessageBox.question(self, "检查更新", ask, yes | no, yes) == yes:
                 self._start_utility(
-                    lambda: apply_program_update(st.program_url), lambda _result: None, "正在下载程序更新…"
+                    lambda report: apply_program_update(st.program_url, progress=report),
+                    lambda _result: None,
+                    "正在下载程序更新…",
                 )
         elif st.data_url:
             ask = f"{detail}\n\n将下载数据包（套装名/词条名/图片），立即生效、无需重启。现在更新？"
             if QMessageBox.question(self, "检查更新", ask, yes | no, yes) == yes:
                 self._start_utility(
-                    lambda: apply_data_update(st.data_url),
+                    lambda report: apply_data_update(st.data_url, progress=report),
                     lambda _result: QMessageBox.information(self, "检查更新", "数据已更新，立即生效。"),
                     "正在下载数据更新…",
                 )
@@ -3524,17 +3530,44 @@ class MainWindow(QMainWindow):
         )
 
     def _start_utility(self, operation, on_success, message: str) -> None:  # noqa: ANN001
+        """在后台线程跑一次工具操作。
+
+        ``operation`` **可选地**接收一个 ``report(已下载字节, 总字节或 None)`` 回调；
+        需要显示下载进度的操作（程序/数据更新）接上它，其余操作保持零参即可。
+        """
         if self._utility_thread is not None or self._run_thread is not None or self._closing:
             return
         self._utility_success = on_success
+        self._utility_message = message
+        self._utility_started = time.monotonic()
         worker = _UtilityThread(operation, self)
         self._utility_thread = worker
         worker.finished.connect(self._on_utility_finished)
+        worker.progress.connect(self._on_utility_progress)
         self.start_btn.setEnabled(False)
         for button in self._task_controls:
             button.setEnabled(False)
         self.status.setText(message)
         worker.start()
+
+    def _on_utility_progress(self, done: int, total) -> None:  # noqa: ANN001
+        """把下载进度写进状态行。
+
+        原先只显示一句"正在下载程序更新…"。程序包约 140 MB，慢网络要十几分钟，
+        用户无法区分"慢"和"卡死"——2026-10-14 两次都被误判成卡住。
+        """
+        if not total:
+            self.status.setText(f"{self._utility_message} 已下载 {done / 1048576:.1f} MB")
+            return
+        text = (
+            f"{self._utility_message} {int(done * 100 / total)}%"
+            f"（{done / 1048576:.1f} / {total / 1048576:.1f} MB）"
+        )
+        elapsed = time.monotonic() - self._utility_started
+        if elapsed > 1 and done > 0:
+            remain = (total - done) * elapsed / done
+            text += f"，约剩 {remain / 60:.0f} 分钟" if remain >= 60 else f"，约剩 {remain:.0f} 秒"
+        self.status.setText(text)
 
     def _on_utility_finished(self) -> None:
         worker = self._utility_thread
@@ -3682,16 +3715,29 @@ def apply_light_style(app: QApplication) -> None:
 
 
 class _UtilityThread(QThread):
+    # (已下载字节, 总字节或 None)。跨线程必须走信号：工作线程不能直接碰控件。
+    progress = Signal(int, object)
+
     def __init__(self, operation, parent: QWidget) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.operation = operation
         self.value = None
         self.error = None
         self.exit_code = None
+        # operation **可选地**接收一个 report 回调。零参操作（检查更新、取示例列表、
+        # 生成组合）不需要进度，继续按零参调用，不必为了统一而都给它们加个参数。
+        try:
+            self._wants_report = len(inspect.signature(operation).parameters) >= 1
+        except (TypeError, ValueError):
+            self._wants_report = False
+
+    def report(self, done: int, total) -> None:  # noqa: ANN001
+        """在工作线程里上报下载进度，经信号转回主线程。"""
+        self.progress.emit(int(done), total)
 
     def run(self) -> None:
         try:
-            self.value = self.operation()
+            self.value = self.operation(self.report) if self._wants_report else self.operation()
         except SystemExit as exc:
             self.exit_code = int(exc.code or 0)
         except Exception as exc:

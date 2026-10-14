@@ -2948,3 +2948,64 @@ def test_fetch_public_examples_cancelled_dialog_writes_nothing(qapp, tmp_path, m
         assert not (plans / "a.yaml").exists()
     finally:
         window.close()
+
+
+def test_utility_thread_hands_report_to_operations_that_want_it(qapp):
+    """接收 report 的操作要拿到回调，进度经信号转回主线程。
+
+    下载进度必须走信号：工作线程直接改控件会崩。这里同步调 run()，
+    同线程下信号是直连，所以能直接断言到。
+    """
+    from zzz_ddtool.gui import _UtilityThread
+
+    seen: list[tuple[int, object]] = []
+    passed: list[object] = []
+
+    def operation(report):
+        passed.append(report)
+        report(1000, 4000)
+        report(2000, 4000)
+        return "done"
+
+    worker = _UtilityThread(operation, None)
+    worker.progress.connect(lambda done, total: seen.append((done, total)))
+    worker.run()
+
+    assert worker.value == "done"
+    assert worker.error is None
+    assert passed and callable(passed[0]), "操作必须收到可调用的 report"
+    assert seen == [(1000, 4000), (2000, 4000)]
+
+
+def test_utility_thread_keeps_calling_zero_arg_operations(qapp):
+    """零参操作（检查更新、取示例列表、生成组合）继续按零参调用。"""
+    from zzz_ddtool.gui import _UtilityThread
+
+    worker = _UtilityThread(lambda: "ok", None)
+    worker.run()
+
+    assert worker.value == "ok"
+    assert worker.error is None
+
+
+def test_utility_progress_line_shows_percent_and_size(qapp, tmp_path):
+    """进度要写成"百分比 + 已下/总量"，总量未知时退化成"已下载多少"。"""
+    import time
+
+    from zzz_ddtool import gui
+
+    window = gui.MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._utility_message = "正在下载程序更新…"
+        window._utility_started = time.monotonic()  # 刚起步，不附剩余时间
+
+        window._on_utility_progress(50 * 1048576, 100 * 1048576)
+        text = window.status.text()
+        assert "正在下载程序更新…" in text
+        assert "50%" in text
+        assert "50.0 / 100.0 MB" in text
+
+        window._on_utility_progress(3 * 1048576, None)
+        assert "已下载 3.0 MB" in window.status.text()
+    finally:
+        window.close()
