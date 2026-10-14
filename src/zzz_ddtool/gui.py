@@ -511,25 +511,6 @@ def default_config_path() -> Path:
     return plans_dir() / "example.yaml"
 
 
-class _ElidedLabel(QLabel):
-    """单行标签：放不下收省略号，悬停看全文。窄窗口下不折行，不把所在行撑高。"""
-
-    def __init__(self, text: str, parent: QWidget | None = None) -> None:
-        super().__init__(text, parent)
-        self.setToolTip(text)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-    def minimumSizeHint(self) -> QSize:
-        return QSize(0, super().minimumSizeHint().height())
-
-    def paintEvent(self, _event) -> None:  # noqa: ANN001
-        rect = self.contentsRect()
-        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, rect.width())
-        painter = QPainter(self)
-        self.style().drawItemText(painter, rect, int(self.alignment()), self.palette(), self.isEnabled(),
-                                  text, self.foregroundRole())
-
-
 class FlowLayout(QLayout):
     def __init__(self, parent: QWidget | None = None, spacing: int = 12) -> None:
         super().__init__(parent)
@@ -1733,9 +1714,12 @@ class MainWindow(QMainWindow):
         super().moveEvent(event)
         self._queue_layout_save()
 
-    def _build_header(self) -> QHBoxLayout:
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
+    def _build_header(self) -> QVBoxLayout:
+        """页头两行：上＝程序名 + 版本号 + 操作按钮（按钮靠右），下＝文件名 + 保存状态。
+
+        两行各自占满整幅宽度，不是「左文字块 + 右按钮块」的两栏结构：两栏结构下
+        第二行的右端只能到按钮左边缘，顶不到窗口右边（2026-10-14 改成上下两行）。
+        """
         title = QLabel("驱动盘强化辅助")
         title.setObjectName("bannerTitle")
         # 版本号跟在程序名右侧：打包态读 exe 同级的 version.txt，开发态仓库根没有这个
@@ -1752,14 +1736,16 @@ class MainWindow(QMainWindow):
         self.save_label = QLabel()
         self.save_label.setObjectName("saveStateIdle")
         self.save_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        # 页头只占两行，矮屏上多留给三栏：第一行程序名 + 版本号，第二行文件名 + 保存状态。
-        # 第二行原来是「左边任务链…不必凑齐 6 个」那句操作提示（2026-10-14 去掉），
-        # 现在整行靠右排成「文件名 · 保存状态」，左边留白。
+        # 页头只占两行，矮屏上多留给三栏：第一行程序名 + 版本号 + 操作按钮，
+        # 第二行文件名 + 保存状态。第二行原来是「左边任务链…不必凑齐 6 个」那句操作提示
+        # （2026-10-14 去掉），现在整行靠右排成「文件名 · 保存状态」，左边留白。
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(14)
-        title_row.addWidget(title)
-        title_row.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignBottom)
+        # 程序名和版本号按基线对齐：按钮比标题高，整行高度由按钮顶起来，
+        # 只写 AlignBottom 的话版本号会掉到标题基线下面去。
+        title_row.addWidget(title, 0, Qt.AlignmentFlag.AlignBaseline)
+        title_row.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignBaseline)
         title_row.addStretch(1)
         path_row = QHBoxLayout()
         path_row.setContentsMargins(0, 0, 0, 0)
@@ -1767,8 +1753,6 @@ class MainWindow(QMainWindow):
         path_row.addStretch(1)
         path_row.addWidget(self.path_label)
         path_row.addWidget(self.save_label)
-        titles.addLayout(title_row)
-        titles.addLayout(path_row)
         self._reset_saved_state()
 
         open_btn = QPushButton("打开")
@@ -1800,11 +1784,17 @@ class MainWindow(QMainWindow):
         actions.addWidget(save_btn)
         actions.addWidget(save_as_btn)
 
-        banner = QHBoxLayout()
-        banner.addLayout(titles, 1)
-        banner.addLayout(actions)
-        banner.setAlignment(actions, Qt.AlignmentFlag.AlignTop)
-        return banner
+        # 按钮挂在标题行右端，不再单独占一栏；第二行因此能顶到窗口右边。
+        title_row.addLayout(actions)
+
+        header = QVBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        # 两行的间距取 10，和页头到下面三栏的间距（__init__ 里 outer.setSpacing(10)）相同：
+        # 文件名/保存状态那一行上下空隙相等，不贴着按钮行的底边。
+        header.setSpacing(10)
+        header.addLayout(title_row)
+        header.addLayout(path_row)
+        return header
 
     def _build_left(self) -> QWidget:
         panel = QWidget()
@@ -3584,7 +3574,9 @@ class MainWindow(QMainWindow):
         """保存成功后右侧状态常驻显示绿字时间戳，直到下次保存或被载入重置。"""
         self.save_label.setObjectName("saveState")
         self._repolish(self.save_label)
-        self.save_label.setText(f"✓ 已保存 · {datetime.now().strftime('%H:%M:%S')}")
+        # 不加「✓」这类符号前缀：字体缺字形时是一个方块（2026-10-14 去掉）。
+        # “成功”由绿色和「已保存」四个字表达，够清楚了。
+        self.save_label.setText(f"已保存 · {datetime.now().strftime('%H:%M:%S')}")
         self.save_label.setToolTip(str(self._path))
 
     def _reset_saved_state(self) -> None:
