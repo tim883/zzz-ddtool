@@ -306,12 +306,49 @@ def test_save_all_examples_counts_ok_and_reports_each_failure(tmp_path: Path, mo
     good = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
     bad = examples.ExampleItem("b.yaml", "t", "2026-10-10", "", "y" * 64, b"NEW")
 
-    ok, problems = examples.save_all_examples([good, bad])
+    report = examples.save_all_examples([good, bad])
 
-    assert ok == 1
-    assert len(problems) == 1
-    assert "b.yaml" in problems[0]
+    assert (report.written, report.skipped) == (1, 0)
+    assert len(report.problems) == 1
+    assert "b.yaml" in report.problems[0]
     assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"
+
+
+def test_save_all_examples_reports_identical_as_skipped_not_saved(tmp_path: Path, monkeypatch) -> None:
+    """本地内容相同=**没有落盘**，就不能报成"已保存"。
+
+    用户场景：三份示例本地都已是最新，点「下载」后界面报"已保存 3 项"，而
+    `user/plan/` 里一个文件都没动 —— 用户据此以为程序没认出他已有的文件。
+    """
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "a.yaml").write_bytes(b"NEW")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    report = examples.save_all_examples([item])
+
+    assert (report.written, report.skipped, report.problems) == (0, 1, ())
+    assert "已保存" not in report.message()
+    assert "未重复下载" in report.message()
+
+
+def test_local_state_and_needs_download(tmp_path: Path, monkeypatch) -> None:
+    """三种本地状态的判定口径，以及"还要不要下"只由"内容是否相同"决定。"""
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "same.yaml").write_bytes(b"NEW")
+    (plans / "diff.yaml").write_bytes(b"MINE")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+
+    same = examples.ExampleItem("same.yaml", "t", "2026-10-10", "", "a" * 64, b"NEW")
+    diff = examples.ExampleItem("diff.yaml", "t", "2026-10-10", "", "b" * 64, b"NEW")
+    missing = examples.ExampleItem("none.yaml", "t", "2026-10-10", "", "c" * 64, b"NEW")
+
+    assert examples.local_state(same) == "已是最新"
+    assert examples.local_state(diff) == "将并列保存"
+    assert examples.local_state(missing) == "不存在"
+    assert [examples.needs_download(item) for item in (same, diff, missing)] == [False, True, True]
 
 
 # --- 修复轮（独立评审发现）--------------------------------------------------
@@ -387,8 +424,8 @@ def test_save_all_examples_absorbs_unexpected_exception(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(examples, "_atomic_write", boom)
 
-    ok, problems = examples.save_all_examples([item])
+    report = examples.save_all_examples([item])
 
-    assert ok == 0
-    assert len(problems) == 1
-    assert "bad path" in problems[0]
+    assert (report.written, report.skipped) == (0, 0)
+    assert len(report.problems) == 1
+    assert "bad path" in report.problems[0]

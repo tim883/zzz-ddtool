@@ -74,7 +74,7 @@ from zzz_ddtool.version import current_version
 from zzz_ddtool.widgets import NoWheelDoubleSpinBox, NoWheelSpinBox
 from zzz_ddtool.patterns import (
     CHECKPOINTS, EMPTY, JUNK, Pattern,
-    enumerate_filtered, enumerate_patterns, first_filter, useful_ordered,
+    enumerate_filtered, enumerate_patterns, useful_ordered,
 )
 
 # 部位中文标签：右侧 tab 与「拷贝对方本档要求」按钮都用它，保持一致。
@@ -170,6 +170,7 @@ QLabel#hint { color: #605e5c; }
 QLabel#saveStateIdle { color: #8a8a8a; }
 QLabel#saveState { color: #107c10; font-weight: 700; }
 QLabel#bannerTitle { font-size: 20px; font-weight: 700; color: #1a1a1a; }
+QLabel#dialogTitle { font-size: 20px; font-weight: 700; color: #1a1a1a; }
 QLabel#appVersion { color: #605e5c; font-size: 13px; }
 QLabel#score { color: #0078d7; font-size: 13px; font-weight: 600; }
 QLabel#junk { color: #8a8a8a; }
@@ -1324,28 +1325,45 @@ class ConfirmSelectAllDialog(QDialog):
 
 
 class ExampleFetchDialog(QDialog):
-    """列出远端示例（文件名 / 标题 / 时间 / 说明 / 本地状态），勾选后下载。
+    """列出远端示例（文件名 / 时间 / 本地状态），勾选后下载。
 
     只负责"让用户挑"；落盘交给 `examples.save_example` —— 那个从不覆盖已有文件。
+    本地已是最新内容的**默认不勾选**：那些没什么可下的，勾上也只是空跑一趟。
+
+    每行只放三样东西：文件名、时间、是否最新。标题与手写说明退到悬停提示里——
+    行一长就得横向滑动，而滑动会把每行最左边的勾选框顶出视野（2026-10-14 实测），
+    勾选框必须一直看得见，所以这里显式关掉横向滑动条。
     """
 
     def __init__(self, items: list, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        from zzz_ddtool import examples
+
         self.setWindowTitle("获取公共示例")
         self.setMinimumWidth(620)
         self._items = list(items)
 
         layout = QVBoxLayout(self)
-        intro = QLabel("勾选要下载的示例。本地已有同名且内容不同的，会并列保存一份，不覆盖你现有的。")
+        heading = QLabel("勾选要下载的示例")
+        heading.setObjectName("dialogTitle")
+        layout.addWidget(heading)
+
+        intro = QLabel("本地已是最新的默认不勾选；同名而内容不同的会并列保存一份，不覆盖你现有的。")
+        intro.setObjectName("hint")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         self.list = QListWidget(self)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         for index, item in enumerate(self._items):
             entry = QListWidgetItem(self._row_text(item), self.list)
             entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            entry.setCheckState(Qt.CheckState.Checked)
+            entry.setCheckState(
+                Qt.CheckState.Checked if examples.needs_download(item) else Qt.CheckState.Unchecked
+            )
             entry.setData(Qt.ItemDataRole.UserRole, index)
+            entry.setToolTip(self._row_tooltip(item))
         layout.addWidget(self.list, 1)
 
         buttons = QDialogButtonBox(
@@ -1358,25 +1376,24 @@ class ExampleFetchDialog(QDialog):
         layout.addWidget(buttons)
 
     def _local_state(self, item) -> str:
-        from zzz_ddtool.paths import plans_dir
+        from zzz_ddtool import examples
 
-        target = plans_dir() / item.file
-        try:
-            if not target.exists():
-                return "不存在"
-            return "已是最新" if target.read_bytes() == item.content else "将并列保存"
-        except OSError:
-            return "未知"
+        return examples.local_state(item)
 
     def _row_text(self, item) -> str:
-        note = item.note or "-"
-        state = self._local_state(item)
-        return f"{item.file}  ·  {item.title}  ·  {item.updated_at}  ·  {note}  ·  {state}"
+        return f"{item.file}  ·  {item.updated_at}  ·  {self._local_state(item)}"
+
+    def _row_tooltip(self, item) -> str:
+        """行内放不下的标题与说明放在悬停提示里，手写说明因此仍然读得到。"""
+        lines = [f"标题：{item.title}"]
+        if item.note:
+            lines.append(f"说明：{item.note}")
+        return "\n".join(lines)
 
     def row_text(self, index: int) -> list[str]:
-        """某一行的字段，供测试与无障碍阅读。"""
+        """某一行的字段（与显示一致），供测试与无障碍阅读。"""
         item = self._items[index]
-        return [item.file, item.title, item.updated_at, item.note, self._local_state(item)]
+        return [item.file, item.updated_at, self._local_state(item)]
 
     def selected_items(self) -> list:
         picked = []
@@ -3084,6 +3101,8 @@ class MainWindow(QMainWindow):
         self._start_utility(collect, self._handle_public_examples, "正在获取示例列表…")
 
     def _handle_public_examples(self, result) -> None:  # noqa: ANN001
+        from zzz_ddtool import examples
+
         items, error = result
         if error:
             QMessageBox.information(self, "获取公共示例", error)
@@ -3092,21 +3111,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "获取公共示例", "远端暂无示例。")
             return
 
+        # 与远端逐字节相同的本地文件没得可下：不要弹一个只会空跑一趟的下载框，
+        # 直接照「检查更新」的口径说一句"已是最新"。
+        todo = [item for item in items if examples.needs_download(item)]
+        if not todo:
+            QMessageBox.information(
+                self, "获取公共示例", f"远端 {len(items)} 份示例都已是本地最新，无需下载。"
+            )
+            return
+
         picked = self._open_example_fetch_dialog(items)
         if not picked:
             return
 
-        from zzz_ddtool.examples import save_all_examples
-
-        ok, problems = save_all_examples(picked)
-        if problems:
-            QMessageBox.information(
-                self,
-                "获取公共示例",
-                f"已保存 {ok} 项；以下未保存：\n" + "\n".join(problems),
-            )
-            return
-        QMessageBox.information(self, "获取公共示例", f"已保存 {ok} 项。")
+        report = examples.save_all_examples(picked)
+        QMessageBox.information(self, "获取公共示例", report.message())
 
     def _open_example_fetch_dialog(self, items) -> list:  # noqa: ANN001
         """单独成方法，测试里覆盖掉它就不用真弹窗。"""

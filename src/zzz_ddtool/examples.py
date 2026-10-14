@@ -2,7 +2,8 @@
 
 示例的语义：示例是**用户自己的存档**，不是程序管理的模板。
 启动时只把包里缺的示例种进 ``user/plan/``，此后用户改、删都不再干预；要拿新
-示例走界面「获取公共示例」的主动通道，它同样从不覆盖本地文件。
+示例走界面「获取公共示例」的主动通道，它同样从不覆盖本地文件，也**不把已经
+是最新内容的再要一遍**（本地状态判定见 ``local_state``）。
 
 「只种一次」用 ``user/.examples-seeded`` 标记，与 ``userdata.migrate_plans()``
 的 ``.plans-imported`` 是两条独立的生命周期。
@@ -90,6 +91,36 @@ class ExampleItem:
     note: str
     sha256: str
     content: bytes
+
+
+# 本地状态：界面列表与「要不要下载」共用同一处判定，避免各写一遍比较口径。
+STATE_MISSING = "不存在"
+STATE_LATEST = "已是最新"
+STATE_PARALLEL = "将并列保存"
+STATE_UNKNOWN = "未知"
+
+
+def local_state(item: ExampleItem) -> str:
+    """``user/plan/`` 里这份示例相对远端内容的状态。
+
+    只比字节：本地与远端同内容才算"已是最新"（这就是"不用再下"的唯一条件）。
+    """
+    target = paths.plans_dir() / item.file
+    try:
+        if not target.exists():
+            return STATE_MISSING
+        return STATE_LATEST if target.read_bytes() == item.content else STATE_PARALLEL
+    except OSError:
+        return STATE_UNKNOWN
+
+
+def needs_download(item: ExampleItem) -> bool:
+    """还需不需要下载：已经是本地最新内容的**不再要求下载**。
+
+    ``未知``（本地读不出来）算需要处理 —— 交给 ``save_example`` 去碰真实文件、
+    按它的规则报错，而不是在这里当成功跳过。
+    """
+    return local_state(item) != STATE_LATEST
 
 
 def _is_plain_yaml_name(name: str) -> bool:
@@ -197,19 +228,24 @@ def save_example(item: ExampleItem) -> Path:
     - 目标已存在且内容相同 → 不重复落盘
     - 目标已存在但内容不同 → 并列写 ``<stem>-<updated_at><ext>``，原文件不动
     """
+    return _place_example(item)[0]
+
+
+def _place_example(item: ExampleItem) -> tuple[Path, bool]:
+    """同 ``save_example``，另报"这次到底写没写盘"（内容相同就是没写）。"""
     plans = paths.plans_dir()
     plans.mkdir(parents=True, exist_ok=True)
     target = plans / item.file
     if target.exists():
         if target.read_bytes() == item.content:
-            return target
+            return target, False
         target = plans / f"{target.stem}-{item.updated_at}{target.suffix}"
         if target.exists():
             if target.read_bytes() == item.content:
-                return target
+                return target, False
             raise ExamplesError(f"{target.name} 已存在且内容不同，未覆盖")
     _atomic_write(target, item.content)
-    return target
+    return target, True
 
 
 def _atomic_write(target: Path, content: bytes) -> None:
@@ -224,19 +260,48 @@ def _atomic_write(target: Path, content: bytes) -> None:
         raise
 
 
-def save_all_examples(items: list[ExampleItem]) -> tuple[int, list[str]]:
-    """逐个落盘并汇总，返回 ``(成功数, 失败说明列表)``。
+@dataclass(frozen=True)
+class SaveReport:
+    """一次"下载勾选项"的结果：真写了几份、几份已经是最新、哪些没保存。
+
+    ``skipped`` 单独计数是因为**内容相同本来就不落盘**：把它算进"已保存"会让界面
+    报出一次并不存在的下载（用户看到"已保存 3 项"，磁盘上却一个文件都没多）。
+    """
+
+    written: int = 0
+    skipped: int = 0
+    problems: tuple[str, ...] = ()
+
+    def message(self) -> str:
+        """面向用户的整句结果，界面直接展示。"""
+        parts: list[str] = []
+        if self.written:
+            parts.append(f"已保存 {self.written} 项")
+        if self.skipped:
+            parts.append(f"{self.skipped} 项已是本地最新，未重复下载")
+        head = "；".join(parts) if parts else "没有需要下载的示例"
+        if not self.problems:
+            return f"{head}。"
+        return f"{head}；以下未保存：\n" + "\n".join(self.problems)
+
+
+def save_all_examples(items: list[ExampleItem]) -> SaveReport:
+    """逐个落盘并汇总。
 
     单项失败不影响其余，而且**什么异常都不往外抛** —— 它跑在 Qt 槽里，
     让意外异常逃出去就是界面上的未捕获异常。
     """
-    ok = 0
+    written = 0
+    skipped = 0
     problems: list[str] = []
     for item in items:
         try:
-            save_example(item)
+            _, wrote = _place_example(item)
         except Exception as exc:  # noqa: BLE001 - 槽边界，任何异常都要变成可展示的结果
             problems.append(f"{item.file}：{exc}")
             continue
-        ok += 1
-    return ok, problems
+        if wrote:
+            written += 1
+        else:
+            skipped += 1
+    return SaveReport(written=written, skipped=skipped, problems=tuple(problems))

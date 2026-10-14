@@ -2971,11 +2971,36 @@ def test_example_fetch_dialog_lists_fields_and_selection(qapp, tmp_path, monkeyp
 
     dialog = gui.ExampleFetchDialog([item])
     try:
-        assert dialog.row_text(0) == ["a.yaml", "标题", "2026-10-10", "说明", "不存在"]
+        assert dialog.row_text(0) == ["a.yaml", "2026-10-10", "不存在"]
         assert dialog.selected_items() == [item]
 
         dialog.list.item(0).setCheckState(Qt.CheckState.Unchecked)
         assert dialog.selected_items() == []
+    finally:
+        dialog.close()
+
+
+def test_example_fetch_dialog_row_keeps_checkbox_visible(qapp, tmp_path, monkeypatch):
+    """每行只留文件名 / 时间 / 是否最新，且**没有横向滑动**。
+
+    用户场景：行里塞了标题和手写说明，长到出现横向滑动条；一滑动，每行最左边的
+    勾选框就被顶出视野。勾选框必须一直在，所以行内只留三样东西、横向滑动条关掉。
+    """
+    from PySide6.QtCore import Qt
+
+    from zzz_ddtool import examples, gui, paths
+
+    monkeypatch.setattr(paths, "plans_dir", lambda: tmp_path / "user" / "plan")
+    item = examples.ExampleItem("a.yaml", "标题", "2026-10-10", "说明", "x" * 64, b"NEW")
+
+    dialog = gui.ExampleFetchDialog([item])
+    try:
+        row = dialog.list.item(0)
+        assert row.text() == "a.yaml  ·  2026-10-10  ·  不存在"
+        assert "标题" not in row.text() and "说明" not in row.text()
+        assert dialog.list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        # 去掉的两项退到悬停提示里，手写说明仍然读得到
+        assert "说明" in row.toolTip()
     finally:
         dialog.close()
 
@@ -2997,6 +3022,33 @@ def test_example_fetch_dialog_marks_local_state(qapp, tmp_path, monkeypatch):
     try:
         assert dialog.row_text(0)[-1] == "已是最新"
         assert dialog.row_text(1)[-1] == "将并列保存"
+    finally:
+        dialog.close()
+
+
+def test_example_fetch_dialog_does_not_preselect_already_latest(qapp, tmp_path, monkeypatch):
+    """本地已是最新的**默认不勾选**：没得可下的项不该被当成待下载。
+
+    用户场景：三份示例本地内容都与远端一致，对话框却把三项全勾上、按钮写着
+    「下载」，看着就像程序没认出已有的文件。
+    """
+    from PySide6.QtCore import Qt
+
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "same.yaml").write_text("NEW", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+
+    same = examples.ExampleItem("same.yaml", "t", "2026-10-10", "", "a" * 64, b"NEW")
+    missing = examples.ExampleItem("none.yaml", "t", "2026-10-10", "", "b" * 64, b"NEW")
+
+    dialog = gui.ExampleFetchDialog([same, missing])
+    try:
+        assert dialog.list.item(0).checkState() == Qt.CheckState.Unchecked
+        assert dialog.list.item(1).checkState() == Qt.CheckState.Checked
+        assert dialog.selected_items() == [missing]
     finally:
         dialog.close()
 
@@ -3035,6 +3087,39 @@ def test_fetch_public_examples_reports_error_without_writing(qapp, tmp_path, mon
         assert shown and "网络错误" in shown[-1]
         after = sorted(p.name for p in plans.glob("*.yaml")) if plans.exists() else []
         assert after == before
+    finally:
+        window.close()
+
+
+def test_fetch_public_examples_all_latest_skips_dialog_and_download(qapp, tmp_path, monkeypatch):
+    """本地内容与远端逐字节一致时：不弹下载框、不落盘，只说一句"无需下载"。
+
+    用户场景：明明 `user/plan/` 里就是同一份 YAML，程序却还摆出下载框。
+    """
+    from zzz_ddtool import examples, gui, paths
+
+    plans = tmp_path / "user" / "plan"
+    plans.mkdir(parents=True)
+    (plans / "a.yaml").write_text("NEW", encoding="utf-8")
+    monkeypatch.setattr(paths, "plans_dir", lambda: plans)
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path / "nodata")
+    item = examples.ExampleItem("a.yaml", "t", "2026-10-10", "", "x" * 64, b"NEW")
+
+    window = gui.MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        monkeypatch.setattr(
+            window,
+            "_open_example_fetch_dialog",
+            lambda items: pytest.fail("已是最新时不该弹下载框"),
+        )
+        shown: list[str] = []
+        monkeypatch.setattr(gui.QMessageBox, "information", lambda *args, **kwargs: shown.append(args[2]))
+
+        window._handle_public_examples(([item], ""))
+
+        assert shown and "无需下载" in shown[-1]
+        assert (plans / "a.yaml").read_text(encoding="utf-8") == "NEW"
+        assert sorted(p.name for p in plans.iterdir()) == ["a.yaml"]
     finally:
         window.close()
 
