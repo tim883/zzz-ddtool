@@ -41,7 +41,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 EXAMPLES_DIR = "data/examples"
-REMOTE = "gitee"
+REMOTE = "github"
 PKG_NAME = "zzz-ddtool"
 
 
@@ -250,11 +250,11 @@ def _print_summary(scenario: str, outdir: Path, branch: str, pushed_hash: str, d
     if scenario == "program":
         version = _project_version()
         print(f"程序包：{outdir / f'{PKG_NAME}-v{version}.zip'}")
-        print(f"下一步：Gitee 网页 →「发行版」→ 新建发行版（标签 v{version}），上传 zip、填写更新说明。")
+        print(f"下一步：GitHub 网页 →「发行版」→ 新建发行版（标签 v{version}），上传 zip、填写更新说明。")
     elif scenario == "data":
         version = _project_version()
         print(f"数据包：{outdir / 'data.zip'}")
-        print(f"下一步：Gitee 网页 →「发行版」→ 新建发行版（标签 v{version}），上传 data.zip、填写更新说明。")
+        print(f"下一步：GitHub 网页 →「发行版」→ 新建发行版（标签 v{version}），上传 data.zip、填写更新说明。")
     else:
         print("公共示例已随仓库推送，用户端「获取公共示例」即可取到最新清单。")
 

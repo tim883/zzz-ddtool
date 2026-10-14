@@ -1,6 +1,6 @@
-"""检查更新：读 Gitee 发行版最新版本号，对比本地 version.txt。
+"""检查更新：读 GitHub 发行版最新版本号，对比本地 version.txt。
 
-匿名访问 Gitee OpenAPI v5，不带 token（公开仓库 + 低频够用，
+匿名访问 GitHub REST API，不带 token（公开仓库 + 低频够用，
 带 token 反而会把账号凭证发给所有用户）。
 """
 
@@ -14,7 +14,15 @@ from pathlib import Path
 
 from zzz_ddtool.version import current_version
 
-GITEE_LATEST_URL = "https://gitee.com/api/v5/repos/qzl2077/zzz-ddtool/releases/latest"
+# ---- 远端仓库坐标：换 GitHub 账号或仓库名时，只改这两行 --------------------------
+GITHUB_REPO = "qzl2077/zzz-ddtool"
+GITHUB_BRANCH = "master"  # examples.py 的 raw 直链据此拼出
+
+# 用发行版「列表」端点而不是 ``/releases/latest``：仓库可见但还没有任何发行版时，
+# GitHub 对 latest 也返回 404，与「仓库不存在/未公开」无法区分；列表端点返回
+# 200 + []，一次请求就能把「仓库不可访问」和「暂无版本」分开。
+GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=10"
+GITHUB_RAW = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
 
 
 @dataclass(frozen=True)
@@ -63,33 +71,53 @@ def _pick_urls(assets: list) -> tuple[str, str]:
     return data_url, program_url
 
 
+def _pick_release(releases: list) -> dict | None:
+    """挑最近一个正式发布：跳过 draft 与 prerelease。
+
+    ``/releases`` 列表按 ``created_at`` 倒序返回，所以第一个非预览项就是
+    ``/releases/latest`` 会给的那一个。注意 GitHub 的 ``created_at`` 取的是
+    **该发行版所用提交的日期**，不是发布时刻——先发新版、几天后再给旧版补热修时
+    列表顺序会反过来，补发的那版不会被识别为更新。
+    """
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        return release
+    return None
+
+
 def check_for_update() -> UpdateStatus:
     current = current_version()
-    req = urllib.request.Request(GITEE_LATEST_URL, headers={"User-Agent": "zzz-ddtool"})
+    req = urllib.request.Request(GITHUB_RELEASES_URL, headers={"User-Agent": "zzz-ddtool"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            releases = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            # Gitee 对"仓库不存在/未公开"与"仓库可见但无发行版"给不同的 message；
-            # 混判会让"仓库没公开"伪装成"没有新版本"。
-            try:
-                payload = json.loads(exc.read().decode("utf-8", "replace")) or {}
-            except Exception:
-                payload = {}
-            message = str(payload.get("message") or "")
-            if "Not Found Project" in message:
-                return UpdateStatus(False, "", current, error="仓库不可访问（不存在或未公开）")
-            return UpdateStatus(False, "", current, error="暂无可用版本")
+            # 列表端点只在"仓库不存在/未公开"时 404；仓库可见但没有发行版返回 200 + []
+            return UpdateStatus(False, "", current, error="仓库不可访问（不存在或未公开）")
+        if exc.code == 403:
+            # 未认证配额 60 次/小时/IP；校园网、小区宽带等共享出口会一起打满
+            remaining = str((exc.headers or {}).get("X-RateLimit-Remaining") or "")
+            if remaining == "0":
+                return UpdateStatus(
+                    False, "", current, error="检查过于频繁，请稍后再试（同一网络匿名查询次数已用尽）"
+                )
+            return UpdateStatus(False, "", current, error="检查失败（HTTP 403）")
         return UpdateStatus(False, "", current, error=f"检查失败（HTTP {exc.code}）")
     except Exception as exc:  # 网络错误、超时、JSON 解析失败等
         return UpdateStatus(False, "", current, error=f"网络错误：{exc}")
 
-    latest = str(data.get("tag_name") or data.get("name") or "").strip()
-    body = str(data.get("body") or "")
+    if not isinstance(releases, list):
+        return UpdateStatus(False, "", current, error="发行版数据格式异常")
+    release = _pick_release(releases)
+    if release is None:
+        return UpdateStatus(False, "", current, error="暂无可用版本")
+    latest = str(release.get("tag_name") or release.get("name") or "").strip()
+    body = str(release.get("body") or "")
     if not latest:
         return UpdateStatus(False, "", current, body, error="发行版缺版本号")
-    data_url, program_url = _pick_urls(data.get("assets") or [])
+    data_url, program_url = _pick_urls(release.get("assets") or [])
     available = _is_newer(latest, current)
     return UpdateStatus(available, latest, current, body, data_url, program_url)
 

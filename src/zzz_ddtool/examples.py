@@ -71,7 +71,7 @@ def seed_examples() -> list[Path]:
 #   .../raw/master/data/examples/manifest.json
 #   .../raw/master/data/examples/<file>
 
-EXAMPLES_MANIFEST_URL = "https://gitee.com/qzl2077/zzz-ddtool/raw/master/data/examples/manifest.json"
+EXAMPLES_MANIFEST_URL = f"{updater.GITHUB_RAW}/data/examples/manifest.json"
 
 _MANIFEST_SCHEMA = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")

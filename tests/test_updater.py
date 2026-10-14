@@ -6,6 +6,7 @@ xcopy 是覆盖式复制 —— 这层剥离是"更新绝不改写用户数据�
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -139,9 +140,33 @@ def _raiser(exc):
     return _raise
 
 
+class _FakeResp:
+    """urlopen 返回值的替身：支持 ``with ... as resp: resp.read()``。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResp":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _ok_json(body: bytes):
+    return lambda *args, **kwargs: _FakeResp(body)
+
+
 def test_check_for_update_distinguishes_invisible_repo(monkeypatch) -> None:
-    """仓库不可见（不存在/未公开）不能伪装成"没有新版本"。"""
-    body = b'{"message":"Not Found Project"}'
+    """仓库不可见（不存在/未公开）不能伪装成"没有新版本"。
+
+    GitHub 只在"仓库不存在/未公开"时 404；仓库可见但没有发行版由列表端点
+    以 200 + [] 表达，所以 404 可以无条件判为仓库不可访问。
+    """
+    body = b'{"message":"Not Found","documentation_url":"https://docs.github.com/"}'
     monkeypatch.setattr(updater.urllib.request, "urlopen", _raiser(_http_404(body)))
 
     st = updater.check_for_update()
@@ -151,15 +176,42 @@ def test_check_for_update_distinguishes_invisible_repo(monkeypatch) -> None:
     assert "暂无可用版本" not in st.error
 
 
-def test_check_for_update_plain_404_means_no_release(monkeypatch) -> None:
-    """仓库可见但还没有发行版 —— 维持原文案。"""
-    body = b'{"message":"404 Not Found"}'
-    monkeypatch.setattr(updater.urllib.request, "urlopen", _raiser(_http_404(body)))
+def test_check_for_update_empty_release_list_means_no_release(monkeypatch) -> None:
+    """仓库可见但还没有任何发行版 —— 维持原文案。"""
+    monkeypatch.setattr(updater.urllib.request, "urlopen", _ok_json(b"[]"))
 
     st = updater.check_for_update()
 
     assert st.available is False
     assert st.error == "暂无可用版本"
+
+
+def test_check_for_update_skips_prerelease_and_splits_assets(monkeypatch) -> None:
+    """预览版不算更新；data*.zip 是数据包，其余 zip 是程序包。"""
+    payload = json.dumps(
+        [
+            {"tag_name": "v9.9.9", "prerelease": True, "body": "预览版"},
+            {
+                "tag_name": "v0.2.0",
+                "body": "正式版",
+                "assets": [
+                    {"name": "data.zip", "browser_download_url": "http://x/data.zip"},
+                    {"name": "zzz-ddtool-v0.2.0.zip", "browser_download_url": "http://x/prog.zip"},
+                ],
+            },
+        ],
+        ensure_ascii=False,
+    ).encode("utf-8")
+    monkeypatch.setattr(updater, "current_version", lambda: "0.1.0")
+    monkeypatch.setattr(updater.urllib.request, "urlopen", _ok_json(payload))
+
+    st = updater.check_for_update()
+
+    assert st.latest_version == "v0.2.0"
+    assert st.body == "正式版"
+    assert st.data_url == "http://x/data.zip"
+    assert st.program_url == "http://x/prog.zip"
+    assert st.available is True
 
 
 def test_log_stripped_reaches_the_text_log(tmp_path, monkeypatch) -> None:
