@@ -15,7 +15,7 @@ from pathlib import Path
 from zzz_ddtool.version import current_version
 
 # ---- 远端仓库坐标：换 GitHub 账号或仓库名时，只改这两行 --------------------------
-GITHUB_REPO = "qzl2077/zzz-ddtool"
+GITHUB_REPO = "tim883/zzz-ddtool"
 GITHUB_BRANCH = "master"  # examples.py 的 raw 直链据此拼出
 
 # 用发行版「列表」端点而不是 ``/releases/latest``：仓库可见但还没有任何发行版时，
