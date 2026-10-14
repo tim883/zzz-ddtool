@@ -6,21 +6,21 @@
       "title": "异常攻精",
       "updated_at": "2026-10-14",
       "note": "异常攻精：8 套装 6 个部位，异常精通 1 分 / 攻击力% 0.8 分，每个任务最多 15 件",
-      "sha256": "cea9a4cbd1593656d955a0f3e1e5abfc37531bfe83be2293d18caa27850c2140"
+      "sha256": "de1e552de75063b998172a03df87e40003c9ea05fd772de1d4885a4d66ac824c"
     },
     {
       "file": "example-星见雅折纸.yaml",
       "title": "星见雅折纸",
       "updated_at": "2026-10-14",
       "note": "星见雅折纸：折枝剑歌 1 套，按主词条拆成 9 个任务，异常精通 / 攻击力% / 暴击率 各 1 分，每个任务最多 15 件",
-      "sha256": "b6e4bee7aa5b7be1d51e2a12b5994530d779e1bf7263f6797a4b52a5bfb9da86"
+      "sha256": "d0b289552f8192110376fc8328df630408189ddbc096bd1b8bce6754dc6afbee"
     },
     {
       "file": "example-直伤双爆.yaml",
       "title": "直伤双爆",
       "updated_at": "2026-10-14",
       "note": "直伤双爆：6 套装，4 号暴击率 / 暴击伤害 / 攻击力% 分开建任务，三项各 1 分，每个任务最多 10 件",
-      "sha256": "0b373ef4c54c59e6887babb320c7f21a6a7afa2ebaf0de6095b2b2e29717b294"
+      "sha256": "13c5d5803bf1af2c6081e03d898737718ab7300f948789ffd98ad2e06615ed05"
     }
   ]
 }
