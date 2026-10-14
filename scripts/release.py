@@ -16,7 +16,12 @@
 3. ``program`` / ``data`` 场景要求 ``data/examples/`` **之外**的工作区干净：
    包内容是磁盘快照，必须与推送的提交一致，否则包与仓库对不上。
    ``examples`` 场景只推仓库、不打包，不做硬性拦截（只提醒）。
-4. 推送后自动核对远端 hash（``git ls-remote``），一致才算发布完成。
+4. **版本号两处必须一致**：``pyproject.toml`` 与 ``src/zzz_ddtool/version.py``
+   的兜底常量 ``FALLBACK_VERSION``。这是**唯一不被打包流程核对**的一处版本号
+   （``build.py`` 写包内 ``version.txt``，``package_release.py`` 只核对 pyproject
+   与它），历史上漏改过两个版本没人发现，所以在这里拦住；同样是
+   ``program`` / ``data`` 硬拦、``examples`` 只提醒。
+5. 推送后自动核对远端 hash（``git ls-remote``），一致才算发布完成。
 
 约定入口：**要推仓库 = 跑本脚本**（见仓库根 ``AGENTS.md``）。细节见
 ``docs/技术/打包与发布.md``。
@@ -40,9 +45,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
+SRC = ROOT / "src"
 EXAMPLES_DIR = "data/examples"
 REMOTE = "github"
 PKG_NAME = "zzz-ddtool"
+
+# 与 scripts/ 下其他脚本同一约定：显式加 src，不依赖 editable 安装是否还在
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 class ReleaseError(Exception):
@@ -127,6 +137,49 @@ def _check_worktree(strict: bool) -> None:
     print("提醒：data/examples/ 之外还有未提交改动（本次只发布示例，不会被推送）：")
     for path in outside:
         print(f"  - {path}")
+
+
+def _fallback_version() -> str:
+    """读 ``src/zzz_ddtool/version.py`` 的兜底版本号常量。"""
+    from zzz_ddtool.version import FALLBACK_VERSION
+
+    return FALLBACK_VERSION
+
+
+def _check_versions(strict: bool) -> None:
+    """``pyproject.toml`` 与 ``version.py`` 的版本号必须一致。
+
+    这是**唯一不被打包流程核对**的一处版本号：``build.py`` 从 pyproject 写包内
+    ``version.txt``，``package_release.py`` 只核对这两者，兜底常量漏改不会被发现
+    （2026-10-14 发现它停在 0.1.0，落后两个版本没人察觉）。
+
+    漏改的后果不对称：兜底值偏小 → 真触发时**反复提示更新**；偏大 → **永远不提示
+    更新**。所以放在发布唯一入口上拦，而不是只靠自觉。
+    """
+    expected = _project_version()
+    actual = _fallback_version()
+    if actual == expected:
+        print(f"版本号检查通过：pyproject.toml 与 version.py 都是 {expected}")
+        return
+    message = (
+        f"版本号不一致：pyproject.toml 是 {expected}，"
+        f"src/zzz_ddtool/version.py 的 FALLBACK_VERSION 是 {actual}。\n"
+        "两处必须同步——改 pyproject 的 version 时同时改 version.py。"
+    )
+    if strict:
+        raise ReleaseError(message)
+    print(f"提醒：{message}")
+
+
+def _precheck(strict: bool) -> None:
+    """发布前置检查：**先版本号，再工作区**。
+
+    顺序是刻意的。版本号不一致最常发生在"刚改完 ``pyproject.toml``、还没提交"时，
+    那一刻工作区恰好是脏的——先查工作区会把它盖住，检查就在最需要它的时刻失效。
+    版本号是静态配置错误，先报它；工作区是工作状态，随后报。
+    """
+    _check_versions(strict)
+    _check_worktree(strict)
 
 
 def _generate_manifest(dry_run: bool) -> None:
@@ -279,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     steps: list[tuple[str, object]] = [
-        ("前置检查", lambda: _check_worktree(strict)),
+        ("前置检查", lambda: _precheck(strict)),
         ("生成示例清单", lambda: _generate_manifest(dry_run)),
         ("提交示例改动", lambda: _commit_examples(dry_run)),
     ]

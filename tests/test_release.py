@@ -173,3 +173,51 @@ def test_summary_dry_run_marks_no_writes(capsys: pytest.CaptureFixture) -> None:
     out = capsys.readouterr().out
     assert "预演结束" in out
     assert "发布完成" not in out
+
+
+# --- 版本号一致性 -------------------------------------------------------------
+
+
+def test_fallback_version_matches_pyproject() -> None:
+    """守卫：``version.py`` 的兜底常量必须等于 ``pyproject.toml`` 的 version。
+
+    它**不在打包流程的检查范围**内（``build.py`` / ``package_release.py`` 只核对
+    pyproject 与包内 ``version.txt``），2026-10-14 发现它停在 ``0.1.0``、落后两个
+    版本都没人察觉——所以在这里直接钉死，改版本号忘了第二处时用例立刻变红。
+    """
+    from zzz_ddtool.version import FALLBACK_VERSION
+
+    assert FALLBACK_VERSION == rel._project_version()
+
+
+def test_check_versions_passes_when_matched(monkeypatch: MP, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.setattr(rel, "_project_version", lambda: "9.9.9")
+    monkeypatch.setattr(rel, "_fallback_version", lambda: "9.9.9")
+
+    rel._check_versions(strict=True)
+
+    assert "通过" in capsys.readouterr().out
+
+
+def test_check_versions_strict_blocks_mismatch(monkeypatch: MP) -> None:
+    monkeypatch.setattr(rel, "_project_version", lambda: "9.9.9")
+    monkeypatch.setattr(rel, "_fallback_version", lambda: "0.1.0")
+
+    with pytest.raises(rel.ReleaseError) as excinfo:
+        rel._check_versions(strict=True)
+
+    message = str(excinfo.value)
+    assert "9.9.9" in message and "0.1.0" in message
+    assert "FALLBACK_VERSION" in message
+
+
+def test_check_versions_loose_only_warns(monkeypatch: MP, capsys: pytest.CaptureFixture) -> None:
+    """``examples`` 只推仓库、不打包，与工作区检查同一取向：只提醒不拦。"""
+    monkeypatch.setattr(rel, "_project_version", lambda: "9.9.9")
+    monkeypatch.setattr(rel, "_fallback_version", lambda: "0.1.0")
+
+    rel._check_versions(strict=False)  # 不应抛错
+
+    out = capsys.readouterr().out
+    assert "提醒" in out
+    assert "0.1.0" in out
