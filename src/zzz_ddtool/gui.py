@@ -581,6 +581,51 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y()
 
 
+class FlowHost(QWidget):
+    """卡片流式容器：按当前宽度告诉父布局「这一堆卡要占多高」。
+
+    FlowLayout 只知道自己有几张卡、每张多大，说不出总高度；而 `QWidget.sizeHint()`
+    默认走 `QLayout::totalSizeHint()`，会把卡**当成一列**加起来（一页 24 张 ≈ 2774px，
+    正是「每张占一行」的高度）。父布局拿它当「想要多高」，滚动内容就被撑出几千像素
+    空白：卡早看完了，右边滑块才走一小截、下面全空。
+
+    只重写 `sizeHint()`，**不**重写 `minimumSizeHint()`：
+      * `sizeHint()` 按实际行数报 —— 它是父布局分配高度的依据；
+      * 最小高度仍用 FlowLayout 的「一张卡」，与宽度无关。按宽度算出来的最小值
+        在窗口变宽后是**旧值**（偏大），而 QScrollArea 取「最小高度」与
+        `heightForWidth()` 的较大者，旧值偏大就会重新长出空白。
+
+    竖向 sizePolicy 必须是带收缩位的（见 StageSection 里的 `Preferred`）：不带收缩位时
+    `qSmartMinSize()` 会取 `sizeHint` 当最小高度——那正是「假高度被当成最小高度」的病根。
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._hinted_width = -1
+
+    def sizeHint(self) -> QSize:
+        layout = self.layout()
+        if layout is None:
+            return super().sizeHint()
+        width = max(0, layout.minimumSize().width())
+        if not layout.count():
+            return QSize(width, 0)
+        if self._hinted_width <= 0 or self.width() <= 0:
+            # 还没拿到真实宽度：未布局的控件 Qt 给的是 640 的默认宽，拿它算行数会得出
+            # 「每张一行」的假高度（几千像素），所以先按「一张卡」报；等排过一次版
+            # （resizeEvent 记下宽度）再按行数报。
+            return QSize(width, layout.minimumSize().height())
+        return QSize(width, layout.heightForWidth(self.width()))
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        width = self.width()
+        if width != self._hinted_width:
+            # 行数只由宽度决定：宽度变了，父布局得拿新高度重排一次。
+            self._hinted_width = width
+            self.updateGeometry()
+
+
 class PatternCard(QFrame):
     toggled = Signal()
 
@@ -759,10 +804,13 @@ class StageSection(QWidget):
         header.addStretch()
         header.addWidget(self.count_label)
 
-        self.flow_host = QWidget()
+        self.flow_host = FlowHost()
         self.flow = FlowLayout(self.flow_host, spacing=_CARD_SPACING)
         self.flow_host.setLayout(self.flow)
-        self.flow_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        # 竖向用 Preferred（带收缩位）：最小高度取 FlowLayout 的「一张卡」，
+        # 不要拿按宽度算出来的 sizeHint 当最小值 —— 那个值在窗口变宽后是旧值，
+        # 会被 QScrollArea 当成内容高度，重新长出几千像素空白。见 FlowHost。
+        self.flow_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 14)

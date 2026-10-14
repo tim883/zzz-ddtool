@@ -1263,6 +1263,101 @@ def test_pagination_preserves_all_pages_and_bulk_selection(qapp, tmp_path):
     window.close()
 
 
+def _card_area_metrics(window):
+    """右栏滚动区的高度账：(内容控件, 视口, 滚动条, 内容真实底边)。"""
+    host = window.three_host
+    scroll = host["scroll"]
+    inner = host["inner"]
+    sections = [section for key, section in window.sections.items() if key[0] == "three"]
+    bottom = max(section.geometry().bottom() for section in sections) + 1
+    bottom += host["box"].contentsMargins().bottom()
+    return inner, scroll.viewport(), scroll.verticalScrollBar(), bottom
+
+
+def _clipped_sections(window):
+    """卡片容器比「这个宽度下要排的行高」还矮的分区：它们会被父控件裁掉。
+
+    只看当前露出来的卡片容器：藏起来的页签 Qt 不排子控件，几何值仍是默认尺寸，
+    拿它判裁卡会假报（切过去时会重排，不是缺陷）。
+    """
+    clipped = []
+    for key, section in window.sections.items():
+        if not section.flow.count() or not section.flow_host.isVisible():
+            continue
+        need = section.flow.heightForWidth(section.flow_host.width())
+        if section.flow_host.height() < need:
+            clipped.append((key, section.flow_host.height(), need))
+    return clipped
+
+
+def _last_section_bottom_in_viewport(qapp, window):
+    """把滚动条拖到底，返回最后一个分区下沿在视口坐标里的 y（再滚回顶部）。
+
+    这条判据盯的是用户看到的那一下：拖到底之后，卡片区最后一行应该正好贴着
+    视口底边，而不是停在一片空白中间。它走 Qt 的坐标映射，不复用高度差。
+    """
+    from PySide6.QtCore import QPoint
+
+    host = window.three_host
+    scroll = host["scroll"]
+    bar = scroll.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    qapp.processEvents()
+    sections = [section for key, section in window.sections.items() if key[0] == "three"]
+    last = max(sections, key=lambda section: section.geometry().bottom())
+    where = last.mapTo(scroll.viewport(), QPoint(0, last.height())).y()
+    bar.setValue(0)
+    qapp.processEvents()
+    return where
+
+
+def test_card_area_scroll_height_matches_content(qapp, tmp_path):
+    """卡片区滚动高度必须等于「最后一个分区的下沿」，且不许裁卡。
+
+    曾经的毛病：FlowHost 报的是 `QLayout::totalSizeHint()`（把所有卡当成一列加起来，
+    一页 24 张 ≈ 2774px），外层又把它当最小高度，于是卡片早看完了，滑块下面还挂着
+    上万像素空白。判据用「内容控件高度 == max(视口, 内容真实底边)」，窗口变宽后同理
+    要重算，不能留着变宽前那份高度；同时逐分区核对容器高度够不够排下这个宽度的行。
+    """
+    from zzz_ddtool.gui import _CARD_WIDTH
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window.resize(1700, 800)
+    window.show()
+    qapp.processEvents()
+    window._config_splitter.setSizes([420, 330, 900])
+    qapp.processEvents()
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1, "暴击伤害": 1, "攻击力%": 1, "穿透值": 0.5})
+    refresh_cards(window, qapp)
+    qapp.processEvents()
+
+    widest = max(window.sections.values(), key=lambda section: section.flow_host.width())
+    assert len(widest.cards) > 4, "样本要有多行卡片"
+    # 卡片列必须并排放得下两张以上，否则「一张一行」时新旧实现算出来一样，用例空转
+    assert widest.flow_host.width() > 2 * _CARD_WIDTH
+    inner, viewport, bar, bottom = _card_area_metrics(window)
+    assert inner.height() == max(viewport.height(), bottom)
+    assert not _clipped_sections(window), _clipped_sections(window)
+    assert inner.height() > viewport.height(), "样本内容要比视口高，否则量不出滚动范围"
+    # 拖到底：最后一行下沿贴在视口底边，只剩布局自身那点下边距，不该再有别的空白
+    margin = window.three_host["box"].contentsMargins().bottom()
+    assert _last_section_bottom_in_viewport(qapp, window) == viewport.height() - margin
+    tall = inner.height()
+    narrow = widest.flow_host.width()
+
+    # 窗口拉宽 → 每行放得下更多卡、内容变矮：滚动范围要跟着收，别留着旧高度
+    window.resize(1960, 800)
+    qapp.processEvents()
+    inner, viewport, bar, bottom = _card_area_metrics(window)
+    wide = max(section.flow_host.width() for section in window.sections.values())
+    assert wide > narrow, "环境没让卡片列变宽，这条断言就失去意义"
+    assert inner.height() == max(viewport.height(), bottom)
+    assert not _clipped_sections(window), _clipped_sections(window)
+    assert inner.height() < tall
+    window.close()
+
+
 def test_unrendered_edits_and_thresholds_are_saved_correctly(qapp, tmp_path):
     from zzz_ddtool.patterns import Pattern, Slot, canonicalize
     from zzz_ddtool.origin import Origin
