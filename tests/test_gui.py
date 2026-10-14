@@ -1200,7 +1200,43 @@ def test_below_threshold_cards_really_stay_hidden(qapp: QApplication, tmp_path) 
     explicit = Qt.WidgetAttribute.WA_WState_ExplicitShowHide
     assert all(not c.isHidden() and c.testAttribute(explicit) for c in section.cards)
     shown = sum(p.score + 1e-9 >= need for p in section.patterns)
-    assert section.count_label.text() == f"{shown} / {len(section.patterns)} 张"
+    # 计数口径 = 已勾选 / 通过本档要求；新任务没有历史勾选、策略是全选，所以两边相等
+    assert section.count_label.text() == f"{shown} / {shown} 张"
+    window.close()
+
+
+def test_stage_count_pairs_checked_with_qualified(qapp, tmp_path) -> None:
+    """每档「N / M 张」= 已勾选 / 通过本档要求（含必带）的组合数。
+
+    分母**不能**退回该档穷举的全部组合：那里混着「废词条」占位与门槛外、页面上
+    根本看不到的组合，用户看到的列表里没有它们。判据里显式断言两个分母不相等，
+    否则旧口径溜回来这条用例也会绿。
+    """
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"攻击力%": 1.0, "暴击率": 1.0, "暴击伤害": 1.0})
+    section = window.sections[("three", 0)]
+    section.require.setValue(2.0)
+    refresh_cards(window, qapp)
+
+    qualified = len(section._visible_indices)
+    assert 0 < qualified < len(section.patterns), "样本要两种口径给出的分母不同"
+    assert section.count_label.text() == f"{qualified} / {qualified} 张"
+
+    # 取消一张可见卡：分子掉 1，分母不动
+    section.cards[0].checkbox.setChecked(False)
+    qapp.processEvents()
+    assert section.count_label.text() == f"{qualified - 1} / {qualified} 张"
+
+    # 「全选当前可见」把它补回来
+    section.check_visible(True)
+    assert section.count_label.text() == f"{qualified} / {qualified} 张"
+
+    # 抬门槛把这一档全筛掉：分母跟着归零，不会退回"全部组合"
+    section.require.setValue(30.0)
+    qapp.processEvents()
+    assert section._visible_indices == []
+    assert section.count_label.text() == "0 / 0 张"
     window.close()
 
 

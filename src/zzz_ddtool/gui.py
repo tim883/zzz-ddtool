@@ -780,6 +780,11 @@ class StageSection(QWidget):
         # 最小宽写 1 而不是 0：0 表示「沿用文字宽」，等于没放开。
         self.count_label.setMinimumWidth(1)
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.count_label.setToolTip(
+            "已勾选 / 符合本档要求的组合张数。\n"
+            "分母只数这一档列在页面上的组合（已按「本档要求」和必带条件筛过），"
+            "分子是其中已勾选的；门槛外、页面上看不到的组合不计入。"
+        )
 
         level = QLabel(f"+{checkpoint}")
         level.setObjectName("stageLevel")
@@ -887,6 +892,7 @@ class StageSection(QWidget):
             self._checked.add(pid)
         else:
             self._checked.discard(pid)
+        self._refresh_count()
         self.selection_changed.emit()
 
     def can_reuse(self, patterns: list[Pattern]) -> bool:
@@ -896,6 +902,17 @@ class StageSection(QWidget):
         self._set_patterns(patterns, is_checked)
         self.apply_filter()
 
+    def _refresh_count(self) -> None:
+        """本档计数：已勾选 / 通过本档要求（含必带）的组合数。
+
+        分母只数**这一档列在页面上的组合**——门槛外、页面上根本看不到的组合不计入。
+        早先用的是该档穷举出的全部组合，里面混着「废词条」占位与远低于门槛的组合，
+        用户看到的列表里没有它们。分子同理只数合格集合里的已勾选。
+        """
+        qualified = {self._ids[index] for index in self._visible_indices}
+        checked = len(qualified & self._checked)
+        self.count_label.setText(f"{checked} / {len(qualified)} 张")
+
     def apply_filter(self) -> None:
         need = self.require.value()
         required = effective_required_substats(self.required_substats, self.blocked)
@@ -904,7 +921,7 @@ class StageSection(QWidget):
             if pattern.score + 1e-9 >= need and has_required_substats(pattern, required)
         ]
         self._page = 0
-        self.count_label.setText(f"{len(self._visible_indices)} / {len(self.patterns)} 张")
+        self._refresh_count()
         self._render_page()
 
     def check_visible(self, on: bool) -> None:
@@ -915,6 +932,7 @@ class StageSection(QWidget):
             self._checked.difference_update(ids)
         for card in self.cards:
             card.set_checked_silent(on)
+        self._refresh_count()
         self.selection_changed.emit()
 
     def visible_accepted(self) -> list[str]:
@@ -929,6 +947,7 @@ class StageSection(QWidget):
         self._checked = {pid for pid in self._ids if is_checked(pid)}
         for card in self.cards:
             card.set_checked_silent(card.pattern.pattern_id in self._checked)
+        self._refresh_count()
         self.selection_changed.emit()
 
     def _on_require(self, _value: float) -> None:
