@@ -13,7 +13,7 @@ from zzz_ddtool.paths import version_file
 # 两处的一致性由 scripts/release.py 的前置检查与 tests/test_release.py 的守卫用例把住：
 # build.py 只把 pyproject 的版本写进包内 version.txt，package_release.py 只核对这两者，
 # **这里漏改不会被它们发现**（2026-10-14 发现它漂到了 0.1.0，落后两个版本）。
-FALLBACK_VERSION = "1.0.1"
+FALLBACK_VERSION = "1.0.2"
 
 
 def current_version() -> str:
