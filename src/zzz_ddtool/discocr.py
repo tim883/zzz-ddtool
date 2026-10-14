@@ -140,6 +140,26 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _imread_gray(path: Path) -> np.ndarray | None:
+    """按路径读一张灰度 PNG；读不出来返回 None（调用方按「资产损坏」处理）。
+
+    不走 ``cv2.imread``：它在 Windows 上按 ANSI 代码页打开文件，**路径含非 ASCII 时一律
+    返回 None**（中文安装目录、中文用户名下的临时目录都会中招）。那会让整棵资产被判
+    「模板 PNG 无法解码」，快路径每帧 ``INVALID_ASSETS``、静默退回 legacy 整帧解析。
+    经 ``imdecode`` 走字节，不经过文件路径，不受代码页影响（2026-10-14 实测）。
+    """
+    try:
+        raw = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError:
+        return None
+    if raw.size == 0:
+        return None
+    array = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+    if array is None or array.size == 0:
+        return None
+    return array
+
+
 # ---------------------------------------------------------------------------
 # 资产模型
 # ---------------------------------------------------------------------------
@@ -349,7 +369,7 @@ def _load_templates(
             value = item[key]
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
                 raise _AssetError(f"{tid}：{key} 必须在 0~1")
-        array = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        array = _imread_gray(image_path)
         if array is None or array.size == 0:
             raise _AssetError(f"{tid}：模板 PNG 无法解码")
         table.setdefault((pid, kind), []).append(

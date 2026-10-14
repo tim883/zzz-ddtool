@@ -126,3 +126,23 @@ def test_illegal_entry_shape_raises(tmp_path):
 
     with pytest.raises(picker_names.PickerAssetError, match="键集合"):
         picker_names.load_entries(root)
+
+
+def test_templates_load_from_non_ascii_path(tmp_path):
+    """资产路径含中文时也要能加载。
+
+    与 discocr 同一个病：``cv2.imread`` 在 Windows 上按 ANSI 打开文件，路径含非 ASCII 就
+    返回 None，资产被判损坏后生产侧静默回落名称带 OCR（2026-10-14 实测）。
+    这里先在 ASCII 目录里造好资产（``cv2.imwrite`` 同样读不了中文路径，不能用它造），
+    再把整棵目录改名成中文。
+    """
+    pattern = _pattern(9)
+    root = _write_assets(tmp_path, [("t-1", "甲套装", pattern)])
+    moved = tmp_path / "中文目录"
+    moved.mkdir()
+    root.rename(moved / "picker")
+
+    entries = picker_names.load_entries(moved / "picker")
+
+    assert [entry.name for entry in entries] == ["甲套装"]
+    assert entries[0].array.shape == pattern.shape

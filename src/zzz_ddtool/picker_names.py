@@ -56,6 +56,25 @@ def _file_sha256(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
 
+def _imread_gray(path: Path) -> np.ndarray | None:
+    """按路径读一张灰度 PNG；读不出来返回 None（调用方按「资产损坏」处理）。
+
+    不走 ``cv2.imread``：它在 Windows 上按 ANSI 代码页打开文件，**路径含非 ASCII 时一律
+    返回 None**（中文安装目录必踩），于是整套套装名模板被判损坏、生产侧静默回落名称带
+    OCR。经 ``imdecode`` 走字节，不经过文件路径，不受代码页影响（2026-10-14 实测）。
+    """
+    try:
+        raw = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError:
+        return None
+    if raw.size == 0:
+        return None
+    array = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+    if array is None or array.size == 0:
+        return None
+    return array
+
+
 def _load_entries(root: Path) -> tuple[_Entry, ...]:
     try:
         doc = json.loads((root / "templates.json").read_text(encoding="utf-8"))
@@ -98,7 +117,7 @@ def _load_entries(root: Path) -> tuple[_Entry, ...]:
             value = item[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
                 raise PickerAssetError(f"{tid}：{key} 必须在 0~1")
-        array = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        array = _imread_gray(path)
         if array is None or array.size == 0:
             raise PickerAssetError(f"{tid}：模板 PNG 无法解码")
         entries.append(

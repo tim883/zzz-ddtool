@@ -701,6 +701,25 @@ def test_o10_missing_png_is_invalid_assets(tmp_path) -> None:
         assert result.reject_reason == discocr.INVALID_ASSETS
 
 
+def test_o10_assets_load_from_non_ascii_path(tmp_path) -> None:
+    """资产路径含中文时也要能加载：cv2.imread 在 Windows 上读不了非 ASCII 路径。
+
+    2026-10-14 实测：同一个模板 PNG，路径纯 ASCII 时 imread 读得出，路径里带中文就返回
+    None，于是整棵资产被判「模板 PNG 无法解码」，快路径每帧 INVALID_ASSETS、静默退回
+    legacy 整帧解析（打包态解压到中文目录必踩，源码态永远碰不到）。
+    """
+    copy = _copy_assets(tmp_path / "中文目录")
+    image = load(FIXTURES / "warehouse-detail.png")
+
+    assert discocr._load_assets(copy).identity
+
+    with discocr._fast_read_override(asset_root=copy):
+        result = discocr.try_read_disc(image, layout="detail")
+
+    assert result.profile_id == _WAREHOUSE
+    assert result.disc is not None
+
+
 def test_o10_manifest_only_change_changes_content_identity(tmp_path) -> None:
     """PNG 一个字节没动，只改 templates.json 的文字 → 内容身份必须变化，且新会话重新核对。"""
     import json
