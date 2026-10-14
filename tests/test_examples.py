@@ -143,6 +143,44 @@ def test_fetch_downloads_and_verifies_sha256(monkeypatch) -> None:
     ]
 
 
+def test_fetch_percent_encodes_non_ascii_file_name(monkeypatch) -> None:
+    """文件名可以是中文，但**请求地址必须是纯 ASCII**：非 ASCII 要百分号编码。
+
+    2026-10-14 实测：公共示例改成中文文件名后，原样拼出来的地址让 ``urllib`` 抛
+    ``UnicodeEncodeError: 'ascii' codec can't encode ...``——清单取得到（它的路径
+    是 ASCII），三份示例却一份都下不动。这条钉住"文件名进地址前先编码"。
+    """
+    from urllib.parse import quote
+
+    content = b"name: ok\n"
+    name = "example-异常攻精.yaml"
+    manifest = _manifest(
+        [
+            {
+                "file": name,
+                "title": "异常攻精",
+                "updated_at": "2026-10-14",
+                "note": "",
+                "sha256": _sha(content),
+            }
+        ]
+    )
+    encoded_url = f"{_FETCH_BASE}/{quote(name)}"
+    seen: list[str] = []
+
+    def fake(url: str, dest) -> None:
+        seen.append(url)
+        assert url.isascii(), f"请求地址必须纯 ASCII，实际是 {url!r}"
+        Path(dest).write_bytes({_MANIFEST_URL: manifest, encoded_url: content}[url])
+
+    monkeypatch.setattr(examples.updater, "_download", fake)
+
+    items = examples.fetch_examples(_MANIFEST_URL)
+
+    assert [i.file for i in items] == [name]
+    assert seen == [_MANIFEST_URL, encoded_url]
+
+
 def test_fetch_rejects_path_traversal_file_name(monkeypatch) -> None:
     """远端可指定任意文件名，绝不能拼出 user/plan/ 之外的路径。"""
     content = b"x"

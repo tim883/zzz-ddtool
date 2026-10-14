@@ -18,6 +18,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 from zzz_ddtool import paths, updater
 from zzz_ddtool.userdata import copy_missing
@@ -172,8 +173,12 @@ def fetch_examples(url: str = EXAMPLES_MANIFEST_URL) -> list[ExampleItem]:
         items: list[ExampleItem] = []
         for entry in entries:
             blob = tmp / entry["file"]
+            # 示例名可以是中文，但 HTTP 请求行只认 ASCII：路径段必须先百分号编码，
+            # 否则 urllib 直接抛 UnicodeEncodeError，清单取得到、示例却一份都下不动
+            # （2026-10-14 实测）。文件名由 _is_plain_yaml_name 保证不含 "/"，
+            # quote 不会跨段编码，拼不出别的路径。
             try:
-                updater._download(f"{base}/{entry['file']}", blob)
+                updater._download(f"{base}/{quote(entry['file'])}", blob)
             except Exception as exc:
                 raise ExamplesError(f"取不到示例 {entry['file']}：{exc}") from exc
             content = blob.read_bytes()
