@@ -5,8 +5,10 @@
 ## 快速开始
 
 1. 到 [发行版](https://github.com/tim883/zzz-ddtool/releases/latest) 下载程序包 zip（`zzz-ddtool-v<版本>.zip`）。
-2. 解压到任意目录 —— 解压后根目录里直接就是 `zzz-ddtool.exe`。
-3. 双击 `zzz-ddtool.exe`。**不需要安装 Python。**
+2. 解压到任意目录 —— 根目录直接就是 zzz-ddtool.exe，不要再套一层目录。
+3. 双击 zzz-ddtool.exe 启动客户端，不需要安装 Python。
+4. 客户端加载yaml方案，目前有3套预设方案，客户端配置、运行和停止方式参见[任务管理器使用说明](https://github.com/tim883/zzz-ddtool/blob/master/docs/%E4%BD%BF%E7%94%A8/%E4%BB%BB%E5%8A%A1%E7%AE%A1%E7%90%86%E5%99%A8%E4%BD%BF%E7%94%A8%E8%AF%B4%E6%98%8E.md)。
+5. 将游戏画面调整到大地图或仓库页，管理器点击开始任务。
 
 之后有新版本在界面里点「检查更新」即可，不用重新下载解压。更新会直接替换程序目录，替换期间不要强制结束进程，**没有回滚**。
 
