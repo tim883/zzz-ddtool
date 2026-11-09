@@ -319,6 +319,9 @@ _JOB_COUNTS_STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 _JOB_COUNT_WIDTH = 84  # 10pt 下「2016/2016」约 63px，留点余量
 _JOB_COUNT_FONT_PT = 10
 
+# 任务链为空时状态行只说这一句：这时右侧整块灰置，编什么都不会落到任务上。
+_EMPTY_CHAIN_HINT = "任务链是空的：先新建任务。"
+
 
 def _job_count_rects(rect: QRect) -> tuple[QRect, QRect]:
     right = rect.right() - 5
@@ -1482,6 +1485,12 @@ class MainWindow(QMainWindow):
         self._editing_job_id: str | None = None
         # 「应用于所有任务」那几个按钮：任务链为空时没有可铺的对象，统一禁用。
         self._apply_buttons: list[QPushButton] = []
+        # 任务链为空时一并置灰的按钮（生成组合 / 开始任务 / 链行操作）。
+        # 见 `_update_editor_enabled`：它们和右侧两栏一起灰，只留「新建任务」。
+        self._empty_chain_buttons: list[QPushButton] = []
+        # 配置栏与卡片栏的容器：任务链为空时整块置灰，不在界面上假装能编。
+        self._config_panel: QWidget | None = None
+        self._cards_panel: QWidget | None = None
         self._run_thread = None
         self._controller = None
         self._close_after_run = False
@@ -1503,9 +1512,12 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self._config_splitter = splitter
+        # 配置栏 / 卡片栏的容器留着引用：任务链为空时整块置灰（`_update_editor_enabled`）。
+        self._config_panel = self._build_left()
+        self._cards_panel = self._build_right()
         splitter.addWidget(self._build_chain())
-        splitter.addWidget(self._build_left())
-        splitter.addWidget(self._build_right())
+        splitter.addWidget(self._config_panel)
+        splitter.addWidget(self._cards_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 0)
         splitter.setStretchFactor(2, 1)
@@ -2115,6 +2127,8 @@ class MainWindow(QMainWindow):
         up_btn.clicked.connect(lambda: self._move_job(-1))
         down_btn.clicked.connect(lambda: self._move_job(1))
         del_btn.clicked.connect(self._remove_job)
+        # 链空时这四件事都无事可做（复制还要有选中行），跟着一起灰。
+        self._empty_chain_buttons.extend([copy_btn, up_btn, down_btn, del_btn])
         row.addWidget(up_btn)
         row.addWidget(down_btn)
         row.addWidget(del_btn)
@@ -2296,6 +2310,7 @@ class MainWindow(QMainWindow):
                     break
         self.chain_list.blockSignals(False)
         self._update_apply_buttons()
+        self._update_editor_enabled()
         self._update_status()
 
     def _editing_job(self) -> TaskJob | None:
@@ -2562,6 +2577,24 @@ class MainWindow(QMainWindow):
         for button in self._apply_buttons:
             button.setEnabled(enabled)
 
+    def _update_editor_enabled(self) -> None:
+        """任务链为空时，把右侧整块灰置。
+
+        没有任务就没有可编的对象：权重、门槛、额度、套装、主词条、卡片区、生成组合、
+        开始任务全部置灰，只留左上「新建任务」。否则界面看着能编，编完却无处可存
+        （新建出来的是空任务，之前敲的东西被清掉），属于假信息。
+
+        只管「能不能点」，不碰任何数据：`collect_preset`、任务节点和 Runner 都不受影响。
+        """
+        has_chain = bool(self._jobs)
+        for panel in (self._config_panel, self._cards_panel):
+            if panel is not None:
+                panel.setEnabled(has_chain)
+        # 运行 / 后台操作期间另有自己的禁用流程；恢复时不能把空链该灰的按钮点亮。
+        busy = self._run_thread is not None or self._utility_thread is not None
+        for button in self._empty_chain_buttons:
+            button.setEnabled(has_chain and not busy)
+
     def _apply_to_all(self, label: str, mutate) -> None:  # noqa: ANN001
         """把当前编辑器里的某项设置一次性铺到任务链里**已存在**的任务上。
 
@@ -2569,13 +2602,13 @@ class MainWindow(QMainWindow):
         """
         self._commit_editor()
         if not self._jobs:
-            self.status.setText("任务链是空的：先新建任务，再应用。")
+            self._show_notice("任务链是空的：先新建任务，再应用。")
             return
         for job in self._jobs:
             mutate(job)
         self._mark_unsaved()
         self._refresh_chain_list(self._editing_job_id)
-        self.status.setText(f"已把{label}应用到全部 {len(self._jobs)} 个任务。")
+        self._show_notice(f"已把{label}应用到全部 {len(self._jobs)} 个任务。")
 
     def _apply_weights_to_all(self) -> None:
         weights = dict(self.weight_editor.weights())
@@ -2610,10 +2643,10 @@ class MainWindow(QMainWindow):
         """
         self._commit_editor()
         if not self._jobs:
-            self.status.setText("任务链是空的：先新建任务，再批量全选。")
+            self._show_notice("任务链是空的：先新建任务，再批量全选。")
             return
         if not self._confirm_select_all_jobs():
-            self.status.setText("已取消：没有改动任何任务。")
+            self._show_notice("已取消：没有改动任何任务。")
             return
         # 快照成纯数据再进后台线程——那边不能碰界面控件。
         plans = [
@@ -2673,7 +2706,7 @@ class MainWindow(QMainWindow):
             note += f"；{skipped} 个任务没有符合门槛的卡片，已跳过未改动"
         if self._preview_dirty:
             note += "（当前任务尚未生成组合）"
-        self.status.setText(note + "。")
+        self._show_notice(note + "。")
 
     def _refresh_main_boxes(self, keep: set[str] | None = None) -> None:
         keep = set(keep if keep is not None else self._selected_mains())
@@ -2758,7 +2791,7 @@ class MainWindow(QMainWindow):
             value = self.sections[(other.value, checkpoint)].require.value()
             self.sections[(origin.value, checkpoint)].require.setValue(value)
         self._mark_unsaved()
-        self.status.setText(
+        self._show_notice(
             f"已把「初始 {_ORIGIN_CN[other]}」每档的本档要求拷贝到「初始 {_ORIGIN_CN[origin]}」。"
         )
 
@@ -2849,6 +2882,8 @@ class MainWindow(QMainWindow):
         footer.addLayout(row)
         all_on = QPushButton("全选当前可见")
         all_off = QPushButton("取消当前可见")
+        self.all_on_btn = all_on
+        self.all_off_btn = all_off
         all_on.clicked.connect(lambda: self._check_visible(True))
         all_off.clicked.connect(lambda: self._check_visible(False))
         self._task_controls.extend([all_on, all_off])
@@ -2867,6 +2902,10 @@ class MainWindow(QMainWindow):
         self.select_all_jobs_btn.clicked.connect(self._select_all_jobs)
         self._task_controls.append(self.select_all_jobs_btn)
         self._apply_buttons.append(self.select_all_jobs_btn)
+        # 链空时这些一并置灰：没有任务可生成、可勾、可跑。
+        self._empty_chain_buttons.extend(
+            [all_on, all_off, self.refresh_cards_btn, self.select_all_jobs_btn, self.start_btn]
+        )
         row.addWidget(all_on)
         row.addWidget(all_off)
         row.addWidget(self.refresh_cards_btn)
@@ -2896,6 +2935,16 @@ class MainWindow(QMainWindow):
         self.status = QLabel()
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
+        # 一次性提示单独占一行：以前这些句子直接写进上面那行现状，
+        # 把统计冲掉、而且一直停在那里，同一个位置一会儿是统计一会儿是提示。
+        self.notice = QLabel()
+        self.notice.setObjectName("hint")
+        self.notice.setWordWrap(True)
+        self.notice.setVisible(False)
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.setInterval(4000)
+        self._notice_timer.timeout.connect(self._clear_notice)
         self.run_status_label = QLabel()
         self.run_status_label.setObjectName("status")
         # 结果统计：界面**不显示**详细日志正文，只给一行摘要 + 详细日志文件路径。
@@ -2910,6 +2959,7 @@ class MainWindow(QMainWindow):
         self.run_stats_path_label.setOpenExternalLinks(True)
         self.run_stats_path_label.setVisible(False)
         box.addWidget(self.status)
+        box.addWidget(self.notice)
         box.addWidget(self.run_status_label)
         box.addWidget(self.run_stats_path_label)
         self._run_timer = QTimer(self)
@@ -2924,7 +2974,7 @@ class MainWindow(QMainWindow):
         if self._run_thread is not None or self._utility_thread is not None:
             return
         if self._preview_thread is not None or self._preview_timer.isActive():
-            self.status.setText("组合正在生成，请等待完成后开始任务。")
+            self._show_notice("组合正在生成，请等待完成后开始任务。")
             return
         try:
             preset = self.collect_preset()
@@ -2948,7 +2998,7 @@ class MainWindow(QMainWindow):
             return
         self._set_saved_state()
         if all(job.accepted is None for job in preset.task_chain):
-            self.status.setText("所有任务均未生成，已跳过。请先生成组合。")
+            self._show_notice("所有任务均未生成，已跳过。请先生成组合。")
             return
         self.start_btn.setEnabled(False)
         self.start_btn.setText("运行中…")
@@ -2957,6 +3007,7 @@ class MainWindow(QMainWindow):
             button.setEnabled(False)
         self._task_status = {"phase": "starting", "message": "正在启动任务"}
         self._show_run_status(self._task_status)
+        self._sync_run_lines()
         from zzz_ddtool.hotkeys import HotkeyController
         from copy import deepcopy
 
@@ -2984,6 +3035,8 @@ class MainWindow(QMainWindow):
         self._controller = None
         self._run_thread.deleteLater()
         self._run_thread = None
+        # 上面无条件把按钮点亮了：链空时（不可能跑，但状态要对）按空链规则重算一次。
+        self._update_editor_enabled()
         self._refresh_run_status()
         # 任务收尾后按轮数回收一次；回收失败不影响界面收尾，下次触发再试。
         from zzz_ddtool.retain import retain_rounds
@@ -3072,6 +3125,28 @@ class MainWindow(QMainWindow):
     def _on_task_status(self, data: dict) -> None:
         self._task_status = dict(data)
         self._show_run_status(data)
+        self._sync_run_lines()
+
+    def _sync_run_lines(self) -> None:
+        """运行状态这两行只在「任务链里有任务 + 本进程跑过」时出现。
+
+        空链时状态区只留「先新建任务」一句；没跑过就不占位，也不再显示
+        「运行状态：—（还没有运行记录）」这种对着现状说不出东西的句子。
+        """
+        shown = bool(self._jobs) and self._task_status is not None
+        self.run_status_label.setVisible(shown)
+        if not shown:
+            self.run_stats_path_label.setVisible(False)
+
+    def _show_notice(self, text: str) -> None:
+        """一次性提示：单独一行，4 秒后自己消失，不覆盖上面那行现状。"""
+        self.notice.setText(text)
+        self.notice.setVisible(True)
+        self._notice_timer.start()
+
+    def _clear_notice(self) -> None:
+        self.notice.clear()
+        self.notice.setVisible(False)
 
     def open_settings(self) -> None:
         """日志设置：级别 + 历史日志保留轮数。"""
@@ -3081,7 +3156,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         dialog.apply_settings()
-        self.status.setText("日志设置已保存")
+        self._show_notice("日志设置已保存")
 
     def check_update(self) -> None:
         from zzz_ddtool.updater import check_for_update
@@ -3215,9 +3290,12 @@ class MainWindow(QMainWindow):
             self.log_path.setText(f"日志文件：{self._log_path_shown}")
 
     def _refresh_run_status(self) -> None:
-        """每秒读 run-status.json + 日志尾部，工具窗口实时显示运行状态。"""
-        import json
+        """每秒刷新运行状态行 + 日志尾部。
 
+        运行状态**只认本进程的运行记录**：没跑过就不显示这一行（旧版常驻
+        「运行状态：—（还没有运行记录）」，还去读日志根上上一轮留下的
+        run-status.json，把上一轮的进度当成现况显示）。
+        """
         if self._controller is not None:
             self.pause_btn.setText("恢复 / F9" if self._controller.paused else "暂停 / F9")
             if self._controller.stopped:
@@ -3225,20 +3303,12 @@ class MainWindow(QMainWindow):
                 self.stop_btn.setEnabled(False)
                 self.pause_btn.setEnabled(False)
 
-        from zzz_ddtool import loground, logutil
-
-        text = "运行状态：—（还没有运行记录）"
-        status_file = loground.status_file()
-        if status_file.exists():
-            try:
-                data = json.loads(status_file.read_text(encoding="utf-8"))
-                self._show_run_status(data)
-                text = self.run_status_label.text()
-            except Exception:
-                pass
-        self.run_status_label.setText(text)
         if self._task_status is not None:
             self._show_run_status(self._task_status)
+        self._sync_run_lines()
+
+        from zzz_ddtool import loground, logutil
+
         # 读取当前轮次的主日志，覆盖导航、OCR、执行器等模块。
         if not hasattr(self, "run_log"):
             return
@@ -3434,7 +3504,9 @@ class MainWindow(QMainWindow):
         worker.result.connect(self._on_preview_result)
         worker.failed.connect(self._on_preview_failed)
         worker.finished.connect(self._on_preview_finished)
-        self.status.setText("正在后台计算组合…")
+        # 现状行照实说「组合待生成」，进度另起一行提示：别让一句临时提示停在统计位上。
+        self._update_status()
+        self._show_notice("正在后台计算组合…")
         self.refresh_cards_btn.setText("重新生成")
         self._refresh_current_counts()
         worker.start()
@@ -3443,7 +3515,7 @@ class MainWindow(QMainWindow):
         if self._closing or generation != self._preview_generation:
             return
         self._preview_install = list(grouped.items())
-        self.status.setText("正在显示组合…")
+        self._show_notice("正在显示组合…")
         self._preview_timer.start(1)
 
     def _install_preview_section(self) -> None:
@@ -3483,7 +3555,7 @@ class MainWindow(QMainWindow):
 
     def _on_preview_failed(self, generation: int, message: str) -> None:
         if generation == self._preview_generation and not self._closing:
-            self.status.setText(f"组合生成失败：{message}")
+            self._show_notice(f"组合生成失败：{message}")
             self.refresh_cards_btn.setText("重试生成")
 
     def _on_preview_finished(self) -> None:
@@ -3601,19 +3673,42 @@ class MainWindow(QMainWindow):
         return [section for section in self.sections.values() if origin is None or section.origin is origin]
 
     def _update_status(self) -> None:
+        """状态行只写一句「现状」：选中了哪个任务、哪个部位、组合算到哪一步。
+
+        以前这里还拼「任务链 N 节」并用**部位号**冒充任务号（4 个任务也能读出
+        「正在编 6 号」），任务链为空时也照常输出一份 0 计数，读起来像真有一份
+        配置在那里。现在每种状态各一句，没有任务就只说先新建任务。
+        """
+        if not self._jobs:
+            self.status.setText(_EMPTY_CHAIN_HINT)
+            return
+        job = self._editing_job()
+        if job is None:
+            self.status.setText("未选中任务")
+            return
+        index = next(
+            (row + 1 for row, saved in enumerate(self._jobs) if saved.job_id == job.job_id), 0
+        )
+        scope = self.tabs.tabText(self.tabs.currentIndex()) if self.tabs.currentIndex() < 2 else "全部组合"
+        head = f"已选第 {index} 个任务 · {job.slot} 号位 · {scope}"
+        # 「生成过没有」看界面有没有卡片：任务节点上的 accepted 要等编辑器写回，
+        # 刚生成完那一下还是 None，不能拿它当判据（否则刚出卡就报"未生成"）。
+        generated = any(section.patterns for section in self.sections.values())
+        if job.accepted is None and not generated:
+            self.status.setText(f"{head} · 组合未生成")
+            return
         if self._preview_dirty:
-            self.status.setText("组合待生成")
+            self.status.setText(f"{head} · 组合待生成")
+            return
+        if not generated:
+            self.status.setText(f"{head} · 组合已保存，刷新组合后显示卡片")
             return
         sections = self._current_sections()
         visible = sum(len(section._visible_indices) for section in sections)
         total = sum(len(section.patterns) for section in sections)
         picked = sum(len(section.visible_accepted()) for section in sections)
-        scope = self.tabs.tabText(self.tabs.currentIndex()) if self.tabs.currentIndex() < 2 else "全部组合"
         condition = "符合条件" if self.weight_editor.required_substats() else "符合门槛"
-        self.status.setText(
-            f"任务链 {len(self._jobs)} 节 · 正在编 {self._active_slot} 号 · "
-            f"{scope}：组合共 {total} 种，{condition} {visible}，已勾选 {picked}"
-        )
+        self.status.setText(f"{head}：组合共 {total} 种，{condition} {visible}，已勾选 {picked}")
 
     def _start_utility(self, operation, on_success, message: str) -> None:  # noqa: ANN001
         """在后台线程跑一次工具操作。
@@ -3662,6 +3757,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         for button in self._task_controls:
             button.setEnabled(True)
+        # 同上：无条件点亮之后按空链规则重算一次，别把该灰的点亮。
+        self._update_editor_enabled()
         if worker.exit_code is not None:
             self._exit_after_close = worker.exit_code
             self.close()
@@ -3756,6 +3853,7 @@ class MainWindow(QMainWindow):
         self._preview_install = []
         self._preview_timer.stop()
         self._counts_timer.stop()
+        self._notice_timer.stop()
         if self._counts_thread is not None:
             self._counts_thread.requestInterruption()
             event.ignore()

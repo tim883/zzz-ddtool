@@ -1023,8 +1023,8 @@ def test_select_all_jobs_covers_every_task_and_spares_new_ones(qapp: QApplicatio
     assert first.accepted and second.accepted
     # 空集绝不能落地：accepted=[] 在运行时是「全部判弃置」，不是「一张不勾」
     assert third.accepted is None
-    assert "已按各自门槛为 2 个任务勾选" in window.status.text()
-    assert "1 个任务没有符合门槛的卡片" in window.status.text()
+    assert "已按各自门槛为 2 个任务勾选" in window.notice.text()
+    assert "1 个任务没有符合门槛的卡片" in window.notice.text()
 
     # 之后新建的任务不受影响
     window._add_job()
@@ -1065,7 +1065,7 @@ def test_select_all_jobs_cancelled_changes_nothing(qapp: QApplication, tmp_path,
     assert asked == [1]  # 确实问了
     assert job.accepted is None  # 但没有改
     assert window._utility_thread is None  # 也没启动后台
-    assert "已取消" in window.status.text()
+    assert "已取消" in window.notice.text()
     window.close()
 
 
@@ -1519,6 +1519,8 @@ def test_utility_runs_off_thread_and_reports_failure(qapp, tmp_path, monkeypatch
     monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text: warnings.append(text))
 
     window = MainWindow(config_path=tmp_path / "t.yaml")
+    # 有任务才有「开始任务」可点：空链时它按新规则恒为灰（见 test_empty_chain_*）。
+    window._add_job()
     entered, release = threading.Event(), threading.Event()
     calls = []
     main_id = threading.get_ident()
@@ -2352,7 +2354,9 @@ def test_ungenerated_task_stays_invalid_after_edits_and_save(qapp, tmp_path, mon
         assert load_preset(window._path).task_chain[0].accepted is None
         window._on_start_clicked()
         assert window._run_thread is None
-        assert "未生成" in window.status.text() and "跳过" in window.status.text()
+        assert "未生成" in window.status.text()
+        # 「跳过」是一次性提示：它单独占一行，不覆盖上面的现状句。
+        assert "跳过" in window.notice.text()
     finally:
         close_count_window(window, qapp)
 
@@ -2413,7 +2417,7 @@ def test_generation_in_progress_keeps_task_invalid_and_prevents_start(qapp, tmp_
         assert window.collect_preset().task_chain[0].accepted is None
         window._on_start_clicked()
         assert window._run_thread is None
-        assert "等待" in window.status.text()
+        assert "等待" in window.notice.text()
         release.set()
         wait_until(qapp, lambda: not window._preview_dirty)
         assert window.collect_preset().task_chain[0].accepted is not None
@@ -2950,7 +2954,7 @@ def test_copy_other_require_mirrors_other_origin(qapp: QApplication, tmp_path) -
     window._copy_other_require(Origin.THREE)
     for checkpoint in CHECKPOINTS:
         assert window.sections[("three", checkpoint)].require.value() == pytest.approx(checkpoint * 0.5 + 1)
-    assert "4词" in window.status.text() and "3词" in window.status.text()
+    assert "4词" in window.notice.text() and "3词" in window.notice.text()
 
     # 反向：从 4 词一侧拷回 3 词
     window.sections[("three", 0)].require.setValue(9.9)
@@ -3223,5 +3227,136 @@ def test_utility_progress_line_shows_percent_and_size(qapp, tmp_path):
 
         window._on_utility_progress(3 * 1048576, None)
         assert "已下载 3.0 MB" in window.status.text()
+    finally:
+        window.close()
+
+
+def test_state_line_describes_what_is_actually_selected(qapp, tmp_path):
+    """状态行一句现状：第几个任务 + 哪个部位 + 页签 + 组合到哪一步。
+
+    「正在编 6 号」那种写法把**部位号**当任务号读（4 个任务也能冒出"6 号"），
+    也不该再报「任务链 N 节」。
+    """
+    from zzz_ddtool.gui import _EMPTY_CHAIN_HINT
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        # 链空：只说先新建任务，也没有别的句子混进来
+        assert window.status.text() == _EMPTY_CHAIN_HINT
+
+        window._add_job()
+        assert window.status.text() == "已选第 1 个任务 · 4 号位 · 初始 3 词 · 组合未生成"
+
+        # 部位号是 6 号位，任务序号还是第 1 个：两套编号各归各位
+        window._on_slot_clicked(6)
+        assert "已选第 1 个任务 · 6 号位" in window.status.text()
+        assert "正在编" not in window.status.text()
+
+        window._add_job()
+        assert "已选第 2 个任务 · 6 号位" in window.status.text()
+
+        # 生成后给出计数，措辞沿用列表/手册的口径
+        window.weight_editor.set_weights({"暴击率": 1.0, "暴击伤害": 1.0})
+        refresh_cards(window, qapp)
+        text = window.status.text()
+        assert text.startswith("已选第 2 个任务 · 6 号位 · 初始 3 词：")
+        assert "组合共" in text and "符合门槛" in text and "已勾选" in text
+
+        # 改动后（未重新生成）说"待生成"
+        window.weight_editor.set_weights({"暴击率": 2.0})
+        window._schedule_rebuild()
+        assert window.status.text().endswith("组合待生成")
+    finally:
+        window.close()
+
+
+def test_empty_chain_greys_every_editor_and_only_hints_to_add_a_task(qapp, tmp_path):
+    """任务链清空后：右侧整块灰置，状态区只留一句「先新建任务」。
+
+    之前这里看着还能编（权重、门槛、额度、套装、主词条、生成组合都能点），
+    编完却无处可存——新建任务是空的，敲进去的值被清掉。显示层不许假装能编。
+    """
+    from zzz_ddtool.gui import _EMPTY_CHAIN_HINT
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        empty_buttons = [
+            window.start_btn, window.refresh_cards_btn, window.all_on_btn, window.all_off_btn,
+            window.select_all_jobs_btn, window.apply_weights_btn, window.apply_limit_btn,
+            window.apply_sets_btn,
+        ]
+        assert window._jobs == []
+        assert window.status.text() == _EMPTY_CHAIN_HINT
+        assert not window._config_panel.isEnabled()
+        assert not window._cards_panel.isEnabled()
+        assert all(not button.isEnabled() for button in empty_buttons), [
+            button.text() for button in empty_buttons if button.isEnabled()
+        ]
+        # 运行那两行不占位：没任务、没跑过就整行不出现
+        assert window.run_status_label.isHidden()
+        assert window.run_stats_path_label.isHidden()
+
+        # 建了任务立刻恢复，文案变成「已选第 1 个任务 …」
+        window._add_job()
+        assert window._config_panel.isEnabled()
+        assert window._cards_panel.isEnabled()
+        assert all(button.isEnabled() for button in empty_buttons)
+        assert window.status.text().startswith("已选第 1 个任务")
+
+        # 删回空链：不留「正在编 N 号」「任务链 0 节」这类残句
+        window._remove_job()
+        text = window.status.text()
+        assert text == _EMPTY_CHAIN_HINT
+        assert "正在编" not in text and "任务链 0 节" not in text
+        assert not window._config_panel.isEnabled()
+        assert all(not button.isEnabled() for button in empty_buttons)
+    finally:
+        window.close()
+
+
+def test_run_status_line_appears_only_after_a_run(qapp, tmp_path):
+    """没跑过就不出现运行状态行；跑过之后才有，空链时再收起来。"""
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        window._refresh_run_status()
+        assert window.run_status_label.isHidden()
+        assert "还没有运行记录" not in window.run_status_label.text()
+
+        window._on_task_status(
+            {"phase": "running", "processed": 1, "max_discs": 10, "message": "处理中"}
+        )
+        assert not window.run_status_label.isHidden()
+        assert "运行状态：running" in window.run_status_label.text()
+
+        # 链空：只留「先新建任务」，运行那两行一起收掉
+        window._remove_job()
+        window._refresh_run_status()
+        assert window.run_status_label.isHidden()
+        assert window.run_stats_path_label.isHidden()
+    finally:
+        window.close()
+
+
+def test_one_off_notice_stays_out_of_the_state_line(qapp, tmp_path):
+    """一次性提示单独一行：不再把现状句冲掉，也不再永远停在那里。"""
+    from zzz_ddtool.origin import Origin
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    try:
+        window._add_job()
+        before = window.status.text()
+        assert window.notice.isHidden()
+
+        window._copy_other_require(Origin.THREE)
+        assert "3词" in window.notice.text() and "4词" in window.notice.text()
+        assert window.status.text() == before, "现状句不能被一次性提示覆盖"
+        assert not window.notice.isHidden()
+
+        # 4 秒后自己消失
+        window._notice_timer.stop()
+        window._clear_notice()
+        assert window.notice.isHidden()
+        assert window.status.text() == before
     finally:
         window.close()
