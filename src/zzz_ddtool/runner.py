@@ -159,6 +159,22 @@ _RETURN_EDGE_FLOOR_MS: dict[str, int] = {
 #: 约 1.16 s）由本固定间隔取代。取值 0.1 s 作保险余量，与副词条/set_option 连点口径一致。
 _STAGE_ADD_TO_UPGRADE_S = 0.1
 
+#: 「材料返还」候选项位置键的量化粒度（px）。两次真机弹窗的「确认」行检出框分别是
+#: (948,711,1008,748) 与 (899,692,1048,765)——同一按钮有时被 OCR 并成更大的一块，
+#: 框的宽高不可靠；而同一弹窗连续帧里框会抖 1~2 px，位置原值进 `state_key` 就等于
+#: 每帧都是新候选，「连续两帧一致」永远攒不起来（2026-11-20 真机实测：连续三帧被 ±1 px
+#: 打断，8180 ms 预算耗尽后判超时，再走一遍超时出口重做同一份识别）。
+#: 所以键只取**量化后的中心点**：既吸收抖动与框宽高差异，按钮真的移位仍算新候选。
+_REFUND_KEY_QUANTUM_PX = 20
+
+
+def _refund_position_key(line) -> tuple[int, int]:
+    """返还确认行的位置键：中心点按 :data:`_REFUND_KEY_QUANTUM_PX` 量化。"""
+    quantum = _REFUND_KEY_QUANTUM_PX
+    cx = (int(line.left) + int(line.right)) // 2
+    cy = (int(line.top) + int(line.bottom)) // 2
+    return (cx // quantum, cy // quantum)
+
 # ---- 就绪等待（§6.2 material_ready）的像素差分阈值（§10 裁量）----
 # 2026-10-12：`_upgrade_once` 生产路径已不再调用该等待（见 _STAGE_ADD_TO_UPGRADE_S）。
 # 仍在用的是 `_pick_material`（测试入口）触发的那次 material_ready；阈值与探针保留。
@@ -579,6 +595,30 @@ class Runner:
                 return line
         return None
 
+    def _refund_sample(self, frame, captured: float) -> "readiness.WaitSample | None":
+        """§6.2.1：把一帧上的「材料返还」判定做成中断样本；没有弹窗返回 None。
+
+        一次整窗 OCR（``_find_material_refund``），命中后样本带 ``interrupt_reason``，
+        交给等待器按「两个独立稳定候选」判中断。位置只进证据的原始框，比较键按量子取，
+        避免 OCR 检出框 ±1 px 抖动把连续候选打散。
+        """
+        refund = self._find_material_refund(frame)
+        if refund is None:
+            return None
+        text = refund.text.replace(" ", "")
+        rect = [int(refund.left), int(refund.top), int(refund.right), int(refund.bottom)]
+        return readiness.WaitSample(
+            frame=frame,
+            captured_at=captured,
+            ready=False,
+            state_key=(
+                "upgrade_result", "refund", self.MATERIAL_REFUND_TITLE, text,
+                _refund_position_key(refund),
+            ),
+            evidence=self._evidence(refund={"text": text, "rect": rect}),
+            interrupt_reason=MATERIAL_REFUND,
+        )
+
     # ---------------------------------------------------------------- 证据与判据工具
 
     @staticmethod
@@ -914,9 +954,20 @@ class Runner:
         return probe
 
     def _probe_upgrade_result(self, before: Disc, expected_level: int):
+        # 材料返还只在「升到满级」这一档出现（素材溢出）：只有本档可能到 15 级时才先看弹窗。
+        # 其余档位不付这份识别开销——预判小框 + 整窗 OCR 一次都不做，保持原顺序。
+        watch_refund_first = expected_level >= MAX_LEVEL
+
         def probe() -> readiness.WaitSample:
             frame, _page, _method, _hwnd = self._grab(allow_esc=False, need_page=False)
             captured = time.monotonic()
+            # 先看弹窗：弹窗盖住整页，先读盘面必然两套布局各 0 行（0.6~0.8 s 白花）。
+            # 标题小框先预判，命中才做整窗 OCR 拿「确认」行。
+            title_hit = watch_refund_first and self._refund_title_hit(frame)
+            if title_hit:
+                sample = self._refund_sample(frame, captured)
+                if sample is not None:
+                    return sample
             disc = self._parse_upgrade_page(frame)
             if disc is not None:
                 ready = disc.level >= expected_level
@@ -932,19 +983,12 @@ class Runner:
                     ),
                     disc=disc if ready else None,
                 )
-            # 只有本帧读不到盘面才做全窗口返还 OCR（§6.2.1）。
-            refund = self._find_material_refund(frame)
-            if refund is not None:
-                text = refund.text.replace(" ", "")
-                rect = [int(refund.left), int(refund.top), int(refund.right), int(refund.bottom)]
-                return readiness.WaitSample(
-                    frame=frame,
-                    captured_at=captured,
-                    ready=False,
-                    state_key=("upgrade_result", "refund", self.MATERIAL_REFUND_TITLE, text, tuple(rect)),
-                    evidence=self._evidence(refund={"text": text, "rect": rect}),
-                    interrupt_reason=MATERIAL_REFUND,
-                )
+            # 标题小框没命中（判据漂移、弹窗被动画遮挡）时仍是原有的整窗兜底，各档都保留；
+            # 已命中过的帧不再重复整窗 OCR。
+            if not title_hit:
+                sample = self._refund_sample(frame, captured)
+                if sample is not None:
+                    return sample
             return readiness.WaitSample(
                 frame=frame,
                 captured_at=captured,
@@ -2264,11 +2308,20 @@ class Runner:
                 )
             )
 
+        phase = state.row_phase_px or 0.0
+        above_top = sum(
+            1 for _x, label_y, _level in labels if metrics.is_above_viewport_top(label_y, phase)
+        )
+        if above_top:
+            self.log.info(
+                "顶部露出上一行残影 %d 条，按视口外处理（不参与格位映射）", above_top
+            )
+
         cells, problems = map_labels(
             metrics,
             labels,
             viewport_top_row0=state.viewport_top_row0 or 0,
-            row_phase_px=state.row_phase_px or 0.0,
+            row_phase_px=phase,
         )
 
         # 没读到「等级」的屏幕位置不等于空位（spec §5.5 第 259 行）：逐个看图标
@@ -3094,6 +3147,26 @@ class Runner:
     # 打断整条任务链（2026-10-04 全链路实测：处理到第 4 件、12→15 满级后弹出）。
     # 注意游戏文案是「返还」不是「退还」，标题 OCR 实测 (898,404,1021,442) score=1.00。
     MATERIAL_REFUND_TITLE = "材料返还"
+    #: 标题小框（设计坐标）：只用来在整窗 OCR 之前预判「弹窗是不是来了」。
+    #: 成本是一次单区域识别，与 `(955,528,1050,592)` 这种框同级（生产日志 35~50 ms），
+    #: 比两套布局解析（0.61~0.78 s）和整窗 OCR（1.19~1.47 s）便宜一个数量级；
+    #: 小框之间再放大几乎不再加钱，所以按「弹窗高度随返还材料行数变化」留足余量：
+    #: 两份真机弹窗的标题框是 (898,404,1021,442) 与 (897,402,1022,443)（几乎重合），
+    #: 而「确认」行一在 (948,711,1008,748)、一在 (899,692,1048,765)（差约 19 px）。
+    MATERIAL_REFUND_TITLE_AREA = (840, 320, 1080, 470)
+
+    def _refund_title_hit(self, image: QImage) -> bool:
+        """§6.2.1：小框预判「材料返还」标题，只决定值不值得做整窗 OCR；不做中断判定。
+
+        中断判定仍要整窗 OCR 拿到「确认」行（见 ``_refund_sample``），标题单独出现不算。
+        """
+        from zzz_ddtool import ocr as _ocr
+
+        title = self.MATERIAL_REFUND_TITLE
+        return any(
+            title in line.text.replace(" ", "")
+            for line in _ocr.read_rect(image, self.MATERIAL_REFUND_TITLE_AREA)
+        )
 
     def _dismiss_material_refund(self, hwnd: int, image: QImage, *, resume_result: bool = False) -> bool:
         """识别「材料返还」确认弹窗并点「确认」；没这个弹窗就返回 False。

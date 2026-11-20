@@ -422,15 +422,33 @@ def test_material_refund_wrong_kind_rejected(sim_clock, fake_controller):
         _run(sim_clock, fake_controller, steps, calls=calls, kind="select_disc", policy=policy)
 
 
-def test_material_refund_over_budget_prefers_timeout(sim_clock, fake_controller):
+def test_material_refund_frame_after_budget_still_interrupts(sim_clock, fake_controller):
+    """超时只在「这一帧没确认成功」时判：第二帧拍在预算外，但已凑成确认 → 判中断。
+
+    2026-11-21 用户裁定：看到不对才看表；已经确认到的不因识别收尾晚了而被丢掉。
+    """
     policy = readiness.WaitPolicy(200, 3000, 50, 2)
     steps = [
         lambda c, ctrl: (_advance(c, 0.300), _sample(c, ready=False, interrupt=readiness.MATERIAL_REFUND))[1],
         lambda c, ctrl: (_advance(c, 3.000), _sample(c, ready=False, interrupt=readiness.MATERIAL_REFUND))[1],
     ]
     calls: list[int] = []
+    with pytest.raises(readiness.ReadinessInterrupted) as excinfo:
+        _run(sim_clock, fake_controller, steps, calls=calls, kind="upgrade_result", policy=policy)
+    assert excinfo.value.reason == readiness.MATERIAL_REFUND
+    assert excinfo.value.samples == 2
+
+
+def test_material_refund_single_frame_after_budget_times_out(sim_clock, fake_controller):
+    """只有一帧、没凑成确认，且活动时间已过预算 → 照旧判超时（超时不会被无限拖）。"""
+    policy = readiness.WaitPolicy(200, 3000, 50, 2)
+    steps = [
+        lambda c, ctrl: (_advance(c, 3.300), _sample(c, ready=False, interrupt=readiness.MATERIAL_REFUND))[1],
+    ]
+    calls: list[int] = []
     with pytest.raises(readiness.ReadinessTimeout):
         _run(sim_clock, fake_controller, steps, calls=calls, kind="upgrade_result", policy=policy)
+    assert len(calls) == 1  # 判超时后不再补拍
 
 
 def test_mutually_exclusive_sequences_rebuild(sim_clock, fake_controller):

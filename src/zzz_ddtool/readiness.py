@@ -310,6 +310,9 @@ def wait_ready(
     - 下限与超时都按 ``started_at`` 起的活动时间计（扣暂停）；暂停阻塞不计入
       ``active_ms``/超时。代次改变丢弃旧帧、候选与最后样本（恢复后仍须两帧新证据），
       但**不**重开下限预算（§2.1、§3.2）。
+    - 超时只在**这一帧没有确认成功**时才判：每帧先判是否凑成确认（就绪两帧 / 中断两帧），
+      凑成就返回；没凑成才看表决定「再来一帧」还是「判超时」。所以一帧已经拍下、只是识别
+      收尾把活动时间推过超时的，不会再被丢掉；停止最晚比超时晚一帧。
     - 下限达成前的睡眠请求不超过剩余下限，并计入 ``requested_sleep_ms``；
       超过下限后的轮询请求不计入（§7.1）。
     - ``material_refund`` 需两个独立稳定候选，满足后抛 ``ReadinessInterrupted``。
@@ -416,8 +419,6 @@ def wait_ready(
 
         end = _now()
         crossed = _on_checkpoint()
-        if _active_at(end) > timeout_s:
-            _raise_timeout(end)
 
         if crossed:
             # probe 期间跨代次：当前样本采自旧代次（_on_checkpoint 已清 last），不消费。
@@ -441,6 +442,12 @@ def wait_ready(
                     state["times"].append(sample.captured_at)
                     if len(state["times"]) >= need:
                         return _finish(sample, end)
+
+        # 这一眼看下来没有确认成功（未就绪 / 未凑够两帧 / 跨代次作废），这时才看表：
+        # 没超时就去拍下一帧，超时才停止。已经凑成确认的那一帧在此之上直接返回，所以
+        # 「识别收尾把时间推过超时」不会再把已经判对的结果丢掉；超时最晚晚一帧生效。
+        if _active_at(end) > timeout_s:
+            _raise_timeout(end)
 
         # 调度下一帧：按本帧采集时刻 + poll 间隔（§6.1）；probe 耗时达到 poll 时立即继续，
         # 不在慢 probe 后机械再睡足一个 poll（那会把本可在预算内完成的等待拖成超时）。

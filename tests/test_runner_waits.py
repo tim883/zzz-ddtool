@@ -453,6 +453,96 @@ def test_w4_title_only_never_interrupts_and_upgrade_result_stays_pending(monkeyp
     assert click.call_count == 0
 
 
+def test_w4_refund_probe_checks_popup_before_disc_parse_on_max_upgrade(monkeypatch, sim_time):
+    """满级档先看返还弹窗：标题小框命中就不再读被盖住的盘面；位置键取量化中心点。
+
+    2026-11-20 真机：同一弹窗三帧的「确认」框依次 1009→1008、left 947→948，位置原值
+    进键等于每帧都是新候选，两帧永远凑不齐、8180 ms 预算耗尽判超时；而且每帧先花
+    0.6~0.8 s 去读必然 0 行的盘面。两次真机弹窗的「确认」框还分别是 (948,711,1008,748)
+    与 (899,692,1048,765)——同一按钮有时被并成更大一块，所以键只取中心点。
+    """
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    frames = Frames([{"image": image()}])
+    bind_grab(monkeypatch, runner, frames)
+    parse = Mock(return_value=None)
+    monkeypatch.setattr(runner, "_parse_upgrade_page", parse)
+
+    boxes = [
+        (947, 711, 1009, 748),   # 基准
+        (947, 711, 1008, 748),   # 右边界抖 1 px
+        (948, 711, 1008, 748),   # 左边也抖 1 px
+        (899, 692, 1048, 765),   # 同一按钮被 OCR 并成更大一块（另一份真机样本）
+        (947, 751, 1009, 788),   # 按钮真的下移 40 px
+    ]
+    seen = {"n": 0, "full": 0}
+
+    def fake_read(image_, region):
+        if tuple(region) == runner.MATERIAL_REFUND_TITLE_AREA:
+            return [line("材料返还", (898, 404, 1021, 442))]
+        if tuple(region) == (0, 0, image_.width(), image_.height()):
+            seen["full"] += 1
+            box = boxes[min(seen["n"], len(boxes) - 1)]
+            seen["n"] += 1
+            return [line("材料返还", (898, 404, 1021, 442)), line("确认", box)]
+        return []
+
+    monkeypatch.setattr(ocr_module, "read_rect", fake_read)
+
+    probe = runner._probe_upgrade_result(disc(12), 15)      # 12 → 15：这一档会溢出素材
+    samples = [probe() for _ in boxes]
+
+    assert [s.interrupt_reason for s in samples] == ["material_refund"] * len(boxes)
+    assert parse.call_count == 0                            # 标题命中：不再读被盖住的盘面
+    assert seen["full"] == len(boxes)                       # 每帧只做一次整窗 OCR
+    keys = [s.state_key for s in samples]
+    assert keys[0] == keys[1] == keys[2] == keys[3]         # 抖动 / 框宽高差异：同一候选
+    assert keys[4] != keys[0]                               # 中心点真的挪了：算新候选
+    # 证据保留未量化的原始框，量化只影响比较键。
+    assert [s.evidence["refund"]["rect"] for s in samples] == [[*box] for box in boxes]
+
+
+def test_w4_refund_title_hit_on_real_popup_sample():
+    """真机弹窗帧：标题小框命中、整窗也能拿到「确认」行；强化页帧不误报。
+
+    样本 `tests/fixtures/upgrade-material-refund.png` 取自 2026-11-20 那轮的材料返还确认帧
+    （返还 1 行「塑化镉剂 ×3」，标题实测 (898,404,1021,442)、「确认」实测 (948,711,1008,748)）。
+    """
+    runner = Runner(Preset(), hotkeys=False)
+    popup = QImage("tests/fixtures/upgrade-material-refund.png")
+    plain = QImage("tests/fixtures/upgrade-modal.png")
+    assert not popup.isNull(), "缺少固定测试样本 upgrade-material-refund.png"
+    assert not plain.isNull(), "缺少固定测试样本 upgrade-modal.png"
+
+    assert runner._refund_title_hit(popup) is True
+    assert runner._refund_title_hit(plain) is False
+
+    refund = runner._find_material_refund(popup)
+    assert refund is not None
+    assert "确认" in refund.text.replace(" ", "")
+
+
+def test_w4_refund_precheck_skipped_below_max_level(monkeypatch, sim_time):
+    """非满级档不会有素材溢出：连标题小框都不读，保持「先读盘面」的原顺序。"""
+    runner = Runner(Preset(), hotkeys=False)
+    runner.trace = Mock()
+    frames = Frames([{"image": image()}])
+    bind_grab(monkeypatch, runner, frames)
+    monkeypatch.setattr(runner, "_parse_upgrade_page", lambda _image: disc(3))
+    title_hit = Mock(return_value=True)
+    monkeypatch.setattr(runner, "_refund_title_hit", title_hit)
+    monkeypatch.setattr(
+        runner, "_refund_sample",
+        Mock(side_effect=AssertionError("非满级档不应做返还识别")),
+    )
+
+    sample = runner._probe_upgrade_result(disc(0), 3)()      # 0 → 3：不会溢出
+
+    assert title_hit.call_count == 0
+    assert sample.ready is True and sample.interrupt_reason is None
+    assert sample.disc is not None and sample.disc.level == 3
+
+
 def _generation_interrupted(frame, pause_generation):
     sample = WaitSample(
         frame=frame, captured_at=0.0, ready=False, state_key=("upgrade_result", "refund"),
