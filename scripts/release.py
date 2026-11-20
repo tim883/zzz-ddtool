@@ -313,9 +313,12 @@ def _print_summary(scenario: str, outdir: Path, branch: str, pushed_hash: str, d
 
 
 def main(argv: list[str] | None = None) -> int:
-    # 输出被管道捕获时父进程是块缓冲，子脚本先 flush 会显成乱序；改行缓冲让每步即时按序显示
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(line_buffering=True)
+    # 输出被管道捕获时父进程是块缓冲，子脚本先 flush 会显成乱序；改行缓冲让每步即时按序显示。
+    # errors="replace"：GBK 控制台下个别符号（如 ×）编码不了会抛 UnicodeEncodeError，
+    # 把本该显示的中止原因整个吞掉、只剩一堆 traceback（2026-11-21 实际踩到）。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True, errors="replace")
     args = _parse_args(argv)
     scenario = args.action
     dry_run = args.dry_run
@@ -328,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         branch = _current_branch()
     except ReleaseError as exc:
-        print(f"✘ 发布中止：{exc}")
+        print(f"× 发布中止：{exc}")
         return 2
 
     steps: list[tuple[str, object]] = [
@@ -353,11 +356,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = step()  # type: ignore[operator]
         except ReleaseError as exc:
-            print(f"\n✘ 发布中止（停在第 {index} 步「{name}」）：{exc}")
+            print(f"\n× 发布中止（停在第 {index} 步「{name}」）：{exc}")
             print("  处理后重新运行本命令即可。")
             return 2
         except Exception as exc:  # noqa: BLE001 - 脚本边界，意外错误也要友好收场
-            print(f"\n✘ 意外错误（停在第 {index} 步「{name}」）：{type(exc).__name__}: {exc}")
+            print(f"\n× 意外错误（停在第 {index} 步「{name}」）：{type(exc).__name__}: {exc}")
             print("  处理后重新运行本命令即可。")
             return 2
         if name == "核对远端" and isinstance(result, str):
