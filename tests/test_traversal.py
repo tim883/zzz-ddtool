@@ -158,10 +158,52 @@ def test_duplicate_column_is_a_problem_not_a_skip():
 
 def test_unmappable_label_recorded_as_problem():
     geom = metrics()
+    # 视口内、但落在两行之间（偏 10px > 175*2%=3.5px）→ 仍不可映射，记 problem。
+    off_grid_y = geom.row_center_y(1, 0, 0.0) + 10.0 + 87.0
     _, problems = map_labels(
-        geom, [(10.0, 10.0, 0)], viewport_top_row0=0, row_phase_px=0.0
+        geom, [(geom.center_x_of(2), off_grid_y, 0)], viewport_top_row0=0, row_phase_px=0.0
     )
     assert len(problems) == 1
+
+
+def test_residual_row_above_viewport_top_is_ignored_not_a_problem():
+    """滚动后顶部露出的上一行残影不是格位，不记 problem（真机 2026-11-12）。
+
+    真机帧里 OCR 读到坐标 (167,182) 的残影标签：按实测原点 268.5、行距 174.5
+    反推它的图标中心在 95，正好落在首行之上一整行，属于被列表上沿裁掉的上一行。
+    """
+    geom = metrics()
+    top0, phase = 2, 0.0
+    labels = [label_for(geom, -1, col, phase=phase, top0=top0, level=15) for col in range(9)]
+    cells, problems = map_labels(geom, labels, viewport_top_row0=top0, row_phase_px=phase)
+    assert problems == []
+    assert cells == []
+
+
+def test_residual_row_does_not_disturb_real_cells():
+    geom = metrics()
+    top0, phase = 2, 0.0
+    residual = [label_for(geom, -1, col, phase=phase, top0=top0, level=15) for col in range(9)]
+    real = [
+        label_for(geom, row, col, phase=phase, top0=top0)
+        for row in range(4)
+        for col in range(9)
+    ]
+    cells, problems = map_labels(geom, residual + real, viewport_top_row0=top0, row_phase_px=phase)
+    assert problems == []
+    assert len(cells) == 36
+    assert {cell.global_row0 for cell in cells} == {2, 3, 4, 5}
+
+
+def test_residual_row_above_dropped_while_clipped_first_row_still_maps():
+    """半行相位：裁切中的首行照旧归位，它上面那一整行的残影排除。"""
+    geom = metrics()
+    top0, phase = 10, 87.5
+    residual = [label_for(geom, -1, col, phase=phase, top0=top0) for col in range(9)]
+    first_row = [label_for(geom, 0, col, phase=phase, top0=top0) for col in range(9)]
+    cells, problems = map_labels(geom, residual + first_row, viewport_top_row0=top0, row_phase_px=phase)
+    assert problems == []
+    assert [cell.global_row0 for cell in cells] == [10] * 9
 
 
 def test_map_labels_maps_full_row_in_column_order():

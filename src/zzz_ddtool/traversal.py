@@ -234,6 +234,18 @@ class GridMetrics:
             return None
         return best
 
+    def is_above_viewport_top(self, label_center_y: float, row_phase_px: float) -> bool:
+        """标签是否属于视口首行之上的残影（滚动后顶部露出的上一行标签条）。
+
+        残影的图标中心比首行锚点高出超过半行，反推出的屏幕行号必然为负，不存在
+        对应可见格位。游戏滚动不是行对齐，此时上一行的图标已被列表上沿裁掉，只剩
+        「等级N」的文字条还看得见并被 OCR 读到；它既不是漏格、也不是可点格位，
+        调用方应排除，不能当作网格不完整。
+        """
+        icon_y = self.icon_center_of_label(label_center_y)
+        first_row_center_y = self.origin_center_y - row_phase_px
+        return icon_y < first_row_center_y - self.row_pitch_px / 2
+
     def locate(
         self, center_x: float, label_center_y: float, *, viewport_top_row0: int, row_phase_px: float
     ) -> tuple[int, int, float] | None:
@@ -282,11 +294,16 @@ def map_labels(
     labels 的每项是 (标签中心 x, 标签中心 y, 等级)。行号由几何反推，不用标签
     序号；不可映射或同一行列重复归位记入 problems，调用方须据此把该位置当作
     进度屏障，而不是当作跳过。GridCell.center_y 存图标中心（点击点）。
+
+    视口首行之上的残影标签（``GridMetrics.is_above_viewport_top``）直接排除、不进
+    problems：那是滚动后露出的上一行标签条，图标已被裁掉，本就不对应任何可见格位。
     """
     cells: list[GridCell] = []
     problems: list[str] = []
     seen: set[tuple[int, int]] = set()
     for center_x, label_center_y, level in labels:
+        if metrics.is_above_viewport_top(label_center_y, row_phase_px):
+            continue
         position = metrics.locate(
             center_x, label_center_y, viewport_top_row0=viewport_top_row0, row_phase_px=row_phase_px
         )

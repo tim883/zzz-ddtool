@@ -1557,6 +1557,48 @@ def test_scan_flags_disc_without_level_label_as_barrier(monkeypatch):
     assert any("有盘但没读到等级" in problem for problem in problems)
 
 
+# ---------------------------------------------------------------- 滚动后顶部残行（2026-11-12）
+
+FIXTURE_RESIDUAL = Path(__file__).parent / "fixtures" / "驱动盘仓库" / "滚动后顶部残行.png"
+#: 该帧真机实测布局（日志「布局复核」：原点 268.5、行距 174.5），视口顶部为全局第 3 行。
+RESIDUAL_ORIGIN_Y = 268.5
+RESIDUAL_PITCH = 174.5
+
+
+def residual_image():
+    image = QImage(str(FIXTURE_RESIDUAL))
+    assert not image.isNull(), FIXTURE_RESIDUAL
+    return image
+
+
+def residual_runner():
+    runner = Runner(Preset(), hotkeys=False)
+    runner._origin_center_y = RESIDUAL_ORIGIN_Y
+    runner._row_pitch = RESIDUAL_PITCH
+    runner.trace = Mock()
+    return runner
+
+
+def residual_state():
+    state = _state()
+    state.confirm_viewport(2, 0.0, row_pitch_px=RESIDUAL_PITCH, at_top=False, at_bottom=False)
+    return state
+
+
+def test_scan_ignores_residual_row_above_viewport_top():
+    """真机图重放：滚 2 行后顶部露出上一行残影（图标被列表上沿裁掉，只剩「等级」条）。
+
+    残影不对应任何可见格位，扫描不得记成「网格映射不完整」：真机上这条曾让整轮
+    在重读耗尽后 failed（顶部只剩上一行的 9 条等级条，图标已裁）。
+    """
+    runner = residual_runner()
+    cells, problems, _skips = runner._scan_cells(residual_state(), image=residual_image())
+
+    assert problems == []
+    assert len(cells) == 36
+    assert {cell.global_row0 for cell in cells} == {2, 3, 4, 5}
+
+
 # ---------------------------------------------------------------- 状态识别与跳过（2026-10-05）
 
 
