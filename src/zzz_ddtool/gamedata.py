@@ -98,5 +98,6 @@ def selectable_mainstats(slots: Sequence[int]) -> tuple[str, ...]:
             names.append(name)
     return tuple(names)
 
-# 简中套装名，按 biligame「分类:驱动盘」2026-09。新套装可往下加。
+# 简中套装名，按拼音序排列，取自 nanoka 驱动盘数据（见 docs/技术/数据来源.md）。
+# 新套装按拼音序**插入**，不追加到末尾；缺名称底图时游戏内走 OCR 兜底。
 SETS = tuple(_load_json("sets.json"))
