@@ -166,6 +166,47 @@ def test_mark_switches_reflect_and_save_labels(qapp: QApplication, tmp_path) -> 
     window.close()
 
 
+def test_skip_max_level_switch_reflects_and_saves(qapp: QApplication, tmp_path) -> None:
+    """「跳过 15 级盘（满级）」勾：默认勾上、按存档回显，改动随任务配置写回 filters。
+
+    这个开关以前只存在于 YAML（`skip_max_level` 缺省开启），界面没有控件也就无从关闭；
+    现在控件是这一项的唯一来源，回显、写回与「未保存」提示都要跟着它走。
+    """
+    from zzz_ddtool.config import load_preset, preset_from_dict
+
+    window = MainWindow(config_path=tmp_path / "t.yaml")
+    window._add_job()
+    window.weight_editor.set_weights({"暴击率": 1.0})
+    assert window.skip_max_level.text() == "跳过 15 级盘（满级）"
+    assert window.skip_max_level.isChecked()
+    assert window.collect_preset().skip_max_level is True
+
+    # 存档里关掉过 → 界面必须照着显示，且不改写原值
+    window._apply_preset(preset_from_dict({
+        "task_chain": [{"slot": 4, "weights": {"暴击率": 1.0}}],
+        "filters": {"skip_max_level": False},
+    }))
+    assert not window.skip_max_level.isChecked()
+    assert window.collect_preset().skip_max_level is False
+
+    window.skip_max_level.setChecked(True)
+    assert window.collect_preset().skip_max_level is True
+
+    # 落盘字段名就是 YAML 里的 filters.skip_max_level，不是界面专用别名
+    dest = tmp_path / "skip-max-level.yaml"
+    window._path = dest
+    window.skip_max_level.setChecked(False)
+    window.save_current()
+    assert "skip_max_level: false" in dest.read_text(encoding="utf-8")
+    assert load_preset(dest).skip_max_level is False
+
+    # 与同组其余勾选一样，改动要参与「未保存」提示。
+    assert window.save_label.objectName() == "saveState"
+    window.skip_max_level.setChecked(True)
+    assert window.save_label.objectName() == "saveStateIdle"
+    window.close()
+
+
 def test_editor_empty_when_no_job_selected(qapp: QApplication, tmp_path) -> None:
     """死线：左侧没有选中任务时，右侧必须是空的，绝不能显示残留内容（假信息）。"""
     window = MainWindow(config_path=tmp_path / "t.yaml")

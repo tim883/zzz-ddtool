@@ -213,6 +213,7 @@ def preset_to_dict(preset: Preset) -> dict[str, Any]:
             "skip_locked": preset.skip_locked,
             "skip_equipped": preset.skip_equipped,
             "skip_discarded": preset.skip_discarded,
+            "skip_max_level": preset.skip_max_level,
         },
         "task_chain": [job.to_dict() for job in preset.task_chain],
         "weights": {str(name): float(weight) for name, weight in preset.weights.items()},

@@ -1618,7 +1618,7 @@ class MainWindow(QMainWindow):
         self._refresh_run_status()
         self._load_path(self._path)
         for box in (self.mark_discard, self.mark_lock, self.skip_locked, self.skip_equipped,
-                    self.skip_discarded):
+                    self.skip_discarded, self.skip_max_level):
             box.toggled.connect(self._mark_unsaved)
         self.max_discs.valueChanged.connect(self._mark_unsaved)
         # 恢复上次的窗口大小/位置、三栏比例。放在最后：控件都建好了才动。
@@ -1926,12 +1926,19 @@ class MainWindow(QMainWindow):
         self.skip_locked = QCheckBox("跳过有锁定标记")
         self.skip_equipped = QCheckBox("跳过已装备（无法跳过）")
         self.skip_discarded = QCheckBox("跳过有弃置标记")
+        self.skip_max_level = QCheckBox("跳过 15 级盘（满级）")
+        self.skip_max_level.setToolTip(
+            "扫描列表时读到「等级 15」就跳过这一格：不点开、不读词条、不强化、不打标，"
+            "也不占「本次最多处理 N 个盘子」的额度。\n"
+            "等级读不出来的格子不跳过，照常点开处理。"
+        )
         for box in (self.mark_discard, self.mark_lock):
             # 判断后打不打标记：默认都打；取消勾选只停发 R/T，判定与计数不变。
             box.setChecked(True)
             flags.addWidget(box)
-        for box in (self.skip_equipped, self.skip_locked, self.skip_discarded):
-            # 弃置标记默认不勾，其余两项默认勾。
+        for box in (self.skip_equipped, self.skip_locked, self.skip_discarded,
+                    self.skip_max_level):
+            # 弃置标记默认不勾，其余各项默认勾（满级盘默认跳过）。
             box.setChecked(box is not self.skip_discarded)
             flags.addWidget(box)
         layout.addWidget(flags_box)
@@ -3370,6 +3377,7 @@ class MainWindow(QMainWindow):
         self.skip_locked.setChecked(preset.skip_locked)
         self.skip_equipped.setChecked(preset.skip_equipped)
         self.skip_discarded.setChecked(preset.skip_discarded)
+        self.skip_max_level.setChecked(preset.skip_max_level)
         self.max_discs.setValue(preset.max_discs)
         self._legacy_max_discs = preset.max_discs
         self._jobs = [
@@ -3649,6 +3657,7 @@ class MainWindow(QMainWindow):
                     "skip_locked": self.skip_locked.isChecked(),
                     "skip_equipped": self.skip_equipped.isChecked(),
                     "skip_discarded": self.skip_discarded.isChecked(),
+                    "skip_max_level": self.skip_max_level.isChecked(),
                 },
                 **({"accepted": list(current["accepted"])} if current.get("accepted") is not None else {}),
             }

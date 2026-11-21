@@ -112,6 +112,18 @@ def test_global_label_policy_roundtrip_and_legacy_defaults(tmp_path):
     assert not loaded.labels.allows("save")
 
 
+def test_skip_max_level_defaults_on_and_roundtrips(tmp_path: Path) -> None:
+    """满级盘默认跳过：`filters.skip_max_level` 缺省 True，显式关掉要能存回、读回。"""
+    assert preset_from_dict({}).skip_max_level is True
+    assert preset_from_dict({"filters": {"skip_max_level": True}}).skip_max_level is True
+
+    preset = preset_from_dict({"filters": {"skip_max_level": False}})
+    path = tmp_path / "no-max-skip.yaml"
+    save_preset(path, preset)
+    assert preset_to_dict(preset)["filters"]["skip_max_level"] is False
+    assert load_preset(path).skip_max_level is False
+
+
 def test_legacy_require_s_rank_key_is_ignored(tmp_path: Path) -> None:
     """老存档里的 filters.require_s_rank 被忽略：载入不报错，也不再写回该键。"""
     path = tmp_path / "legacy.yaml"
