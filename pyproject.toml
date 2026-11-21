@@ -36,6 +36,7 @@ zzz_ddtool = [
   "assets/discocr/templates/*.png",
   "assets/picker/templates.json",
   "assets/picker/templates/*.png",
+  "assets/sets/*.png",
 ]
 
 [tool.pytest.ini_options]

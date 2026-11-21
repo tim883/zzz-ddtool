@@ -33,6 +33,9 @@ a = Analysis(
         ("src/zzz_ddtool/assets/discocr", "zzz_ddtool/assets/discocr"),
         # 套装名图片模板（套装筛选点选），运行时 assets_dir()/picker 从包内读
         ("src/zzz_ddtool/assets/picker", "zzz_ddtool/assets/picker"),
+        # 套装图标（「选择套装」格子里的图），运行时 assets_dir()/sets 从包内读；
+        # 缺图时 seticons 用完整套装名色块兜底，所以少几张不影响启动
+        ("src/zzz_ddtool/assets/sets", "zzz_ddtool/assets/sets"),
     ],
     hiddenimports=[],
     hookspath=[],

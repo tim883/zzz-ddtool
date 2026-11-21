@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import types
 from pathlib import Path
@@ -283,3 +284,31 @@ def test_nested_directory_named_data_keeps_its_yaml(tmp_path: Path) -> None:
     build.copy_runtime_data(src, out)
 
     assert (out / "examples" / "data" / "nested.yaml").exists()
+
+
+ASSETS_ROOT = REPO_ROOT / "src" / "zzz_ddtool" / "assets"
+
+
+def _spec_asset_datas() -> set[str]:
+    """spec 里登记进包的 assets 源目录（``("src/zzz_ddtool/assets/x", ...)``）。"""
+    text = (REPO_ROOT / "zzz-ddtool.spec").read_text(encoding="utf-8")
+    return set(re.findall(r'\("(src/zzz_ddtool/assets/[^"]+)"', text))
+
+
+def test_every_asset_directory_with_files_is_packaged() -> None:
+    """源码里带资源的 assets 子目录必须全部登记进 spec 的 datas。
+
+    漏一个的后果是打包态静默退回兜底且没人报错：2026-11-21 发 v1.0.4 时
+    ``assets/sets``（「选择套装」格子里的图）就漏在包外，源码态看不出差别。
+    断言由磁盘实际目录推出，不抄 spec 自己的清单。
+    """
+    on_disk = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in ASSETS_ROOT.iterdir()
+        if path.is_dir() and any(item.is_file() for item in path.rglob("*"))
+    }
+    assert on_disk, "assets/ 下没有子目录，这个用例失去意义"
+
+    registered = _spec_asset_datas()
+    assert on_disk - registered == set(), "有资源目录没进包"
+    assert registered - on_disk == set(), "spec 登记了不存在的目录"
